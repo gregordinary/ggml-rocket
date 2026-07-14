@@ -3275,6 +3275,25 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             const ggml_tensor * v = op->src[2];
             const ggml_tensor * m = op->src[3];
             if (!rocket_flash_attn_on() || !q || !k || !v || !m) return false;
+            // ATTENTION SINKS (src[4]) — DECLINE. A sink is a learned per-head logit that joins
+            // the softmax denominator: softmax over [scale*QK^T + mask, sink] rather than over
+            // the scores alone. The handler computes softmax(scale*QK^T + mask) and carries no
+            // sink term, so accepting such an op does not merely lose accuracy — it computes a
+            // DIFFERENT attention, silently, and the graph has no way to notice.
+            //
+            // This is not hypothetical: gpt-oss ships sinks on every layer
+            // (llama.cpp openai-moe: attn_sinks -> ggml_flash_attn_ext_add_sinks -> src[4]), and
+            // the gate below accepts everything else about its FA ops. The bug was invisible
+            // because it only fires past the n_kv floor (1024), so short-prompt tests never
+            // reached it, and because a wrong-but-plausible attention still produces fluent text
+            // — the differential-PPL check read it as +1.0%, i.e. "within noise".
+            //
+            // Declining is also FASTER on this model, which is why the loss looked like a
+            // performance regression: the offload was costing time to compute the wrong answer.
+            // Implementing the sink is easy in principle (the softmax is host-side, so it is one
+            // extra term in the denominator) — but do that only if the offload is a WIN on a
+            // sink-carrying model, which on gpt-oss it is not.
+            if (op->src[4]) return false;
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *)op->op_params + 1, sizeof(float));
             // head_dim (= DK) is the QK contraction dim; dv (= DV) the value/output dim.
