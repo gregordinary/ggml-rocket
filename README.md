@@ -13,8 +13,11 @@ DRM-accel driver.
 It builds as a runtime-loadable `libggml-rocket.so` that drops into stock llama.cpp and
 whisper.cpp: point `GGML_BACKEND_PATH` at it and the NPU appears as a ggml device, exactly like
 ggml's own BLAS backend. It runs the Whisper encoder end to end and the prefill of Gemma-4,
-Qwen3.5 / 3.6, Llama-3.2, Phi-4, Ministral and more on the NPU. Decode stays on the CPU — it is a
-single-row GEMV, ~82× slower on the NPU.
+Qwen3.5 / 3.6, Llama-3.2, Phi-4, Ministral and more on the NPU. Decode stays on the CPU: it is
+small-M work, and below `ROCKET_MIN_M` (default 128 rows) the per-call dispatch and weight packing
+outweigh the NPU's per-row advantage. That covers llama.cpp's single-row GEMV decode (~82× slower
+on the NPU) and also **batched** decode — whisper.cpp's default beam search presents 5 rows per
+step, still far below the crossover.
 
 This is a separate project from the driver: `rocket-userspace` (the `librocketnpu` dependency)
 builds and runs on its own; this backend links it.

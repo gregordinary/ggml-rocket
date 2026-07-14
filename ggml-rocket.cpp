@@ -331,14 +331,45 @@ struct ggml_backend_rocket_context {
 // independent, so the first M rows are bit-identical to an unpadded run.
 static inline int rocket_pad_m(int M) { return (M + 3) & ~3; }
 
-// Minimum prefill rows (M) worth offloading. Decode is GEMV (M=1) and ~82x
-// slower on the NPU than a batched prefill GEMM, so it (and tiny ubatches) stay
-// on the CPU. Tunable via ROCKET_MIN_M (>=4) without a rebuild.
+// Minimum rows (M) worth offloading. Below it the offload LOSES to the CPU: the
+// per-call fixed cost (dispatch, plus the full packB -- a weight only goes resident
+// at M >= max_tile, so below that it is re-packed on EVERY call) outweighs the NPU's
+// per-row throughput advantage.
+//
+// The crossover is where the NPU's cost meets the CPU's, per op:
+//     NPU = dispatch + p*(K*N) + w*(M*K*N)      CPU = g*(M*K*N)
+//     =>  M* = ( p + dispatch/(K*N) ) / (g - w)
+// The K*N cancels out of the leading term, so M* is nearly MODEL-INDEPENDENT -- the
+// packB you pay scales with the same K*N as the compute you gain. What remains is the
+// dispatch term, which does NOT scale with K*N and so weighs more when the weights are
+// small: a small model crosses LATER. Measured [HW sweep, 600 MHz, F16, warm, t/s
+// NPU/CPU], and the drift is exactly that predicted shape:
+//
+//              pp16   pp32   pp48   pp64   pp96   pp128     M*
+//     0.8B     0.36   0.58   0.72   0.83   1.04   1.15      ~86
+//     3B       0.35   0.60   0.87   1.03   1.38   1.60      ~64
+//     8B       0.35   0.65   0.93   1.24    -     1.89      ~55
+//
+// Default 128: at or above every measured crossover, so NO model regresses below the
+// CPU, and larger models cross earlier still (so 12B+ is covered a fortiori). The cost
+// is forgoing the 64..127 wins on the bigger models -- a forgone win, never a loss.
+// Quantized weights and MoE experts have their own (higher) floors, so this governs the
+// F16/BF16 dense path alone.
+//
+// A floor of 4 (the old default) is a TRAP for hosts whose *decode* is batched:
+// whisper.cpp defaults to beam search with beam_size=5 and batches all active decoders
+// into ONE decode call, so every decode step arrives as M=5. It cleared a floor of 4,
+// landed on the NPU, and ran 2.3x SLOWER than the CPU -- making end-to-end whisper a
+// 1.40x NET LOSS. M=1 GEMV decode (llama.cpp) was never the only small-M case.
+//
+// Do NOT set this to max_tile (256) on the theory that the residency pivot is the right
+// floor: llama streams its weights below 256 too and still wins big there (pp128 =
+// 1.89x), so 256 costs pp128 -46%. Tunable via ROCKET_MIN_M.
 static int rocket_min_m(void) {
     static int m = 0;
     if (m == 0) {
         const char * e = getenv("ROCKET_MIN_M");
-        m = e ? atoi(e) : 4;
+        m = e ? atoi(e) : 128;
         if (m < 4) m = 4;
     }
     return m;
