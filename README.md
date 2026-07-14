@@ -115,9 +115,15 @@ The envelope, all HW-validated on the RK3588 and PPL-faithful to the CPU backend
   is ~460 GOP/s across precisions (DMA/dispatch-bound, not MAC-bound). A quantized GGUF wants
   `-b 2048 -ub 2048`. Bottleneck-conditional, not a permanent property — see
   [API.md](API.md#why-quantization-does-not-speed-prefill).
-- **MoE routed experts run on the CPU by default** — offloading the quantized experts is a net loss
-  (`ROCKET_MOE=1` opts in, bit-faithful but slower). The dense projections and `lm_head` still reach
-  the NPU.
+- **MoE routed experts run on the CPU by default; `ROCKET_MOE=1` puts them on the NPU and is worth
+  **2.16× the CPU** at pp2048** (gpt-oss-20b, MXFP4, `-b 2048 -ub 2048`; 1.34× at pp512 — it wins at
+  every prefill length). The lever is **residency, not quantization**: a quantized expert on the
+  naive route is dequantized on the host *every micro-batch*, and that decode does not shrink with
+  the row count, so it costs ~119 s of a prefill before any arithmetic. The native-quant route
+  ingests each expert **once** into int8 codes that stay resident in NPU BOs and deletes it. Opt-in
+  because the win is conditional on nearly the whole expert stack fitting RAM (99% resident wins;
+  82% resident *loses* at short prefill), and because it costs a one-time ~70 s ingest at the first
+  prefill. See [API.md](API.md#native-quant-experts).
 - **bf16 weights prefill ~0.55–0.6× native fp16** (re-decoded per micro-batch); convert to fp16 for
   full speed, or set `ROCKET_BF16=1` for the exact fp32-output bf16 datapath.
 
@@ -151,7 +157,8 @@ sudo ./build/test-rocket-matmul  # needs /dev/accel/accel0 — each shape prints
 
 The gates are all CTest-registered — run `ctest` from the build dir; the NPU gates report `Skipped`
 off-device, the pure-CPU ones run anywhere. They include `test-rocket-matmul` (rocket vs CPU backend
-on real ggml graphs), `test-rocket-moe` (the MoE handler, cos = 1.000000), `test-rocket-int4`,
+on real ggml graphs), `test-rocket-moe` (the MoE handler, both the fp16 and the native-quant expert
+route, against the CPU backend under outlier-channel activations), `test-rocket-int4`,
 `test-rocket-bf16`, `test-rocket-placement` (the `supports_op` / `offload_op` contract), and the
 Hadamard construction tests.
 

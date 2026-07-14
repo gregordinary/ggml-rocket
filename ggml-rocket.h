@@ -30,6 +30,20 @@ GGML_BACKEND_API bool ggml_backend_is_rocket(ggml_backend_t backend);
  * 3 cores + 2 to fill pack/read idle bubbles). Call before/independent of graph compute. */
 GGML_BACKEND_API void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, int n_threads);
 
+/* Native-quant MoE expert residency, for diagnostics and for the gate.
+ *
+ * A quantized MoE expert is ingested ONCE into int8 codes that stay resident in NPU BOs,
+ * which is what removes the per-micro-batch host dequant. Residency is ADMISSION-ONLY: an
+ * expert that does not fit the budget or the NPU's IOVA window streams on the fp16 dequant
+ * route instead, correctly but at the streaming cost. So "how much of the model went
+ * resident" is the number that explains the speed, and it is not otherwise observable.
+ *
+ * Writes the count of experts ingested to *n_resident and the count that fell back to
+ * streaming to *n_streamed (either pointer may be NULL). Both are cumulative over the
+ * backend's life and count DISTINCT experts, not calls. */
+GGML_BACKEND_API void ggml_backend_rocket_moe_stats(ggml_backend_t backend,
+                                                    long * n_resident, long * n_streamed);
+
 /* Backend registry entry point (for ggml_backend_load / device enumeration). */
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rocket_reg(void);
 

@@ -17,6 +17,15 @@
 #include "ggml-cpu.h"
 #include "rocket_raii.h"
 
+// block_mxfp4 (the 17-byte { E8M0 exponent, 16 nibble-packed codes } block), for the
+// native-quant MoE expert ingest, which reads MXFP4 blocks directly instead of going
+// through ggml's dequantizer. DECL only -- we want the struct layout, not ggml-common's
+// (large, mostly-unused) codebook tables; the 16-entry MXFP4 codebook is mirrored
+// locally next to the ingest. Taking the struct from the real header means a future
+// layout change breaks the BUILD rather than silently miscomputing.
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+
 #include <vector>
 #include <string>
 #include <memory>
@@ -32,6 +41,7 @@
 #include <condition_variable>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <sys/mman.h>   // madvise(MADV_DONTNEED) on the GGUF source pages
 #include <unistd.h>     // sysconf(_SC_PAGESIZE)
 
@@ -129,6 +139,24 @@ struct rocket_i4_resident {
     rocket_i4_weights * w;         // resident per-worker int4 nibble BOs
     std::vector<float>  b_scale;   // [N*nG] per-(output-channel,K-group) dequant scale
     int Mp, N, K, group; bool hadamard; size_t bytes;   // Mp = pack-time padded M (informational)
+};
+
+// One RESIDENT natively-quantized MoE expert weight: the expert's [N,K] GGUF-quant
+// payload ingested ONCE into int8 codes + per-(output-channel, K-group) fp32 scales,
+// scattered into resident NPU int8 tile BOs, and the host int8 copy dropped. Keyed on
+// (weight name, expert index) -- the whole [K,N,n_expert] stack shares ONE tensor name,
+// so a name-only key would alias every expert onto one entry.
+//
+// This is what removes the per-micro-batch host dequant that makes a quantized MoE
+// offload a net loss today: the expert's codes never leave the NPU, and each forward
+// pass quantizes only the activation. The layout is M-INDEPENDENT (canonical-tile
+// planning), so one ingest serves every micro-batch's ragged per-expert row count.
+struct rocket_moe_i8_expert {
+    rocket_i8_weights * w;         // resident per-worker int8 tile BOs
+    std::vector<float>  b_scale;   // [N*nG] per-(output-channel, K-group) dequant scale
+    int K, N, group;
+    size_t bytes;                  // resident NPU-BO bytes
+    size_t charged;                // bytes + the GGUF source that must stay mapped (budget)
 };
 
 struct ggml_backend_rocket_context {
@@ -314,6 +342,60 @@ struct ggml_backend_rocket_context {
     std::vector<int32_t> moe_row_slot;    // id (0..n_expert_used) per bucketed row
     std::vector<int32_t> moe_row_tok;     // token (0..n_tokens)  per bucketed row
     std::vector<int32_t> moe_expert_off;  // [n_expert+1] prefix offsets into the buckets
+
+    // NATIVE-QUANT MoE experts (the resident int8 group-wise path). A GGUF-quantized
+    // expert weight (gpt-oss MXFP4, DeepSeek Q4_K/Q8_0) is ingested ONCE into int8 codes
+    // + per-(channel, K-group) scales and left resident in NPU BOs, so the per-micro-batch
+    // host dequant->fp16 and weight scatter both disappear -- the only source of speed on
+    // this path (the int8 GEMM itself moves MORE bytes than the fp16 one). Shares the
+    // resident int8 device context (i8_dev) and its worker fds with the dense W8A8 path.
+    //
+    // Keyed on (weight name, expert index): rocket_weight_key returns ONE name for the
+    // whole [K,N,n_expert] stack, so a name-only key would alias all n_expert experts.
+    // Admission-only, no eviction -- prefill touches every expert every micro-batch, so
+    // there is no hotness to exploit; what does not fit streams on the fp16 dequant path.
+    int moe_native = -1;                  // ROCKET_MOE_NATIVE (-1 = unqueried)
+    std::unordered_map<std::string, rocket_moe_i8_expert> moe_i8_cache;
+    size_t moe_i8_resident_bytes = 0;     // the resident NPU-BO bytes (what is on the NPU)
+    size_t moe_charged_bytes     = 0;     // what the budget governs: BOs + the GGUF source
+                                          // that has to stay mapped alongside them
+    size_t moe_cache_budget      = 0;     // bytes; 0 = unlimited. Set in _init (default auto)
+    bool   moe_i8_full           = false; // IOVA window full / budget hit -> stream the rest
+    long   moe_n_resident        = 0;     // experts ingested (for the resident/streaming split)
+    // What the residency COSTS: every resident expert is decoded from its GGUF blocks,
+    // requantized to int8, and scattered into NPU BOs -- once. On a real MoE that is
+    // thousands of experts and tens of GB, i.e. minutes, and because the ingest is lazy it
+    // all lands inside the FIRST prefill. Timed unconditionally rather than behind
+    // ROCKET_MM_PROFILE: a multi-minute startup stall is a cost the user pays and must be
+    // told about, not a number only a developer wants. Two timers because the two halves
+    // have different fixes -- the decode is CPU work that threads, the pack is a BO scatter
+    // that does not.
+    double moe_ingest_ms         = 0;     // GGUF quant blocks -> int8 codes + group scales
+    double moe_pack_ms           = 0;     // int8 codes -> the tiled scatter into resident BOs
+    // The DISTINCT experts that fell back to fp16 streaming. A per-call counter would count
+    // the same expert once per micro-batch and read as a much worse split than it is; the
+    // number that matters is how many of the model's experts never went resident.
+    std::unordered_set<std::string> moe_streamed_keys;
+    // Per-expert M bucketing (see rocket_moe_bucket_m): the router hands every expert a
+    // different row count, and the driver's resident scratch is cached per (M,K,N,group) in a
+    // fixed-size table that does NOT evict -- so the raw M_e values would exhaust it mid-prefill.
+    // M_e is rounded up onto a fixed 2-rungs-per-octave ladder whose rung count is bounded by
+    // construction; moe_slots then only *observes* how many slots that costs, so a shape mix we
+    // did not anticipate can warn instead of silently degrading to the fp16 route.
+    int moe_m_granule = 0;                // 0 = unqueried; the ladder's floor (ROCKET_MOE_M_BUCKET)
+    std::unordered_set<uint64_t> moe_slots;   // diagnostic: distinct (M,K,N) slots asked for
+    // Host scratch for the native-quant route (grow-only; fully written before read).
+    std::vector<int8_t> moe_qA;           // [Mb,K] int8 activations
+    std::vector<float>  moe_a_scale;      // [Mb*nG] per-(row, K-group) activation scale
+    std::vector<float>  moe_Cgw;          // [Mb,N] fp32 group-wise matmul output
+    // Ingest scratch, held on the context rather than allocated per expert. A fresh
+    // [N*K] vector per expert would value-initialize (memset) a buffer we then overwrite
+    // in full, and malloc hands back a fresh mmap at that size -- so a 2300-expert model
+    // would memset and page-fault ~19 GB purely to throw it away. The ingest writes every
+    // byte of both buffers before anything reads them, so reuse is identical to a fresh
+    // allocation.
+    std::vector<int8_t> moe_ingest_codes;  // [N*K] int8 codes for the expert being ingested
+    std::vector<float>  moe_ingest_scales; // [N*nG] its per-(channel, K-group) scales
 };
 
 // ===========================================================================
@@ -430,6 +512,43 @@ static int rocket_moe_min_tokens(void) {
     return m;
 }
 
+// NATIVE-QUANT MoE experts: within ROCKET_MOE=1, route a GGUF-QUANTIZED expert weight
+// through the resident int8 group-wise path (ingest once -> int8 codes resident on the
+// NPU) instead of dequantizing it to fp16 on the host every micro-batch. ON by default
+// when ROCKET_MOE is on -- it is the reason the MoE offload can win at all on the models
+// that ship quantized. ROCKET_MOE_NATIVE=0 forces the fp16 dequant route, which is the
+// A/B baseline for the native path (and the only route for an F16 expert, which has no
+// dequant to delete).
+static bool rocket_moe_native_on(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ROCKET_MOE_NATIVE"); v = e ? (atoi(e) > 0) : 1; }
+    return v > 0;
+}
+
+// ROCKET_MOE_GROUP=g pins the K-group the native-quant path quantizes on (0/unset = auto,
+// see rocket_moe_pick_group). The group is the accuracy/speed dial: readback scales as
+// K/group and these integer paths are readback-bound, so a fine group is more faithful
+// and proportionally slower. Exists for the A/B; auto picks the readback floor.
+static int rocket_moe_group_env(void) {
+    static int g = -1;
+    if (g < 0) { const char * e = getenv("ROCKET_MOE_GROUP"); g = e ? atoi(e) : 0; if (g < 0) g = 0; }
+    return g;
+}
+
+// ROCKET_MOE_M_BUCKET: the FLOOR of the bucket ladder the ragged per-expert row count is rounded
+// up onto (default 64 rows). See rocket_moe_bucket_m for why bucketing is mandatory rather than a
+// tuning knob, and for the ladder itself. Rounded up to a power of two: the ladder puts its
+// intermediate rung at 1.5x each power, so a power-of-two floor is what keeps every rung on the
+// M%4 hardware contract.
+static int rocket_moe_m_bucket_env(void) {
+    const char * e = getenv("ROCKET_MOE_M_BUCKET");
+    int g = e ? atoi(e) : 64;
+    if (g < 4) g = 4;
+    int p = 4;
+    while (p < g && p < (1 << 20)) p <<= 1;
+    return p;
+}
+
 // ROCKET_QUANT_RESIDENT=1: hold a quantized GGUF weight's DEQUANTIZED fp16 form
 // RESIDENT in NPU BOs (dequant once, then the F16 prepacked path) instead of
 // re-dequantizing AND re-packing it every micro-batch (the streaming tax).
@@ -531,8 +650,14 @@ static double rocket_now_ms(void) {
 static struct { double pack_ms, unpack_ms, pack_elems, unpack_elems;
                 long pack_calls, unpack_calls; } g_convprof;
 static int g_convprof_armed = 0;
+// The profiler dumps below (this one, i8prof, moeprof, moecos) go out on the rocket_log
+// channel, NOT GGML_LOG_*. They are measurement lines, and the tool they have to survive is
+// llama-bench -- which installs a no-op ggml log callback and swallows everything sent
+// through ggml. ROCKET_LOG_STDERR=1 tees the rocket channel to stderr past that. A profiler
+// whose output is silenced by the profiling harness is worse than no profiler: it reads as
+// "nothing to report".
 static void rocket_convprof_dump(void) {
-    GGML_LOG_INFO(
+    ROCKET_LOGI(
         "ROCKET convert total(ms): pack_act=%.0f (%ld calls, %.0fM elems) "
         "unpack_out=%.0f (%ld calls, %.0fM elems)\n",
         g_convprof.pack_ms,   g_convprof.pack_calls,   g_convprof.pack_elems   / 1e6,
@@ -685,7 +810,7 @@ static struct { double act_rot, act_q, wt_rot, wt_q, dq;
                 long act_calls, wt_calls, dq_calls; } g_i8prof;
 static int g_i8prof_armed = 0;
 static void rocket_i8prof_dump(void) {
-    GGML_LOG_INFO(
+    ROCKET_LOGI(
         "ROCKET int8 convert total(ms): act_rotate=%.0f act_quant=%.0f "
         "wt_rotate=%.0f wt_quant=%.0f dequant=%.0f  (act %ld, wt %ld, dq %ld calls)\n",
         g_i8prof.act_rot, g_i8prof.act_q, g_i8prof.wt_rot, g_i8prof.wt_q, g_i8prof.dq,
@@ -693,6 +818,93 @@ static void rocket_i8prof_dump(void) {
 }
 static inline void rocket_i8prof_arm(void) {
     if (!g_i8prof_armed) { atexit(rocket_i8prof_dump); g_i8prof_armed = 1; }
+}
+
+// MoE handler profiler: the PER-MICRO-BATCH decomposition of the native-quant expert route
+// (gather -> activation quant -> resident int8 GEMM -> scatter), plus whatever still falls
+// through to the fp16 streaming route. This is the line that says where a MoE prefill's time
+// actually goes, and it is what settles whether the route is GEMM-bound (nothing left to win
+// on the host) or host-bound (the activation quant is the remaining lever).
+//
+// Disjoint from g_i8prof above, not overlapping it: the grouped activation quant is reached
+// ONLY from this handler, so it is counted here and nowhere else. g_i8prof stays the DENSE
+// W8A8 path's line.
+//
+// rows_used vs rows_computed prices the M-bucket padding directly (see rocket_moe_bucket_m):
+// the router hands every expert a ragged row count, we round it up to a granule, and the pad
+// rows are computed and thrown away. The ratio is the waste, measured rather than assumed.
+//
+// native_gemms vs fp16_gemms is the residency split as the COST is actually paid -- per
+// (op, expert-with-rows), per micro-batch. The teardown line counts DISTINCT experts, which
+// answers a different question (how much of the model went resident) and cannot be converted
+// into this one without assuming every expert is hit equally often. This counter needs no
+// such assumption.
+//
+// Same ROCKET_MM_PROFILE knob as the other two; own exit line. The one-time ingest is NOT
+// here -- it is timed unconditionally on the context (moe_ingest_ms), because it is a cost
+// the user pays and must be told about, not one only a developer wants.
+static struct { double gather, quant, gemm, scatter, fp16;
+                long   calls, gemms, fp16_gemms, rows_used, rows_computed; } g_moeprof;
+static int g_moeprof_armed = 0;
+static void rocket_moeprof_dump(void) {
+    const double npu   = g_moeprof.gather + g_moeprof.quant + g_moeprof.gemm + g_moeprof.scatter;
+    const long   total = g_moeprof.gemms + g_moeprof.fp16_gemms;
+    ROCKET_LOGI(
+        "ROCKET MoE native total(ms): gather=%.0f act_quant=%.0f gemm=%.0f scatter=%.0f "
+        "| fp16_streamed=%.0f  (%ld ops; %ld/%ld expert GEMMs native = %.0f%%; %.1f%% padded "
+        "rows; gemm=%.0f%% of the native route)\n",
+        g_moeprof.gather, g_moeprof.quant, g_moeprof.gemm, g_moeprof.scatter, g_moeprof.fp16,
+        g_moeprof.calls, g_moeprof.gemms, total,
+        total ? 100.0 * (double)g_moeprof.gemms / (double)total : 0.0,
+        g_moeprof.rows_computed ? 100.0 * (double)(g_moeprof.rows_computed - g_moeprof.rows_used)
+                                        / (double)g_moeprof.rows_computed : 0.0,
+        npu > 0 ? 100.0 * g_moeprof.gemm / npu : 0.0);
+}
+static inline void rocket_moeprof_arm(void) {
+    if (!g_moeprof_armed) { atexit(rocket_moeprof_dump); g_moeprof_armed = 1; }
+}
+
+// ROCKET_MOE_COSINE=1: the per-matmul faithfulness probe for the native-quant expert route,
+// on REAL weights and REAL activations.
+//
+// For ONE expert per MUL_MAT_ID op -- rotating, so the probe sweeps every layer, every
+// projection and the whole expert set rather than camping on layer 0 -- recompute that exact
+// GEMM on the CPU from the raw f32 activations and the UNDECODED GGUF weight (ggml's own
+// dequantizer, fp64 accumulate: rocket_cpu_matmul_slice) and take the cosine against what the
+// NPU's int8 route returned.
+//
+// This is the gate the synthetic test cannot be. test-rocket-moe pins the ROUTE (that the
+// native path ran, and that its arithmetic is right on inputs we invented), but only a live
+// forward pass carries the activation distribution -- outlier channels and all -- that decides
+// whether int8 ACTIVATIONS survive without a Hadamard rotation. That was risk R3, and this is
+// what retires it on real data instead of a synthetic proxy.
+//
+// Diagnostic only: the reference is a scalar fp64 triple loop, seconds per probe.
+static int rocket_moe_cosine_on(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ROCKET_MOE_COSINE"); v = (e && atoi(e) > 0) ? 1 : 0; }
+    return v;
+}
+static struct { double sum, min; long n; } g_moecos = { 0.0, 2.0, 0 };
+static int g_moecos_armed = 0;
+static void rocket_moecos_dump(void) {
+    if (!g_moecos.n) return;
+    ROCKET_LOGI("ROCKET MoE native-quant cosine vs CPU fp64 reference (real weights, real "
+                "activations): mean=%.6f min=%.6f over %ld expert GEMMs\n",
+                g_moecos.sum / (double)g_moecos.n, g_moecos.min, g_moecos.n);
+}
+// cos(a,b) in double. Both vectors are a full [M_e,N] expert output, so a single cosine over
+// the flattened tile is the right summary: it weights each output element equally, which is
+// what a downstream layer sees.
+static double rocket_cosine_f32(const float * a, const float * b, size_t n) {
+    double dot = 0, na = 0, nb = 0;
+    for (size_t i = 0; i < n; i++) {
+        dot += (double)a[i] * (double)b[i];
+        na  += (double)a[i] * (double)a[i];
+        nb  += (double)b[i] * (double)b[i];
+    }
+    if (na <= 0 || nb <= 0) return 1.0;   // an all-zero tile carries no angle
+    return dot / (sqrt(na) * sqrt(nb));
 }
 
 // ===========================================================================
@@ -2665,8 +2877,56 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
         for (auto & kv : ctx->wcache) rocket_weights_free(ctx->dev, kv.second.w);
         rocket_ctx_free(ctx->dev);
     }
+    // The resident/streaming split of the native-quant MoE experts, stated rather than
+    // left to be inferred: a partly-resident model is a partial win by design (admission
+    // only, see rocket_moe_expert_resident), and a run that quietly ingested a third of
+    // its experts should not look like a run that ingested all of them.
+    if (ctx->moe_n_resident || !ctx->moe_streamed_keys.empty()) {
+        const long streamed = (long)ctx->moe_streamed_keys.size();
+        const long total    = ctx->moe_n_resident + streamed;
+        // The denominator is the experts ACTUALLY EXERCISED (an expert the router never sent a
+        // row to is never looked up), not the model's expert count -- and that is the right
+        // denominator for this ratio: the dequant tax is paid per (op, expert-with-rows) and
+        // costs a full [N,K] decode regardless of how many rows that expert got. So this
+        // percentage is the fraction of the dequant actually removed, not a residency fraction.
+        //
+        // rocket_log, not GGML_LOG_*: llama-bench silences ggml, and this line is the one that
+        // explains the number llama-bench just printed.
+        const double res_pct = total ? 100.0 * (double)ctx->moe_n_resident / (double)total : 0.0;
+        ROCKET_LOGI("[moe-int8] experts exercised: %ld resident on the NPU (%zuMB), %ld streamed "
+                    "via dequant->fp16 -- %.0f%% of the per-micro-batch dequant removed\n",
+                    ctx->moe_n_resident, ctx->moe_i8_resident_bytes >> 20, streamed, res_pct);
+        // Say what that number MEANS, because the relationship is not the linear one it looks
+        // like. A streamed expert pays a weight dequant that is INDEPENDENT of its row count
+        // (it decodes the whole [N,K] whatever the router gave it), while a resident one pays a
+        // GEMM that shrinks with M. So the streamed remainder's share of the wall clock grows as
+        // the prefill shortens, and the route falls off a cliff rather than degrading smoothly:
+        // measured on gpt-oss at pp512, 99% resident is 17.6 t/s and 82% resident is 12.2 --
+        // below the 14.1 you get by simply leaving the experts on the CPU. Residency is not a
+        // nice-to-have for this route; it IS the route.
+        if (res_pct < 95.0)
+            ROCKET_LOGW("[moe-int8] only %.0f%% resident -- below ~95%% this route is typically a "
+                        "net LOSS at short prefill (a streamed expert's dequant does not shrink "
+                        "with the row count). Raise ROCKET_MOE_CACHE_MB if the RAM is there, or "
+                        "set ROCKET_MOE=0 to leave the experts on the CPU.\n", res_pct);
+        // What that residency cost, once: the price of admission to the route above. It is
+        // paid inside the first prefill and it is minutes on a large MoE, so it is reported
+        // next to the win rather than left to be discovered as a startup hang. It is also
+        // paid PER CONTEXT, which is why a tool that builds a fresh context per measurement
+        // (llama-bench does) pays it per row -- see the ingest note in the README.
+        if (ctx->moe_ingest_ms + ctx->moe_pack_ms > 0)
+            ROCKET_LOGI("[moe-int8] one-time ingest: %.1fs total (%.1fs GGUF->int8 decode, "
+                        "%.1fs NPU-BO pack) for %ld experts = %.0fms each\n",
+                        (ctx->moe_ingest_ms + ctx->moe_pack_ms) / 1000.0,
+                        ctx->moe_ingest_ms / 1000.0, ctx->moe_pack_ms / 1000.0,
+                        ctx->moe_n_resident,
+                        ctx->moe_n_resident
+                            ? (ctx->moe_ingest_ms + ctx->moe_pack_ms) / (double)ctx->moe_n_resident
+                            : 0.0);
+    }
     if (ctx->i8_dev) {   // resident int8 weights hold BOs on the ctx fds -> free first
-        for (auto & kv : ctx->i8_rwcache) rocket_i8_weights_free(ctx->i8_dev, kv.second.w);
+        for (auto & kv : ctx->i8_rwcache)   rocket_i8_weights_free(ctx->i8_dev, kv.second.w);
+        for (auto & kv : ctx->moe_i8_cache) rocket_i8_weights_free(ctx->i8_dev, kv.second.w);
         rocket_i8_ctx_free(ctx->i8_dev);
     }
     if (ctx->i4_dev) {   // resident int4 weights hold BOs on the ctx fds -> free first
@@ -2811,6 +3071,566 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     return 0;
 }
 
+// ===========================================================================
+// Native-quant MoE experts: GGUF quant blocks -> resident int8 on the NPU
+//
+// A quantized MoE expert costs a full host dequant->fp16 of its [N,K] weight EVERY
+// micro-batch (rocket_weight_to_fp16), and a MoE layer has n_expert times more distinct
+// weights than a dense one -- which is why the fp16 MUL_MAT_ID offload is a net loss on
+// every MoE that actually ships quantized. The fix is to stop dequantizing: ingest each
+// expert ONCE into int8 codes, leave them resident in NPU BOs, and quantize only the
+// activation per call.
+//
+// The NPU cannot apply a K-blocked scale on chip -- at the output stage K is fully
+// contracted, so no register or operand cube is indexed by a K-block, for any dtype. But
+// integer partials ALREADY leave the chip at every K-tile boundary (on-device integer
+// K-accumulation is architecturally impossible: the DPU eltwise operand DMA is <=16-bit
+// and an int32 partial does not fit), so a per-K-group scale rides along for free at a
+// boundary that is already being paid for. Keep each K-tile inside one quant group,
+// multiply its int32 partial by that group's scale, accumulate in fp32 on the host --
+// which is exactly rocket_matmul_int8_prepacked_gw's contract, and why the ingest emits
+// per-(output-channel, K-group) scales rather than one scale per channel.
+//
+// WHERE THE SPEED COMES FROM, precisely: NOT from the quantization. The int8 GEMM's int32
+// output is read back at 8 B/element (the HW output-cube stride), so at the group the CBUF
+// allows it moves MORE bytes than the equivalent fp16 GEMM. The entire win is deleting the
+// per-micro-batch dequant and weight scatter. Quantization here buys residency, and
+// residency buys the speed. A change that reintroduces a per-call pass over the weight --
+// or a separate scale-and-convert pass over the int32 output -- hands the win straight back.
+// ===========================================================================
+
+// The MXFP4 codebook, mirroring kvalues_mxfp4 (ggml-common.h). The mantissa is DECLARED
+// int8_t and reaches only +/-12, so an MXFP4 code IS an exact int8 value with 3 bits of
+// headroom under int8's +/-127: the weight side of a native-int8 expert path is a
+// shift-and-copy, not a quantization -- and strictly MORE faithful than the fp16->int8
+// rounding rocket_quant_wt_int8 does. Mirrored rather than pulled in via
+// GGML_COMMON_IMPL_CPP so we don't drag ggml-common's other (large, unused) codebooks
+// into the .so; the block STRUCT still comes from the real header, so a layout change is
+// a build error. rk_moe_ingest_mxfp4_row asserts the block geometry at compile time.
+static const int8_t rk_mxfp4_kvalues[16] = { 0, 1, 2, 3, 4, 6, 8, 12,
+                                             0, -1, -2, -3, -4, -6, -8, -12 };
+
+// Move one MXFP4 code from its own block's exponent onto the merged group's reference
+// exponent. sh = e_block - e_ref.
+//
+// A LEFT shift is exact and cannot overflow int8: e_ref >= e_max - 3, so sh <= 3 for any
+// code that is nonzero (a nonzero code implies a nonzero block, and only nonzero blocks
+// enter e_max), and |code| <= 12 gives 12 << 3 = 96 <= 127.
+// A RIGHT shift rounds to nearest (half away from zero) and can only shrink the value.
+// A zero code stays zero for ANY sh -- which is what keeps an all-zero block, whose
+// exponent is meaningless and is therefore excluded from the group's band, from shifting
+// by an out-of-range amount.
+static inline int8_t rk_mxfp4_shift(int code, int sh) {
+    if (code == 0) return 0;
+    if (sh >= 0) {
+        // sh <= 3 here (see above). Clamp anyway: a future change to the e_ref rule must
+        // not be able to turn this into an undefined shift.
+        return (int8_t)(code << (sh < 3 ? sh : 3));
+    }
+    const int s = -sh;
+    if (s >= 5) return 0;                 // |code| <= 12 < 2^4, so code/2^5 rounds to 0
+    const int half = 1 << (s - 1);
+    const int mag  = ((code < 0 ? -code : code) + half) >> s;
+    return (int8_t)(code < 0 ? -mag : mag);
+}
+
+// Ingest ONE row of an MXFP4 expert weight: merge each K-group's `group/32` native blocks
+// onto a single exponent and emit the group's int8 codes + its fp32 scale.
+//
+// MXFP4's block scale is E8M0 -- an EXACT power of two, 2^(e-128) -- so the merge is an
+// integer shift of the codes, not a requantization. The group's reference exponent is
+//
+//     e_ref = max(e_min, e_max - 3)
+//
+// and NOT "clamp everything onto e_min". The choice is load-bearing for the ~0.1% of
+// groups whose exponent band is wider than 3 octaves, because it decides WHERE their
+// error lands. Under e_ref every block at or above e_ref left-shifts exactly, and a block
+// further down right-shifts (rounding) instead -- so the error falls on the group's
+// SMALLEST weights. Clamping to e_min would instead have to clip the group's LARGEST
+// weights (a 12<<9 saturated to 127 is a 48x underestimate), and measures 19x less
+// faithful: cosine 0.9958 (clamp) vs 0.9998 (e_ref) at group=576, pooled over all 72
+// gpt-oss expert tensors.
+//
+// The merge is EXACTLY lossless whenever the group's spread is <= 3 octaves, which holds
+// for 99.9% of groups at group=576 [offline sweep, 597M native blocks]. No other GGUF
+// format offers this lever -- Q4_K's d/dmin are fp16, not powers of two -- which is why
+// every other type takes the dequantize-once-then-requantize route below.
+static void rk_moe_ingest_mxfp4_row(const void * W_src, int64_t n, int64_t K, int group,
+                                    int nG, int8_t * qB, float * b_scale) {
+    static_assert(sizeof(block_mxfp4) == 17, "MXFP4 block layout changed");
+    const int nblk_g = group / 32;                   // native blocks per merged group
+    const block_mxfp4 * row = (const block_mxfp4 *)W_src + (size_t)n * (K / 32);
+    int8_t * qrow = qB      + (size_t)n * K;
+    float  * srow = b_scale + (size_t)n * nG;
+
+    for (int g = 0; g < nG; g++) {
+        const block_mxfp4 * blk = row + (size_t)g * nblk_g;
+
+        // Pass 1: the group's exponent band, over the NONZERO blocks only. An all-zero
+        // block constrains nothing (0 shifts to 0) and its exponent is arbitrary, so
+        // letting it into the band would widen it for no reason. A code is zero iff its
+        // nibble's low 3 bits are zero (kvalues[0] == kvalues[8] == 0).
+        int e_min = 255, e_max = -1;
+        for (int b = 0; b < nblk_g; b++) {
+            bool nz = false;
+            for (int j = 0; j < 16; j++)
+                if (blk[b].qs[j] & 0x77) { nz = true; break; }
+            if (!nz) continue;
+            const int e = blk[b].e;
+            if (e < e_min) e_min = e;
+            if (e > e_max) e_max = e;
+        }
+        if (e_max < 0) {                             // the whole group is zero
+            srow[g] = 1.0f;
+            memset(qrow + (size_t)g * group, 0, (size_t)group);
+            continue;
+        }
+
+        int e_ref = e_max - 3;
+        if (e_ref < e_min) e_ref = e_min;
+        // The SAME conversion ggml uses for a block scale, so the merged scale is exactly
+        // the power of two the source blocks were built on -- no fp32 re-derivation.
+        srow[g] = GGML_E8M0_TO_FP32_HALF((uint8_t)e_ref);
+
+        // Pass 2: shift each block's codes onto e_ref. Byte j of a block holds element j
+        // in its low nibble and element j+16 in its high nibble (ggml's MXFP4 packing).
+        for (int b = 0; b < nblk_g; b++) {
+            const int sh = (int)blk[b].e - e_ref;
+            int8_t * out = qrow + ((size_t)g * nblk_g + b) * 32;
+            for (int j = 0; j < 16; j++) {
+                const uint8_t byte = blk[b].qs[j];
+                out[j]      = rk_mxfp4_shift(rk_mxfp4_kvalues[byte & 0x0F], sh);
+                out[j + 16] = rk_mxfp4_shift(rk_mxfp4_kvalues[byte >> 4],   sh);
+            }
+        }
+    }
+}
+
+// Ingest ONE row of a NON-MXFP4 quantized expert weight: dequantize it with the type's own
+// ggml dequantizer (bit-identical to what the CPU backend reads), then symmetric-int8
+// quantize it per K-group.
+//
+// The MXFP4 merge lever is a BONUS, not a requirement. What costs is a dequant per
+// MICRO-BATCH; a one-time one at ingest does not, so ANY format can be dequantized once
+// and requantized to whatever group the CBUF wants. int8 at group ~512 carries 255 levels
+// where Q4_K has 16 per 32-element sub-block, so the requant is FINER than the source
+// quantization (cosine 0.99997 on DeepSeek's Q4_K experts, 0.999976 on its Q8_0 ones).
+// The asymmetric min of a K-quant needs no special algebra here either: dequantizing folds
+// the offset in before the requant. This also covers DeepSeek-V2-Lite's MIXED-format expert
+// stacks (Q4_K gate/up, Q8_0 *and* Q5_0 down, by layer), which a format-specific ingest
+// would not.
+//
+// `frow` is caller-owned scratch of K floats (one per worker thread).
+static bool rk_moe_ingest_generic_row(const void * W_src, ggml_type wt, int64_t n, int64_t K,
+                                      int group, int nG, int8_t * qB, float * b_scale,
+                                      float * frow) {
+    const ggml_type_traits * tr = ggml_get_type_traits(wt);
+    if (!tr || !tr->to_float) return false;
+    const size_t rbytes = ggml_row_size(wt, K);      // bytes of one [K] quantized row
+    tr->to_float((const char *)W_src + (size_t)n * rbytes, frow, K);
+
+    int8_t * qrow = qB      + (size_t)n * K;
+    float  * srow = b_scale + (size_t)n * nG;
+    for (int g = 0; g < nG; g++) {
+        const float * src = frow + (size_t)g * group;
+        float amax = 0.0f;
+        for (int k = 0; k < group; k++) { const float v = fabsf(src[k]); if (v > amax) amax = v; }
+        const float s   = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+        const float inv = 1.0f / s;
+        int8_t * d = qrow + (size_t)g * group;
+        for (int k = 0; k < group; k++) d[k] = rocket_q8(src[k], inv);
+        srow[g] = s;
+    }
+    return true;
+}
+
+// Ingest a whole [N,K] quantized expert weight into int8 codes + [N*nG] fp32 group scales.
+// Rows are independent (a private scratch in, a disjoint output slice out), so they fan
+// across the persistent dequant pool -- this runs once per expert at model load, over
+// n_expert * 3 * n_layer weights, so the serial cost would be minutes. Bit-identical to
+// the serial loop (no cross-row state). Returns false for a type ggml cannot decode, and
+// the caller then leaves that expert on the fp16 route.
+static bool rocket_moe_ingest_int8(const void * W_src, ggml_type wt, int64_t N, int64_t K,
+                                   int group, int8_t * qB, float * b_scale) {
+    if (!ggml_is_quantized(wt) || group <= 0 || K % group) return false;
+    const int nG      = (int)(K / group);
+    const bool mxfp4  = (wt == GGML_TYPE_MXFP4) && (ggml_blck_size(wt) == 32)
+                                                && (ggml_type_size(wt) == sizeof(block_mxfp4));
+    std::atomic<bool> ok(true);
+
+    auto ingest_rows = [&](int64_t n0, int64_t n1) {
+        if (mxfp4) {
+            for (int64_t n = n0; n < n1; n++)
+                rk_moe_ingest_mxfp4_row(W_src, n, K, group, nG, qB, b_scale);
+            return;
+        }
+        std::vector<float> frow((size_t)K);
+        for (int64_t n = n0; n < n1 && ok.load(std::memory_order_relaxed); n++)
+            if (!rk_moe_ingest_generic_row(W_src, wt, n, K, group, nG, qB, b_scale, frow.data()))
+                ok.store(false, std::memory_order_relaxed);
+    };
+
+    const int nthr = rocket_dequant_threads();
+    if (N < 64 || nthr <= 1) { ingest_rows(0, N); return ok.load(); }
+    rocket_dequant_pool & pool = rocket_get_dequant_pool();
+    const int64_t per = (N + pool.size() - 1) / pool.size();
+    pool.run([&](int i) {
+        const int64_t n0 = (int64_t)i * per, n1 = n0 + per > N ? N : n0 + per;
+        if (n0 < n1) ingest_rows(n0, n1);
+    });
+    return ok.load();
+}
+
+// Quantize one activation row's K-group to symmetric int8 + its scale (= amax/127).
+// [-127,127], NOT -128, so +/- are symmetric and the scale is exact both ways -- the same
+// arithmetic as rocket_quant_act_int8, only the scale granularity differs (the activation
+// must be quantized on the SAME K-group grid as the weight, since the matmul applies
+// a_scale[m,g] * b_scale[n,g] to K-group g's int32 partial as it reads it back).
+//
+// This is the LAST host cost on the native-quant path: the weight ingest is one-time and
+// the per-K-group weight scale fuses into the readback loop the integer partials already
+// force (+0.6%, measured). Hence the NEON. The float pre-clamp to +/-127 makes the
+// saturating narrows exact and keeps this bit-identical to the scalar tail: values already
+// satisfy |x*inv| <= 127 by construction (inv = 127/amax), and vcvtnq_s32_f32 rounds
+// ties-to-even exactly as lrintf does under the default rounding mode.
+static inline void rk_quant_act_i8_group(const float * src, int8_t * dst, int group,
+                                         float * pscale) {
+    float amax = 0.0f;
+    int k = 0;
+#ifdef ROCKET_NEON_F32
+    float32x4_t vmax = vdupq_n_f32(0.0f);
+    for (; k + 4 <= group; k += 4) vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(src + k)));
+    amax = vmaxvq_f32(vmax);
+#endif
+    for (; k < group; k++) { const float v = fabsf(src[k]); if (v > amax) amax = v; }
+
+    const float s   = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+    const float inv = 1.0f / s;
+    *pscale = s;
+
+    k = 0;
+#ifdef ROCKET_NEON_F32
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    const float32x4_t vhi  = vdupq_n_f32(127.0f), vlo = vdupq_n_f32(-127.0f);
+    auto q4 = [&](const float * p) {
+        return vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(p), vinv), vlo), vhi));
+    };
+    for (; k + 16 <= group; k += 16) {
+        const int16x8_t s0 = vcombine_s16(vqmovn_s32(q4(src + k     )), vqmovn_s32(q4(src + k +  4)));
+        const int16x8_t s1 = vcombine_s16(vqmovn_s32(q4(src + k +  8)), vqmovn_s32(q4(src + k + 12)));
+        vst1q_s8(dst + k, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
+    }
+#endif
+    for (; k < group; k++) dst[k] = rocket_q8(src[k], inv);
+}
+
+// A[M,K] f32 -> int8 [M,K] + per-(row, K-group) scale a_scale[m*nG + g]. Rows are
+// independent, so they fan across the persistent dequant pool for a prefill-sized M
+// (bit-identical to the serial loop). Pad rows M..Mp are the caller's business.
+static void rocket_quant_act_int8_grouped(const float * src, int8_t * dst, int64_t M,
+                                          int64_t K, int group, float * a_scale) {
+    const bool prof = rocket_convprof_on();
+    const double t0 = prof ? rocket_now_ms() : 0.0;
+    const int nG = (int)(K / group);
+
+    auto quant_rows = [&](int64_t m0, int64_t m1) {
+        for (int64_t m = m0; m < m1; m++)
+            for (int g = 0; g < nG; g++)
+                rk_quant_act_i8_group(src + m * K + (size_t)g * group,
+                                      dst + m * K + (size_t)g * group,
+                                      group, a_scale + m * nG + g);
+    };
+
+    const int nthr = rocket_dequant_threads();
+    if (M < 64 || nthr <= 1) {
+        quant_rows(0, M);
+    } else {
+        rocket_dequant_pool & pool = rocket_get_dequant_pool();
+        const int64_t per = (M + pool.size() - 1) / pool.size();
+        pool.run([&](int i) {
+            const int64_t m0 = (int64_t)i * per, m1 = m0 + per > M ? M : m0 + per;
+            if (m0 < m1) quant_rows(m0, m1);
+        });
+    }
+    // Counted on the MoE line, not the dense W8A8 one: this quant is reached only from
+    // ggml_backend_rocket_mul_mat_id, and it is the host lever that route is judged on.
+    if (prof) { rocket_moeprof_arm(); g_moeprof.quant += rocket_now_ms() - t0; }
+}
+
+// The K-group the native-quant expert path quantizes on, for a given (K,N). 0 = none legal
+// (the caller then leaves this weight on the fp16 route).
+//
+// Readback (~ M*N*nKt, nKt = K/Kt) is what these integer paths are bound by. A K-tile must
+// lie wholly inside one quant group, so the group UPPER-BOUNDS the driver's K-tile and the
+// CBUF caps it. The best group is therefore the LARGEST divisor of K that is a multiple of
+// 32 and that the group-wise planner can still serve with Kt == group: that reaches the
+// readback floor, and no larger group can beat it (a group too wide for the CBUF is split
+// into several K-tiles, which costs readback without buying accuracy). For gpt-oss's
+// K=2880 that is 576 (nKt=5); for K=2048 it is 512 (nKt=4).
+//
+// Probe the SHIPPED planner rather than re-deriving its CBUF arithmetic here -- the cap is
+// a machine parameter (CBUF banks x tile geometry), not a constant to copy. Pure and
+// cheap: a few dozen calls to a pure function, once per MUL_MAT_ID op.
+//
+// The native MXFP4 block size (group=32) is NOT the operating point and never can be: it
+// would mean nKt=90 and a readback that swamps the whole win.
+static int rocket_moe_pick_group(int K, int N) {
+    const int max_tile = rocket_hw_current()->max_tile;   // the canonical resident tile M
+    auto legal = [&](int g) -> bool {
+        if (g < 32 || g % 32 || K % g) return false;
+        int Mt, Kt, Nt;
+        if (rocket_matmul_plan_int8_gw(max_tile, K, N, g, &Mt, &Kt, &Nt) < 0) return false;
+        return Kt == g;                                   // group kept whole -> readback floor
+    };
+    const int forced = rocket_moe_group_env();
+    if (forced > 0) {
+        // An explicit group is honoured even when the CBUF must split it across K-tiles
+        // (that is legal -- just slower); only a shape-illegal group is rejected.
+        int Mt, Kt, Nt;
+        if (forced % 32 == 0 && K % forced == 0
+            && rocket_matmul_plan_int8_gw(max_tile, K, N, forced, &Mt, &Kt, &Nt) >= 0)
+            return forced;
+        GGML_LOG_WARN("%s: ROCKET_MOE_GROUP=%d is not legal for K=%d N=%d "
+                      "(need %%32 and to divide K) -> auto\n", __func__, forced, K, N);
+    }
+    for (int g = (K / 32) * 32; g >= 32; g -= 32)
+        if (legal(g)) return g;
+    return 0;
+}
+
+// Round an expert's ragged row count up to a coarse bucket. TWO hard constraints meet here,
+// and one bucket satisfies both:
+//
+//  - M%4 is a HW contract. The resident paths reject an unaligned M outright, because an
+//    unaligned M does not merely tile badly -- it MISCOMPUTES (the matmul's rows are the
+//    conv's spatial height, and a height below 4 is broken silicon geometry). A router
+//    hands out whatever row count it likes, so this is the shape that actually occurs.
+//    Pad rows quantize to zero and contribute nothing.
+//  - The driver caches its resident scratch per (M,K,N,group) in a FIXED-SIZE table (32
+//    slots), each slot holding its own NPU BOs. A distinct M per (expert, layer,
+//    micro-batch) would exhaust that table partway through a single forward pass, after
+//    which every remaining expert's matmul returns -1 and degrades to the CPU -- which
+//    reads as "the win didn't materialize", not as a bug.
+//
+// M_e is rounded up to a rung of a FIXED ladder with two steps per octave, starting at the
+// granule (default 64):
+//
+//     64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, ...
+//
+// Two properties, and both are the whole point:
+//
+//   BOUNDED BY CONSTRUCTION. Two rungs per octave means every M a router can produce
+//   (M_e <= n_tokens * n_expert_used, so a few thousand at most) lands on one of ~15 values.
+//   With room for a couple of distinct (K,N) expert shapes that stays comfortably inside the
+//   driver's 32-slot table -- and it is bounded with no state that can be got wrong.
+//
+//   PADDING IS CAPPED. A rung is at most 1.5x the one below, so a bucket never exceeds M by
+//   more than ~33%, and is ~15% over on average. Pad rows quantize to zero and contribute
+//   nothing to the result, but the GEMM still computes and reads them back, so they are paid
+//   in full and the cap matters.
+//
+// This REPLACES an adaptive granule that doubled whenever the distinct-slot count neared the
+// cap, and that design had a fatal RATCHET. The slot set never shrinks -- the driver's scratch
+// slots are permanent, it has no eviction -- so once the set passed the cap, the "do we still
+// have headroom" test could never become true again. Every subsequent new bucket therefore
+// doubled the granule, in a loop, until it hit its 4096 ceiling on the very first overflow.
+// After that a 356-row expert computed 4096 rows: 88% of every expert GEMM was padding, and the
+// native route measured 6.11 t/s at pp2048 where it should be several times that. The bug was
+// invisible without an explicit padded-row counter, because nothing failed -- it just quietly
+// did 8x the arithmetic. A fixed ladder cannot ratchet, because there is nothing to adapt.
+static inline uint64_t rk_moe_slot_key(int Mb, int K, int N) {
+    return ((uint64_t)(uint32_t)Mb << 42) | ((uint64_t)(uint32_t)K << 21) | (uint32_t)N;
+}
+static int rocket_moe_bucket_m(ggml_backend_rocket_context * ctx, int M, int K, int N) {
+    if (ctx->moe_m_granule == 0) ctx->moe_m_granule = rocket_moe_m_bucket_env();
+    const int g = ctx->moe_m_granule;              // a power of two >= 4 (see the env reader)
+
+    int Mb = g;
+    if (M > g) {
+        Mb = (M + 3) & ~3;                          // absurd M: fall through, still M%4-legal
+        for (int p = g; p <= (1 << 22); p *= 2) {
+            // The 1.5x rung between p and 2p, rounded up onto the M%4 HW contract. That
+            // rounding is load-bearing at a small granule: at g=4 the raw rung would be 6,
+            // which the driver rejects (-1) and the expert would silently fall back to fp16.
+            const int mid = (p + p / 2 + 3) & ~3;
+            if (M <= mid)   { Mb = mid;   break; }
+            if (M <= p * 2) { Mb = p * 2; break; }
+        }
+    }
+
+    // Track the distinct (M,K,N) slots we have asked the driver for. Purely diagnostic now that
+    // the ladder bounds them -- but warn once if we ever near the table, because the failure it
+    // would cause (rki_ctx_scratch returns NULL, the expert degrades to fp16) reads as "the win
+    // didn't materialize" rather than as a fault. Shapes past 2^21 cannot be packed into the
+    // key; they are far outside any real model, so skip the accounting rather than mis-key it.
+    if (K < (1 << 21) && N < (1 << 21)) {
+        ctx->moe_slots.insert(rk_moe_slot_key(Mb, K, N));
+        if (ctx->moe_slots.size() == 28)
+            GGML_LOG_WARN("[moe-int8] %zu distinct (M,K,N) scratch slots, near the driver's 32 "
+                          "-- further shapes will fall back to the fp16 route. Raise "
+                          "ROCKET_MOE_M_BUCKET to collapse them.\n", ctx->moe_slots.size());
+    }
+    return Mb;
+}
+
+// Fetch (or build) expert `e`'s resident int8 weight. Returns nullptr to tell the caller to
+// stream this expert on the fp16 dequant path -- over budget, IOVA window full, no stable
+// weight name, or an undecodable type. All of those are SAFE: the fp16 route reads the
+// untouched GGUF source (the native path never madvises it away; see below).
+//
+// ADMISSION ONLY, no eviction, and that is the correct policy rather than a missing feature:
+// prefill touches EVERY expert EVERY micro-batch, so there is no hotness for an eviction
+// policy to exploit -- the only thing that decides how much of the dequant tax is removed
+// is the total resident bytes. A 60%-resident model removes 60% of the tax; the blend is a
+// win, not a cliff.
+static const rocket_moe_i8_expert * rocket_moe_expert_resident(
+        ggml_backend_rocket_context * ctx, const ggml_tensor * as, int64_t e,
+        int K, int N, int group) {
+    if (ctx->i8_dev_failed) return nullptr;
+    if (!ctx->i8_dev) {
+        // Shared with the dense W8A8 resident path (same device, same worker fds). More
+        // worker fds is also more IOVA: the 4GB window is PER FD, and the expert stack of
+        // a real MoE is tens of GB, so the fan-out is what makes any of it resident at all.
+        ctx->i8_dev = rocket_i8_ctx_create(ctx->n_threads);
+        if (!ctx->i8_dev) { ctx->i8_dev_failed = true; return nullptr; }
+    }
+
+    // Key on (weight name, expert index). rocket_weight_key returns ONE name for the whole
+    // [K,N,n_expert] stack, so a name-only key would serve expert 0's tiles for every
+    // expert's matmul -- correct arithmetic on the wrong weights.
+    const std::string base = rocket_weight_key(as);
+    if (base.empty()) return nullptr;                  // no stable identity -> fp16 route
+    const std::string key = base + "/e" + std::to_string((long long)e);
+
+    auto it = ctx->moe_i8_cache.find(key);
+    if (it != ctx->moe_i8_cache.end()) {
+        if (it->second.K == K && it->second.N == N && it->second.group == group)
+            return &it->second;                        // reused across every M (M-independent)
+        rocket_i8_weights_free(ctx->i8_dev, it->second.w);   // genuine shape/group change
+        ctx->moe_i8_resident_bytes -= it->second.bytes;
+        ctx->moe_charged_bytes     -= it->second.charged;
+        ctx->moe_n_resident--;
+        ctx->moe_i8_cache.erase(it);
+    }
+    if (ctx->moe_i8_full) { ctx->moe_streamed_keys.insert(key); return nullptr; }
+
+    // Charge the budget for the int8 codes, the group scales, AND the expert's GGUF source
+    // bytes (as->nb[2] is exactly one expert's payload).
+    //
+    // The source is NOT reclaimable here the way a dense resident weight's is. llama.cpp
+    // MMAPS the GGUF, so it lives in page cache -- which a large anonymous allocation will
+    // happily evict -- and MoE DECODE reads the active experts from it on the CPU every
+    // token, so evicting it means faulting the expert back from NVMe per token. Both copies
+    // have to coexist, so both are charged.
+    //
+    // This is a PROXY, and it under-charges when residency is partial: a streamed expert's
+    // source still occupies page cache but is charged to nobody. It is deliberately the
+    // conservative direction to be wrong in, and it is what keeps a full-residency model
+    // honest -- when every expert is resident the charge is exact. Charging the int8 bytes
+    // alone is what turns "19.1 GiB of gpt-oss int8 experts fits a 31 GiB board" into a
+    // thrash: it does fit, but only by evicting the 11 GiB GGUF it was made from.
+    const int    nG  = (int)(K / group);
+    const size_t est = (size_t)N * K + (size_t)N * nG * sizeof(float) + (size_t)as->nb[2];
+    if (ctx->moe_cache_budget != 0
+        && ctx->moe_charged_bytes + est > ctx->moe_cache_budget) {
+        ctx->moe_i8_full = true;                       // latch: the rest streams on fp16
+        ctx->moe_streamed_keys.insert(key);
+        // On the rocket_log channel, NOT GGML_LOG_*: llama-bench SILENCES ggml's logger, and
+        // llama-bench is precisely the tool this path is measured with -- a split that only
+        // prints under llama-cli is a split nobody sees when it matters.
+        ROCKET_LOGI("[moe-int8] resident budget reached at %ld experts (%zuMB on the NPU, "
+                    "%zuMB charged incl. the GGUF source) -- the remaining experts stream via "
+                    "dequant->fp16 (raise ROCKET_MOE_CACHE_MB, or ROCKET_N_THREADS for more "
+                    "per-fd IOVA)\n",
+                    ctx->moe_n_resident, ctx->moe_i8_resident_bytes >> 20,
+                    ctx->moe_charged_bytes >> 20);
+        return nullptr;
+    }
+
+    if (ctx->moe_n_resident == 0) {
+        char budget[32];
+        if (ctx->moe_cache_budget) snprintf(budget, sizeof(budget), "%zuMB", ctx->moe_cache_budget >> 20);
+        else                       snprintf(budget, sizeof(budget), "unlimited");
+        ROCKET_LOGI("[rocket] MoE native-quant experts ON: %s -> int8, group=%d (nKt=%d), "
+                    "resident budget %s (ROCKET_MOE_NATIVE=0 for the fp16 dequant route)\n",
+                    ggml_type_name(as->type), group, nG, budget);
+    }
+
+    // Ingest ONCE: GGUF quant blocks -> int8 codes + per-(channel, group) scales. Into the
+    // context's grow-only scratch: the codes are consumed by the pack below (which scatters
+    // them into the resident NPU BOs) and then dropped, so only the scales are kept.
+    const char * W_src = (const char *)as->data + (size_t)e * as->nb[2];
+    ctx->moe_ingest_codes.resize((size_t)N * K);
+    ctx->moe_ingest_scales.resize((size_t)N * nG);
+    const double t_ingest = rocket_now_ms();
+    if (!rocket_moe_ingest_int8(W_src, as->type, N, K, group,
+                                ctx->moe_ingest_codes.data(), ctx->moe_ingest_scales.data())) {
+        ctx->moe_streamed_keys.insert(key);            // undecodable type -> fp16 route
+        return nullptr;
+    }
+    const double t_pack = rocket_now_ms();
+    ctx->moe_ingest_ms += t_pack - t_ingest;
+
+    rocket_i8_weights * rw = rocket_i8_weights_pack_gw(
+            ctx->i8_dev, rocket_hw_current()->max_tile, K, N,
+            ctx->moe_ingest_codes.data(), group);
+    ctx->moe_pack_ms += rocket_now_ms() - t_pack;
+    if (!rw) {                                         // IOVA/alloc exhausted
+        ctx->moe_i8_full = true;
+        ctx->moe_streamed_keys.insert(key);
+        ROCKET_LOGI("[moe-int8] NPU IOVA window full at %ld experts / %zuMB -- the remaining "
+                    "experts stream via dequant->fp16 (more workers = more per-fd IOVA: "
+                    "ROCKET_N_THREADS)\n",
+                    ctx->moe_n_resident, ctx->moe_i8_resident_bytes >> 20);
+        return nullptr;
+    }
+    // The pack planned its scratch at the canonical tile M; register that slot so the
+    // bucket accounting sees it (it competes for the same 32-slot table).
+    if (K < (1 << 21) && N < (1 << 21))
+        ctx->moe_slots.insert(rk_moe_slot_key(rocket_hw_current()->max_tile, K, N));
+
+    // The BUDGET pre-check used an estimate; the running total uses the weight's TRUE
+    // resident NPU-BO footprint (queried from the packed weight) plus the same source
+    // charge, so the cap tracks what memory is actually committed.
+    const size_t bytes   = rocket_i8_weights_bytes(rw);
+    const size_t charged = bytes + (size_t)as->nb[2];
+    rocket_moe_i8_expert ent;
+    ent.w = rw;
+    // Copied out of the shared ingest scratch (it is reused by the next expert); the scales
+    // are the only host-side state a resident expert keeps -- the codes now live on the NPU.
+    ent.b_scale.assign(ctx->moe_ingest_scales.begin(),
+                       ctx->moe_ingest_scales.begin() + (size_t)N * nG);
+    ent.K = K; ent.N = N; ent.group = group; ent.bytes = bytes; ent.charged = charged;
+    // rw holds resident NPU BOs and the entry stores it as a raw pointer with no
+    // destructor; free it if the cache insert throws before the map takes ownership.
+    rocketraii::scope_guard rw_guard([&] { rocket_i8_weights_free(ctx->i8_dev, rw); });
+    auto & slot = (ctx->moe_i8_cache[key] = std::move(ent));
+    rw_guard.dismiss();
+    ctx->moe_i8_resident_bytes += bytes;
+    ctx->moe_charged_bytes     += charged;
+    ctx->moe_n_resident++;
+
+    // NOTE: deliberately NO ROCKET_PREPACK_MADVISE reclaim of the GGUF source here, unlike
+    // the dense resident paths. Two reasons, either alone sufficient: MoE DECODE reads the
+    // active experts from that source on the CPU every token, and under partial residency
+    // the experts that did NOT go resident need it for their fp16 route -- and the source
+    // is one [K,N,n_expert] mapping shared by all of them.
+
+    if (rocket_debug_on())
+        GGML_LOG_DEBUG("[moe-int8] +%-30s K=%5d N=%5d group=%3d  resident=%zuMB (%ld experts)\n",
+                       key.c_str(), K, N, group, ctx->moe_i8_resident_bytes >> 20,
+                       ctx->moe_n_resident);
+    // The ingest is lazy, so it lands inside the FIRST prefill -- and on a real MoE that is
+    // thousands of experts and tens of GB of decode + NPU-BO scatter, i.e. minutes. A silent
+    // multi-minute stall at the first token reads as a hang, so tick every 256 experts, and
+    // carry the elapsed time so the tick is a progress RATE and not just a sign of life.
+    else if ((ctx->moe_n_resident % 256) == 0)
+        ROCKET_LOGI("[moe-int8] ingesting experts to int8: %ld done, %zuMB resident, %.0fs elapsed\n",
+                    ctx->moe_n_resident, ctx->moe_i8_resident_bytes >> 20,
+                    (ctx->moe_ingest_ms + ctx->moe_pack_ms) / 1000.0);
+    return &slot;
+}
+
 // ---------------------------------------------------------------------------
 // MUL_MAT_ID (MoE routed-expert FFN)
 //
@@ -2829,15 +3649,29 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
 // depend on the routing. This handler reproduces the CPU reference's row-grouping
 // (ggml_compute_forward_mul_mat_id): bucket the (slot,token) rows by their expert
 // id, then for each expert with a nonzero bucket gather its rows into a dense
-// [M_e,K] activation tile, run [M_e,K] x [N,K]^T on the NPU (weights dequant->fp16
-// like the dense path; the GEMM fanned across the worker fds), and scatter the
-// [M_e,N] result back to each row's dst slot. Faithful to the reference within the
-// same per-row-scaled fp16-accumulate envelope as the dense matmul -- proven by
-// test-rocket-moe (cosine vs the CPU backend) and the per-model differential-PPL gate.
+// [M_e,K] activation tile, run [M_e,K] x [N,K]^T on the NPU, and scatter the [M_e,N]
+// result back to each row's dst slot.
 //
-// Returns 0 on success. A failed NPU job degrades that ONE expert to a CPU matmul
-// (never aborts the graph); nonzero is returned only on a malformed graph (an id
-// outside [0,n_expert), which supports_op cannot see because ids is data).
+// TWO weight routes, chosen per expert:
+//
+//   NATIVE-QUANT (a GGUF-quantized expert, the default under ROCKET_MOE=1). The expert's
+//   quant blocks were ingested ONCE into int8 codes that live in NPU BOs, so the call
+//   quantizes only the activation (per row, per K-group) and runs the resident group-wise
+//   int8 matmul, which returns fp32 with every scale already applied. No host dequant, no
+//   weight scatter -- which IS the win; see the native-quant section above.
+//
+//   fp16 (an F16/F32/BF16 expert, an expert that did not fit the resident budget, or
+//   ROCKET_MOE_NATIVE=0). The weight is dequantized to fp16 per micro-batch and run
+//   through the multicore fp16 GEMM -- the original route, kept as the fallback and as the
+//   A/B baseline.
+//
+// Faithful to the reference within each route's numeric envelope -- proven by
+// test-rocket-moe (cosine vs the CPU backend, on both routes) and the per-model
+// differential-PPL / greedy-match gates.
+//
+// Returns 0 on success. A failed NPU job degrades that ONE expert (native -> fp16 -> CPU),
+// never aborting the graph; nonzero is returned only on a malformed graph (an id outside
+// [0,n_expert), which supports_op cannot see because ids is data).
 static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggml_tensor * dst) {
     const ggml_tensor * as  = dst->src[0];   // experts [K, N, n_expert]
     const ggml_tensor * b   = dst->src[1];   // input   [K, ne11, n_tokens]
@@ -2911,16 +3745,39 @@ static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggm
         }
     };
 
+    // --- native-quant route: is it available for THIS op? ---
+    // Only a GGUF-quantized expert has a per-micro-batch dequant to delete, so an F16
+    // expert stays on the fp16 route (int8 would cost accuracy and buy nothing). int8's
+    // weight k-group is 32, stricter than the N%16 supports_op gate, so self-guard it.
+    // rocket_moe_pick_group returns 0 when no legal K-group exists, which also disables it.
+    const bool native_type = rocket_moe_native_on() && ggml_is_quantized(wt)
+                          && (K % 32 == 0) && (N % 32 == 0);
+    const int  group = native_type ? rocket_moe_pick_group((int)K, (int)N) : 0;
+    const int  nG    = group > 0 ? (int)(K / group) : 0;
+
+    // ROCKET_MM_PROFILE: split this op into gather / quant / GEMM / scatter, and count the
+    // rows the M-bucket padding makes us compute and throw away. See g_moeprof.
+    const bool prof = rocket_convprof_on();
+    if (prof) { rocket_moeprof_arm(); g_moeprof.calls++; }
+
+    // ROCKET_MOE_COSINE: probe ONE expert per op against the fp64 CPU reference, rotating the
+    // chosen expert across ops so the sample sweeps every layer, every projection and the
+    // whole expert set instead of camping on expert 0. See rocket_moe_cosine_on.
+    const bool cos_probe = rocket_moe_cosine_on() && group > 0;
+    static long   cos_op     = 0;
+    const int64_t cos_expert = cos_probe ? (cos_op++ % n_expert) : -1;
+
     // --- per-expert GEMM ---
     for (int64_t e = 0; e < n_expert; e++) {
         const int64_t r0 = off[e], r1 = off[e + 1];
         const int64_t M_e = r1 - r0;
         if (M_e == 0) continue;   // this expert got no tokens this micro-batch
 
-        const int64_t Mp = rocket_pad_m((int)M_e);   // driver needs M%4; pad rows = 0
+        const char * W_src = (const char *)as->data + e * as->nb[2];   // expert weight [N,K]
 
-        // gather this expert's M_e input rows into a dense [M_e,K] f32 tile, then
-        // pack to per-row-scaled fp16 [Mp,K] (pad rows M_e..Mp zeroed below)
+        // gather this expert's M_e input rows into a dense [M_e,K] f32 tile (both routes
+        // consume it: the native one quantizes it, the fp16 one packs it)
+        const double t_gather = prof ? rocket_now_ms() : 0.0;
         ctx->moe_Af32.resize((size_t)M_e * K);
         for (int64_t r = 0; r < M_e; r++) {
             const int64_t i11 = slot[r0 + r] % ne11;   // b's slot (broadcast when ne11==1)
@@ -2928,6 +3785,99 @@ static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggm
             const float * src = (const float *)((const char *)b->data + i12 * nb_b_tok + i11 * nb_b_slot);
             memcpy(ctx->moe_Af32.data() + (size_t)r * K, src, (size_t)K * sizeof(float));
         }
+        if (prof) g_moeprof.gather += rocket_now_ms() - t_gather;
+
+        // ---- route 1: NATIVE-QUANT (resident int8 codes, group-wise scales) ----
+        if (group > 0) {
+            // NB: the one-time ingest happens inside this call on an expert's first touch.
+            // It is timed separately (ctx->moe_ingest_ms) and is deliberately NOT part of
+            // any per-call bucket below -- folding a minutes-long startup cost into a
+            // per-micro-batch line would make every phase unreadable.
+            const rocket_moe_i8_expert * rw =
+                rocket_moe_expert_resident(ctx, as, e, (int)K, (int)N, group);
+            if (rw) {
+                // Bucket M (>= M_e, %4) -- both a HW contract and what keeps the driver's
+                // fixed-size resident-scratch table from filling. Pad rows quantize to zero
+                // and contribute nothing; their output rows are computed and discarded.
+                const int Mb = rocket_moe_bucket_m(ctx, (int)M_e, (int)K, (int)N);
+                ctx->moe_qA.resize((size_t)Mb * K);
+                ctx->moe_a_scale.resize((size_t)Mb * nG);
+                ctx->moe_Cgw.resize((size_t)Mb * N);
+                if (Mb > M_e) {   // the scratch is reused across experts -> clear the pad
+                    memset(ctx->moe_qA.data() + (size_t)M_e * K, 0, (size_t)(Mb - M_e) * K);
+                    std::fill(ctx->moe_a_scale.begin() + (size_t)M_e * nG,
+                              ctx->moe_a_scale.begin() + (size_t)Mb  * nG, 1.0f);
+                }
+                rocket_quant_act_int8_grouped(ctx->moe_Af32.data(), ctx->moe_qA.data(),
+                                              M_e, K, group, ctx->moe_a_scale.data());
+
+                // The primitive applies a_scale[m,g]*b_scale[n,g] to each K-group's int32
+                // partial INSIDE the readback loop the integer partials already force, and
+                // hands back fp32 -- so there is nothing left to convert or rescale here.
+                // Do not add a pass over the output: that is exactly the cost this design
+                // avoids (+0.6% as fused, vs the ~2.8ms a separate pass was projected at).
+                const double t_gemm = prof ? rocket_now_ms() : 0.0;
+                const int rc = rocket_matmul_int8_prepacked_gw(
+                        ctx->i8_dev, Mb, (int)K, (int)N, ctx->moe_qA.data(),
+                        ctx->moe_a_scale.data(), rw->b_scale.data(), ctx->moe_Cgw.data(), rw->w);
+                if (prof) {
+                    g_moeprof.gemm += rocket_now_ms() - t_gemm;
+                    g_moeprof.gemms++;
+                    g_moeprof.rows_used     += M_e;   // the rows the router actually asked for
+                    g_moeprof.rows_computed += Mb;    // the rows the bucketed GEMM ran
+                }
+                if (rc == 0) {
+                    // Faithfulness probe (ROCKET_MOE_COSINE=1): one expert per op, rotating,
+                    // against the fp64 CPU reference. See rocket_moe_cosine_on.
+                    if (cos_probe && e == cos_expert) {
+                        ctx->moe_Cf32.resize((size_t)M_e * N);
+                        rocket_cpu_matmul_slice(ctx->moe_Af32.data(), (const void *)W_src, wt,
+                                                ctx->moe_Cf32.data(), M_e, N, K);
+                        const double c = rocket_cosine_f32(ctx->moe_Cgw.data(),
+                                                           ctx->moe_Cf32.data(),
+                                                           (size_t)M_e * N);
+                        if (!g_moecos_armed) { atexit(rocket_moecos_dump); g_moecos_armed = 1; }
+                        g_moecos.sum += c;
+                        if (c < g_moecos.min) g_moecos.min = c;
+                        g_moecos.n++;
+                        // Report as we go, not only at exit. atexit is not enough: the host may
+                        // never exit cleanly (llama-cli drops into an interactive loop after
+                        // generating, so a harness has to kill it), and a diagnostic that only
+                        // prints on a graceful shutdown is a diagnostic you do not get.
+                        if ((g_moecos.n % 24) == 0) rocket_moecos_dump();
+                    }
+                    const double t_sc = prof ? rocket_now_ms() : 0.0;
+                    scatter_f32(ctx->moe_Cgw.data(), r0, M_e);   // first M_e rows; pad discarded
+                    if (prof) g_moeprof.scatter += rocket_now_ms() - t_sc;
+                    continue;
+                }
+                // A driver decline here (a re-pack request, or an exhausted scratch table)
+                // is not a wrong answer -- it fails closed. Degrade THIS expert to the fp16
+                // route below, and say so once: silently reverting mid-prefill is exactly
+                // how a lost win gets mistaken for a bug.
+                static bool warned_gw = false;
+                if (!warned_gw || rocket_debug_on()) {
+                    warned_gw = true;
+                    GGML_LOG_WARN("[moe-int8] resident group-wise matmul declined (rc=%d) for "
+                                  "expert=%lld M=%d K=%lld N=%lld group=%d -> fp16 route for it\n",
+                                  rc, (long long)e, Mb, (long long)K, (long long)N, group);
+                }
+            }
+            // rw == nullptr: admission declined this expert (budget / IOVA / no stable
+            // name). It streams on the fp16 route below -- correct, just at the streaming
+            // cost. rocket_moe_expert_resident has already recorded and logged the split.
+        }
+
+        // ---- route 2: fp16 (dequant per micro-batch) ----
+        // One timer for the whole route, charged on every way out of it (the two CPU
+        // fallbacks `continue`, the normal path falls through), because what matters is the
+        // total that streaming still costs -- not which of its steps it was spent in.
+        const double t_fp16 = prof ? rocket_now_ms() : 0.0;
+        rocketraii::scope_guard fp16_timer([&] {
+            if (prof) { g_moeprof.fp16 += rocket_now_ms() - t_fp16; g_moeprof.fp16_gemms++; }
+        });
+
+        const int64_t Mp = rocket_pad_m((int)M_e);   // driver needs M%4; pad rows = 0
         ctx->moe_A16.resize((size_t)Mp * K);
         if (Mp > M_e)   // clear the pad rows (moe_A16 is reused, so they may be stale)
             memset(ctx->moe_A16.data() + (size_t)M_e * K, 0, (size_t)(Mp - M_e) * K * sizeof(ggml_fp16_t));
@@ -2935,7 +3885,6 @@ static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggm
         rocket_pack_activations(ctx->moe_Af32.data(), ctx->moe_A16.data(), M_e, K, ctx->moe_scales.data());
 
         // expert weight slice [N,K]: F16 zero-copy, else dequant->fp16 (F32/BF16/quant)
-        const char * W_src = (const char *)as->data + e * as->nb[2];
         const ggml_fp16_t * Bp;
         if (w_is_f16) {
             Bp = (const ggml_fp16_t *)W_src;
@@ -3571,6 +4520,39 @@ ggml_backend_t ggml_backend_rocket_init(void) {
     if (const char * e = getenv("ROCKET_INT4_CACHE_MB")) {
         size_t b; if (rocket_parse_mb_budget(e, &b)) ctx->int4_cache_budget = b;
     }
+    // ROCKET_MOE_CACHE_MB: the resident native-quant EXPERT budget in MB (0 = unlimited).
+    //
+    // This is a much bigger appetite than the other caches and needs its own budget rather
+    // than the dense path's fixed 4GB default: a real MoE's expert stack is the bulk of the
+    // model (gpt-oss-20b: 19.1 GiB of int8 expert codes), and the GGUF it was ingested from
+    // must stay mapped -- MoE DECODE reads the active experts from it on the CPU every
+    // token, so it cannot be reclaimed. Full residency therefore does NOT fit a 32GB board
+    // for gpt-oss, and partial residency is the design, not a failure mode.
+    //
+    // So the default is AUTO: size the budget from MemAvailable minus a reserve, exactly as
+    // ROCKET_QUANT_RESIDENT=auto does, and let admission fill it and then degrade. A blanket
+    // "unlimited" on a memory-tight board is a trap (the board has no swap); a fixed default
+    // would be wrong on every board but one.
+    {
+        const char * e = getenv("ROCKET_MOE_CACHE_MB");
+        size_t b;
+        if (e && rocket_parse_mb_budget(e, &b)) {
+            ctx->moe_cache_budget = b;                      // explicit (0 = unlimited)
+            ROCKET_LOGI("[rocket] ROCKET_MOE_CACHE_MB=%s -> resident expert budget %s\n",
+                        e, b ? "set" : "unlimited");
+        } else {
+            const size_t avail = rocket_meminfo_bytes("MemAvailable");
+            const size_t total = rocket_meminfo_bytes("MemTotal");
+            size_t reserve = (size_t)6144 << 20;             // 6 GiB floor
+            if (total / 10 * 3 > reserve) reserve = total / 10 * 3;   // or 30% of RAM
+            if (const char * r = getenv("ROCKET_QUANT_RESIDENT_RESERVE_MB")) {
+                size_t rb; if (rocket_parse_mb_budget(r, &rb)) reserve = rb;
+            }
+            ctx->moe_cache_budget = (avail > reserve) ? (avail - reserve)
+                                                      : ((size_t)256 << 20);   // minimal floor
+            if (!avail) ctx->moe_cache_budget = (size_t)4096 << 20;   // no signal -> conservative
+        }
+    }
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_rocket_guid(),
         /* .iface   = */ rocket_backend_i,
@@ -3583,6 +4565,13 @@ ggml_backend_t ggml_backend_rocket_init(void) {
 
 bool ggml_backend_is_rocket(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rocket_guid());
+}
+
+void ggml_backend_rocket_moe_stats(ggml_backend_t backend, long * n_resident, long * n_streamed) {
+    GGML_ASSERT(ggml_backend_is_rocket(backend));
+    const ggml_backend_rocket_context * ctx = (const ggml_backend_rocket_context *)backend->context;
+    if (n_resident) *n_resident = ctx->moe_n_resident;
+    if (n_streamed) *n_streamed = (long)ctx->moe_streamed_keys.size();
 }
 
 void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, int n_threads) {
