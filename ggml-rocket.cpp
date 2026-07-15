@@ -214,6 +214,14 @@ struct ggml_backend_rocket_context {
     // overrides (0 = unlimited).
     size_t resident_bytes = 0;
     size_t cache_budget   = (size_t)2048 << 20;
+    // Runtime OOM floor for the resident-weight admission (0 = disabled). Set to the
+    // swap-safe reserve by the auto / N-MB budget modes: before committing a resident pack,
+    // build_resident latches if MemAvailable has fallen below this, so residency stops
+    // BEFORE an OOM even when the static byte budget was optimistic. Load-bearing for the F16
+    // knob, whose resident tiles DUPLICATE the still-mapped GGUF (the init MemAvailable counts
+    // the not-yet-faulted GGUF pages as free); the byte budget alone can over-commit a model
+    // that does not fit ~2x. The board has no swap, so an over-commit is a hard kill.
+    size_t resident_floor_bytes = 0;
 
     // Total source bytes reclaimed by ROCKET_PREPACK_MADVISE (the prefill-only
     // resident-weight reclaim; see rocket_prepack_madvise_on).
@@ -569,6 +577,33 @@ static bool rocket_quant_resident_on(void) {
     static int v = -1;
     if (v < 0) {
         const char * e = getenv("ROCKET_QUANT_RESIDENT");
+        v = (e && (strcmp(e, "auto") == 0 || atoi(e) > 0)) ? 1 : 0;
+    }
+    return v > 0;
+}
+
+// ROCKET_F16_RESIDENT: the F16 sibling of ROCKET_QUANT_RESIDENT. Holds a static F16
+// weight's scattered tiles RESIDENT in NPU BOs for ALL K -- not just the K<=2048 whisper
+// default -- so the big LLM weights (attn/FFN, K in {3072,8192,...}) pay their weight
+// scatter (packB) ONCE and reuse it across every later micro-batch / prefill instead of
+// re-scattering per call (the streaming tax). Measured net win over the fused-streaming
+// default even though it disables QKV/gate-up fusion (see rocket_fuse_on): eliminating the
+// fused weights' packB is worth more than the fusion it costs [HW sweep, Llama-3.2-3B-F16,
+// pp2048 -ub512, 600 MHz: resident 41.9 vs default 39.9 t/s = +5%; the pure packB delta with
+// fusion held off is +10.6%].
+//
+// Decode-safe by design: it does NOT madvise the F16 source (that stays behind the separate,
+// prefill-only ROCKET_PREPACK_MADVISE), so the GGUF stays mapped for CPU decode. The resident
+// tiles DUPLICATE the still-mapped GGUF, so this is the "F16-for-quality, RAM-to-spare" case
+// (roughly, models that fit ~2x in RAM); the auto budget below caps residency and a runtime
+// MemAvailable floor (build_resident) latches before an OOM, streaming the overflow.
+//
+// On for "auto" (budget sized from free RAM at init), a positive MB budget, or "1"; off for
+// "0"/unset. Cached like rocket_quant_resident_on so the no-ctx supports_op path can read it.
+static bool rocket_f16_resident_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("ROCKET_F16_RESIDENT");
         v = (e && (strcmp(e, "auto") == 0 || atoi(e) > 0)) ? 1 : 0;
     }
     return v > 0;
@@ -1302,6 +1337,7 @@ static int rocket_quant_int4_grouped(const float * srcf, const void * srcv, bool
 // One-shot int8 / int4 / bf16 matmul generators
 // ===========================================================================
 static std::string rocket_weight_key(const ggml_tensor * t);   // defined below (fp16 wcache)
+static size_t rocket_meminfo_bytes(const char * field);        // defined below (init); read in build_resident
 
 // W8A8 int8 matmul for one plain 2D static-weight GEMM, via the one-shot tiled
 // int8 driver. Returns 0 (dst written) or <0 to fall through to the fp16 path.
@@ -2332,6 +2368,22 @@ static int ggml_backend_rocket_mul_mat_prepacked(
         const size_t est = (size_t)N * K * sizeof(ggml_fp16_t);   // resident weight bytes (M-independent)
         if (ctx->cache_budget && ctx->resident_bytes + est > ctx->cache_budget)
             return nullptr;                   // over budget -> per-call mt path (frees per call)
+        // Runtime OOM guard (no swap): if free RAM has fallen to the reserve floor, stop making
+        // weights resident and stream the rest. The static byte budget is sized from init-time
+        // MemAvailable, which counts the not-yet-faulted (reclaimable) GGUF pages as free -- but an
+        // F16 resident tile DUPLICATES its still-mapped GGUF weight, so a model that does not fit
+        // ~2x can approach the ceiling before the byte budget trips. This latch stops it first.
+        if (ctx->resident_floor_bytes) {
+            const size_t avail = rocket_meminfo_bytes("MemAvailable");
+            if (avail && avail < ctx->resident_floor_bytes) {
+                ctx->dev_resident_full = true;   // latch: the rest streams (per-call mt)
+                if (rocket_debug_on())
+                    GGML_LOG_DEBUG("[prepack] MemAvailable %zuMB < floor %zuMB at resident=%zuMB"
+                            " -> streaming remaining weights\n",
+                            avail >> 20, ctx->resident_floor_bytes >> 20, ctx->resident_bytes >> 20);
+                return nullptr;
+            }
+        }
         rocket_weights * nw = rocket_weights_pack(ctx->dev, pack_m, K, N,
                                 reinterpret_cast<const _Float16 *>(b_src));
         if (!nw) {                            // IOVA/alloc exhausted: latch + stream the rest
@@ -2631,21 +2683,24 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     // copying weights at all. Address-keying would serve the wrong resident weight --
     // correct matmul math on the wrong weights.
     //
-    // The K<=2048 cutoff is now a PERF/ROBUSTNESS choice, NOT a correctness one:
-    // pack-once only pays when a weight is reused across forward passes (whisper's
-    // repeated encoder passes, K<=2048). For LLM prefill each weight is used once
-    // per generation (decode stays on CPU), so the mt path -- which frees its BOs
-    // per call rather than holding them resident -- is just as fast, avoids the
-    // resident-BO footprint, and sidesteps the rare cold-start fence-wait timeout
-    // the prepacked path exhibited (see rocket_wait_ns / ROCKET_WAIT_MS).
-    // ROCKET_FORCE_PREPACK=1 enables prepacked for all K (HW-validated coherent; the
-    // knob to exercise and measure the path).
+    // The K<=2048 cutoff is a PERF choice, NOT a correctness one: pack-once pays when a
+    // weight is reused across forward passes -- whisper's repeated encoder passes (K<=2048),
+    // OR a multi-micro-batch / repeated LLM prefill (any K) once residency is enabled. A
+    // single-micro-batch one-shot prefill uses each weight once, so there the mt path -- which
+    // frees its BOs per call rather than holding them resident -- is just as fast and avoids
+    // the resident-BO footprint. So all-K residency is opt-in:
+    //   ROCKET_F16_RESIDENT=auto|N|1 -- the production knob: budget-managed, decode-safe (no
+    //     madvise), sized from free RAM (see rocket_f16_resident_on / ggml_backend_rocket_init).
+    //   ROCKET_FORCE_PREPACK=1       -- the diagnostic force (default 2GB budget unless
+    //     ROCKET_CACHE_MB set; +prefill-only ROCKET_PREPACK_MADVISE). Both HW-validated coherent.
+    // Either disables QKV/gate-up fusion (rocket_fuse_on) so ALL weights reach this resident
+    // path -- residenting the fused weights beats fusing them [HW sweep, see rocket_f16_resident_on].
     static int no_prepack = -1;
     if (no_prepack < 0) { const char * e = getenv("ROCKET_NO_PREPACK"); no_prepack = e ? atoi(e) : 0; }
     static int force_prepack = -1;
     if (force_prepack < 0) { const char * e = getenv("ROCKET_FORCE_PREPACK"); force_prepack = e ? atoi(e) : 0; }
     const bool cacheable = !no_prepack
-        && (K <= 2048 || force_prepack)
+        && (K <= 2048 || force_prepack || rocket_f16_resident_on())
         && (src0->type == GGML_TYPE_F16)
         && src0->op == GGML_OP_NONE
         && src0->ne[2] == 1 && src0->ne[3] == 1
@@ -2783,8 +2838,12 @@ static bool rocket_fuse_on(void) {
         const char * ns = getenv("ROCKET_NO_STREAM");      // fusion needs the stream path
         const char * fp = getenv("ROCKET_FORCE_PREPACK");  // prepacked fusion is deferred
         const char * i8 = getenv("ROCKET_INT8");           // int8 routes via the single-node path
+        // ROCKET_F16_RESIDENT residents ALL weights (incl. QKV/gate-up), which requires the
+        // per-node path -- so it too turns fusion off (residenting the fused weights is the
+        // bigger win; see rocket_f16_resident_on).
         v = ((nf ? atoi(nf) : 0) == 0 && (ns ? atoi(ns) : 0) == 0
-             && (fp ? atoi(fp) : 0) == 0 && (i8 ? atoi(i8) : 0) == 0) ? 1 : 0;
+             && (fp ? atoi(fp) : 0) == 0 && (i8 ? atoi(i8) : 0) == 0
+             && !rocket_f16_resident_on()) ? 1 : 0;
     }
     return v > 0;
 }
@@ -4495,43 +4554,51 @@ ggml_backend_t ggml_backend_rocket_init(void) {
     if (const char * e = getenv("ROCKET_CACHE_MB")) {
         size_t b; if (rocket_parse_mb_budget(e, &b)) ctx->cache_budget = b;
     }
-    // ROCKET_QUANT_RESIDENT budget modes (the on/off gate is rocket_quant_resident_on):
-    //   auto    -> size the resident-weight budget from free RAM: MemAvailable minus a
-    //              reserve (KV cache / activations / general headroom). A quantized GGUF then
-    //              promotes as many dequant->fp16 weights as SAFELY fit, so the "RAM to spare"
-    //              case needs no hand-computed ROCKET_CACHE_MB. The RK1 has no swap, so the
-    //              reserve is deliberately generous (default max(6GiB, 30% of RAM); override
-    //              with ROCKET_QUANT_RESIDENT_RESERVE_MB). A tighter box just promotes less.
+    // ROCKET_QUANT_RESIDENT / ROCKET_F16_RESIDENT budget modes (on/off gates are
+    // rocket_quant_resident_on / rocket_f16_resident_on). Both size the SAME resident-weight
+    // budget (cache_budget) -- QUANT_RESIDENT holds a quant GGUF's dequant->fp16 form resident,
+    // F16_RESIDENT holds an F16 GGUF's scattered tiles resident:
+    //   auto    -> size the budget from free RAM: MemAvailable minus a reserve (KV cache /
+    //              activations / general headroom, and -- for F16 -- the still-mapped GGUF the
+    //              resident tiles duplicate). Promotes as many weights as SAFELY fit, so the
+    //              "RAM to spare" case needs no hand-computed ROCKET_CACHE_MB. The RK1 has no
+    //              swap, so the reserve is deliberately generous (default max(6GiB, 30% of RAM);
+    //              override ROCKET_QUANT_RESIDENT_RESERVE_MB) AND a runtime MemAvailable floor
+    //              (resident_floor_bytes, checked in build_resident) latches before an OOM.
     //   <N>>=2  -> an explicit N-MB budget (same effect as ROCKET_CACHE_MB=N, co-located here).
     //   1       -> blanket, bounded by the existing cache_budget default.
     // An explicit ROCKET_CACHE_MB always wins -- it is the lower-level knob. Promotion order
     // is weight-encounter (~layer) order, which is optimal here: LLM prefill uses every weight
     // once per micro-batch, so per-layer "hotness" is uniform and only total resident bytes
-    // (hence the budget) sets the fraction of the dequant tax removed.
-    if (const char * e = getenv("ROCKET_QUANT_RESIDENT")) {
+    // (hence the budget) sets the fraction of the packB / dequant tax removed.
+    const char * rez = getenv("ROCKET_F16_RESIDENT");
+    const char * rez_name = "ROCKET_F16_RESIDENT";
+    if (!rez) { rez = getenv("ROCKET_QUANT_RESIDENT"); rez_name = "ROCKET_QUANT_RESIDENT"; }
+    if (rez) {
         if (!getenv("ROCKET_CACHE_MB")) {                 // explicit budget overrides
-            if (strcmp(e, "auto") == 0) {
+            const size_t total = rocket_meminfo_bytes("MemTotal");
+            size_t reserve = (size_t)6144 << 20;              // 6 GiB floor
+            if (total / 10 * 3 > reserve) reserve = total / 10 * 3;   // or 30% of RAM
+            if (const char * r = getenv("ROCKET_QUANT_RESIDENT_RESERVE_MB")) {
+                size_t rb; if (rocket_parse_mb_budget(r, &rb)) reserve = rb;
+            }
+            if (strcmp(rez, "auto") == 0) {
                 const size_t avail = rocket_meminfo_bytes("MemAvailable");
-                const size_t total = rocket_meminfo_bytes("MemTotal");
-                size_t reserve = (size_t)6144 << 20;              // 6 GiB floor
-                if (total / 10 * 3 > reserve) reserve = total / 10 * 3;   // or 30% of RAM
-                if (const char * r = getenv("ROCKET_QUANT_RESIDENT_RESERVE_MB")) {
-                    size_t rb; if (rocket_parse_mb_budget(r, &rb)) reserve = rb;
-                }
                 const size_t budget = (avail > reserve) ? (avail - reserve)
                                                         : ((size_t)256 << 20);  // minimal floor
                 if (avail) ctx->cache_budget = budget;            // 0 avail -> keep default
+                ctx->resident_floor_bytes = reserve;              // runtime OOM guard
                 // rocket_log channel (not GGML_LOG_*) so ROCKET_LOG_STDERR shows this
                 // budget decision even under a host that silences ggml (llama-bench).
-                ROCKET_LOGI("[rocket] ROCKET_QUANT_RESIDENT=auto -> resident budget %zuMB "
+                ROCKET_LOGI("[rocket] %s=auto -> resident budget %zuMB "
                             "(MemAvailable %zuMB - reserve %zuMB, no swap)\n",
-                            ctx->cache_budget >> 20, avail >> 20, reserve >> 20);
+                            rez_name, ctx->cache_budget >> 20, avail >> 20, reserve >> 20);
             } else {
-                const long long n = atoll(e);
+                const long long n = atoll(rez);
                 if (n >= 2) {
                     ctx->cache_budget = (size_t)n << 20;
-                    ROCKET_LOGI("[rocket] ROCKET_QUANT_RESIDENT=%lld -> resident budget %lldMB\n",
-                                n, n);
+                    ctx->resident_floor_bytes = reserve;          // guard explicit budgets too
+                    ROCKET_LOGI("[rocket] %s=%lld -> resident budget %lldMB\n", rez_name, n, n);
                 }
             }
         }

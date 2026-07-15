@@ -73,13 +73,29 @@ is the guide; this is the reference.
 - **Resident weights:** static F16 weight tensors are packed into resident NPU BOs and
   cached by **weight name** (not `src0->data`: the scheduler reuses pooled copy addresses
   across weights, so keying on the address aliases distinct weights and produces gibberish;
-  `supports_buft = is_host`). +6% prefill (prefill-only `madvise` of the F16 source). The cache
+  `supports_buft = is_host`). Holding a weight resident pays its scatter (`packB`) **once** and
+  reuses it across every later micro-batch / prefill, instead of re-scattering per call. The cache
   is keyed on the name alone — **not** the prefill M — so a weight packed at one prefill length is
   reused at any other (M ≥ the tile cap) with no re-pack (the resident layout is M-independent there).
   A weight is made resident only when first seen at a reuse-worthy M; a smaller one-shot M (a short
   prompt, or the tail ubatch of a long prompt) streams via the per-call mt path, leaving the resident
-  weight intact for the big prefills (no re-pack thrash on mixed-length workloads). (Default-gated to
-  K≤2048 weights; `ROCKET_FORCE_PREPACK=1` makes all weights resident.)
+  weight intact for the big prefills (no re-pack thrash on mixed-length workloads).
+  - Default-gated to **K≤2048** weights (whisper's encoder — resident by default).
+  - **`ROCKET_F16_RESIDENT=auto`** extends residency to **all-K** F16 weights (the LLM attn/FFN,
+    K∈{3072,8192,…}) with a free-RAM-sized budget — the F16 sibling of `ROCKET_QUANT_RESIDENT`.
+    **Decode-safe:** no `madvise`, so the GGUF stays mapped for CPU decode. It disables QKV/gate-up
+    fusion so every weight goes resident — residenting the fused weights (≈⅔ of the `packB` bytes)
+    beats fusing them. Llama-3.2-3B-F16 @600 MHz `-ub 512`: pp2048 39.8→42.1 (**+5.9%**), pp512
+    54.5→59.6 (**+9.5%**), token-identical to streaming [HW sweep]. The win is **larger at shorter
+    prefills** (long-prefill attention stays on the CPU and dilutes the offloaded-matmul share) and
+    **larger on combined-projection architectures** — Phi-4-mini (single `qkv`/`gate_up` weights, so
+    nothing to fuse) reads **+21% / +16% / +14%** at pp512 / 1024 / 2048. `auto`/`<N>`-MB/`1` modes and the
+    reserve mirror `ROCKET_QUANT_RESIDENT`. For F16 models that fit ~2× in RAM — the resident tiles
+    duplicate the still-mapped GGUF; a too-large model degrades to partial residency via a runtime
+    `MemAvailable` floor (no OOM on a swapless board).
+  - `ROCKET_FORCE_PREPACK=1` is the diagnostic force (default 2 GB budget unless `ROCKET_CACHE_MB`
+    set) with an optional prefill-only `ROCKET_PREPACK_MADVISE` that reclaims the F16 source (breaks
+    CPU decode).
 - **int8 W8A8 + Hadamard:** coherent — char-identical to fp16 — but a **net loss** in
   prefill speed (see below).
 - **int4 W4A4 in-model (HW-validated):** native int4×int4 prefill for a Gemma-4-12B F16
