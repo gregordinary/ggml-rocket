@@ -320,6 +320,9 @@ avoid the int32 readback — does not exist on this silicon.
 ## Runtime knobs
 
 The backend reads a set of `ROCKET_*` env vars. `sudo` strips the environment — always use `sudo -E`.
+A set-but-empty var (e.g. `ROCKET_MIN_M=`, the shape a wrapper produces when it forwards an unset
+`$VAR`) is treated as **unset** and takes the default — it does not parse as `0` and collapse a
+routing threshold to its clamp floor.
 
 | var | default | meaning |
 |---|---|---|
@@ -355,7 +358,7 @@ The backend reads a set of `ROCKET_*` env vars. `sudo` strips the environment �
 | `ROCKET_CACHE_MB` | — | resident-weight byte budget in MB (the lower-level knob `ROCKET_QUANT_RESIDENT=auto`/`N` set; an explicit value here wins over both) |
 | `ROCKET_NO_FUSE` | off | disable gate/up graph fusion |
 | `ROCKET_VERIFY` | off | per-op NPU-vs-CPU correctness gate (`max_abs` is the signal; ignore `max_rel`; very slow) — needs `-DGGML_ROCKET_DIAGNOSTICS=ON` |
-| `ROCKET_MM_PROFILE` | off | bucket breakdown at exit (adds noise → drop for headline t/s) |
+| `ROCKET_MM_PROFILE` | off | per-phase host+driver bucket breakdown at exit — includes the streaming **weight-dequant** (quant/bf16→fp16) bucket, the dominant host term of a quantized-GGUF prefill (adds noise → drop for headline t/s) |
 | `ROCKET_TRACE` / `ROCKET_DEBUG` / `ROCKET_DEBUG_GRAPH` | off | per-op weight/ptr/amax trace; fusion groups; split census (`ROCKET_TRACE` needs `-DGGML_ROCKET_DIAGNOSTICS=ON`) |
 | `ROCKET_WAIT_MS` | 8000 | output-fence wait deadline |
 | `ROCKET_LOG_STDERR` | off | tee the driver/backend log channel to stderr even when the host silences its `ggml` logger (e.g. `llama-bench` without `-v`) — see Diagnostic logging |

@@ -450,8 +450,12 @@ static inline int rocket_pad_m(int M) { return (M + 3) & ~3; }
 static int rocket_min_m(void) {
     static int m = 0;
     if (m == 0) {
+        // getenv returns a non-NULL "" for a set-but-empty var (ROCKET_MIN_M=, or =$X with X
+        // unset -- the common benchmark-wrapper shape); atoi("")==0 would then clamp to the
+        // floor 4, silently re-arming the beam/small-M offload trap the 128 default exists to
+        // prevent. Treat set-empty as UNSET here and at every routing knob below.
         const char * e = getenv("ROCKET_MIN_M");
-        m = e ? atoi(e) : 128;
+        m = (e && *e) ? atoi(e) : 128;
         if (m < 4) m = 4;
     }
     return m;
@@ -470,7 +474,7 @@ static int rocket_min_m_quant(void) {
     static int m = 0;
     if (m == 0) {
         const char * e = getenv("ROCKET_MIN_M_QUANT");
-        m = e ? atoi(e) : 512;
+        m = (e && *e) ? atoi(e) : 512;
         const int base = rocket_min_m();
         if (m < base) m = base;
     }
@@ -505,7 +509,7 @@ static int rocket_moe_min_tokens(void) {
     static int m = 0;
     if (m == 0) {
         const char * e = getenv("ROCKET_MOE_MIN_TOKENS");
-        m = e ? atoi(e) : 512;
+        m = (e && *e) ? atoi(e) : 512;
         const int base = rocket_min_m();
         if (m < base) m = base;
     }
@@ -521,7 +525,7 @@ static int rocket_moe_min_tokens(void) {
 // dequant to delete).
 static bool rocket_moe_native_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_MOE_NATIVE"); v = e ? (atoi(e) > 0) : 1; }
+    if (v < 0) { const char * e = getenv("ROCKET_MOE_NATIVE"); v = (e && *e) ? (atoi(e) > 0) : 1; }
     return v > 0;
 }
 
@@ -542,7 +546,7 @@ static int rocket_moe_group_env(void) {
 // M%4 hardware contract.
 static int rocket_moe_m_bucket_env(void) {
     const char * e = getenv("ROCKET_MOE_M_BUCKET");
-    int g = e ? atoi(e) : 64;
+    int g = (e && *e) ? atoi(e) : 64;
     if (g < 4) g = 4;
     int p = 4;
     while (p < g && p < (1 << 20)) p <<= 1;
@@ -580,12 +584,12 @@ static bool rocket_quant_resident_on(void) {
 // context on the CPU, and ROCKET_FLASH_ATTN_MIN_T (default 16) keeps decode on the CPU.
 static bool rocket_flash_attn_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_FLASH_ATTN"); v = e ? atoi(e) : 1; }
+    if (v < 0) { const char * e = getenv("ROCKET_FLASH_ATTN"); v = (e && *e) ? atoi(e) : 1; }
     return v > 0;
 }
 static int rocket_flash_attn_min_t(void) {
     static int t = 0;
-    if (t == 0) { const char * e = getenv("ROCKET_FLASH_ATTN_MIN_T"); t = e ? atoi(e) : 16; if (t < 1) t = 1; }
+    if (t == 0) { const char * e = getenv("ROCKET_FLASH_ATTN_MIN_T"); t = (e && *e) ? atoi(e) : 16; if (t < 1) t = 1; }
     return t;
 }
 // ROCKET_FLASH_ATTN_MIN_KV (default 1024): an FA op offloads only when n_kv >= this. With the
@@ -602,7 +606,7 @@ static int rocket_flash_attn_min_t(void) {
 // independently picks the faster backend (both are correct).
 static int rocket_flash_attn_min_kv(void) {
     static int kv = 0;
-    if (kv == 0) { const char * e = getenv("ROCKET_FLASH_ATTN_MIN_KV"); kv = e ? atoi(e) : 1024; if (kv < 1) kv = 1; }
+    if (kv == 0) { const char * e = getenv("ROCKET_FLASH_ATTN_MIN_KV"); kv = (e && *e) ? atoi(e) : 1024; if (kv < 1) kv = 1; }
     return kv;
 }
 // ROCKET_FLASH_ATTN_NO_CTX=1 forces the per-call mt path (fresh worker fds + per-call score
@@ -616,12 +620,15 @@ static bool rocket_flash_attn_no_ctx(void) {
     return v > 0;
 }
 
-// The backend-side fp32<->fp16 CONVERT kernels below
-// (rocket_pack_activations f32->fp16, rocket_unpack_output(_seg) fp16->f32*scale)
-// are NOT covered by the driver's ROCKET_MM_PROFILE (which times only the driver:
-// packA/packB/wait/read). This sizes the convert-vectorization opportunity
-// separately. Gated by the SAME ROCKET_MM_PROFILE
-// knob so the convert breakdown prints alongside the driver's profile at exit.
+// The backend-side host kernels below
+// (rocket_pack_activations f32->fp16, rocket_unpack_output(_seg) fp16->f32*scale, and the
+// streaming weight_dequant bf16/quant->fp16) are NOT covered by the driver's
+// ROCKET_MM_PROFILE (which times only the driver: packA/packB/wait/read). This sizes those
+// host costs separately. The weight_dequant bucket matters most: the per-microbatch
+// bf16/quant->fp16 decode is the dominant host cost of a quantized-GGUF prefill, so leaving
+// it unattributed would understate host-bound work and flatter the driver's "wait" share --
+// the exact host-vs-dispatch axis these probes exist to decide. Gated by the SAME
+// ROCKET_MM_PROFILE knob so the breakdown prints alongside the driver's profile at exit.
 // Single-threaded: these run on the backend's graph_compute dispatch thread (the
 // driver's worker threads are downstream), so no mutex is needed.
 static int rocket_convprof_on(void) {
@@ -647,8 +654,8 @@ static double rocket_now_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
 }
-static struct { double pack_ms, unpack_ms, pack_elems, unpack_elems;
-                long pack_calls, unpack_calls; } g_convprof;
+static struct { double pack_ms, unpack_ms, dequant_ms, pack_elems, unpack_elems, dequant_elems;
+                long pack_calls, unpack_calls, dequant_calls; } g_convprof;
 static int g_convprof_armed = 0;
 // The profiler dumps below (this one, i8prof, moeprof, moecos) go out on the rocket_log
 // channel, NOT GGML_LOG_*. They are measurement lines, and the tool they have to survive is
@@ -659,14 +666,24 @@ static int g_convprof_armed = 0;
 static void rocket_convprof_dump(void) {
     ROCKET_LOGI(
         "ROCKET convert total(ms): pack_act=%.0f (%ld calls, %.0fM elems) "
+        "weight_dequant=%.0f (%ld calls, %.0fM elems) "
         "unpack_out=%.0f (%ld calls, %.0fM elems)\n",
-        g_convprof.pack_ms,   g_convprof.pack_calls,   g_convprof.pack_elems   / 1e6,
-        g_convprof.unpack_ms, g_convprof.unpack_calls, g_convprof.unpack_elems / 1e6);
+        g_convprof.pack_ms,    g_convprof.pack_calls,    g_convprof.pack_elems    / 1e6,
+        g_convprof.dequant_ms, g_convprof.dequant_calls, g_convprof.dequant_elems / 1e6,
+        g_convprof.unpack_ms,  g_convprof.unpack_calls,  g_convprof.unpack_elems  / 1e6);
 }
 static void rocket_convprof_add(double ms, double elems, bool is_unpack) {
     if (!g_convprof_armed) { atexit(rocket_convprof_dump); g_convprof_armed = 1; }
     if (is_unpack) { g_convprof.unpack_ms += ms; g_convprof.unpack_elems += elems; g_convprof.unpack_calls++; }
     else           { g_convprof.pack_ms   += ms; g_convprof.pack_elems   += elems; g_convprof.pack_calls++;   }
+}
+// The per-microbatch streaming weight dequant (bf16 / Q8_0 / Q4_K / MXFP4 / ... -> fp16) runs
+// in the backend BEFORE the driver is entered, so neither ROCKET_MM_PROFILE nor the pack/unpack
+// brackets above see it -- yet it is the dominant host cost of a quantized-GGUF prefill. Its own
+// bucket keeps the breakdown honest (the MoE handler already times its equivalent in g_moeprof).
+static void rocket_convprof_add_dequant(double ms, double elems) {
+    if (!g_convprof_armed) { atexit(rocket_convprof_dump); g_convprof_armed = 1; }
+    g_convprof.dequant_ms += ms; g_convprof.dequant_elems += elems; g_convprof.dequant_calls++;
 }
 
 // FLASH_ATTN_EXT handler timing probe (ROCKET_FA_TIMING=1, off by default; separate from
@@ -2680,12 +2697,21 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
             const ggml_fp16_t * Bp;
             if (b_is_f16) {
                 Bp = (const ggml_fp16_t *)B_src;
-            } else if (rocket_weight_to_fp16(B_src, src0->type, N, K, B16)) {
-                Bp = B16;
             } else {
-                rocket_cpu_matmul_slice((const float *)A_src, (const void *)B_src,
-                                        src0->type, (float *)C_dst, M, N, K);
-                continue;
+                // Time the streaming dequant into its own ROCKET_MM_PROFILE bucket (see
+                // rocket_convprof_add_dequant): it is the dominant host cost here and is
+                // invisible to every other profiler.
+                const bool wprof = rocket_convprof_on();
+                const double wt0 = wprof ? rocket_now_ms() : 0.0;
+                const bool ok = rocket_weight_to_fp16(B_src, src0->type, N, K, B16);
+                if (wprof) rocket_convprof_add_dequant(rocket_now_ms() - wt0, (double)N * K);
+                if (ok) {
+                    Bp = B16;
+                } else {
+                    rocket_cpu_matmul_slice((const float *)A_src, (const void *)B_src,
+                                            src0->type, (float *)C_dst, M, N, K);
+                    continue;
+                }
             }
 
             // Prefer the streaming context (persistent fds + per-shape resident
