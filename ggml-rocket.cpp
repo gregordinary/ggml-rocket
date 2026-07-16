@@ -587,10 +587,11 @@ static bool rocket_quant_resident_on(void) {
 // default -- so the big LLM weights (attn/FFN, K in {3072,8192,...}) pay their weight
 // scatter (packB) ONCE and reuse it across every later micro-batch / prefill instead of
 // re-scattering per call (the streaming tax). Measured net win over the fused-streaming
-// default even though it disables QKV/gate-up fusion (see rocket_fuse_on): eliminating the
-// fused weights' packB is worth more than the fusion it costs [HW sweep, Llama-3.2-3B-F16,
-// pp2048 -ub512, 600 MHz: resident 41.9 vs default 39.9 t/s = +5%; the pure packB delta with
-// fusion held off is +10.6%].
+// default [HW sweep, Llama-3.2-3B-F16, pp2048 -ub512, 600 MHz: resident 41.9 vs default 39.9
+// t/s = +5%; the pure packB delta with fusion held off is +10.6%]. QKV/gate-up fusion is KEPT
+// (see rocket_fuse_on): a fusable group routes through ggml_backend_rocket_mul_mat_group_resident
+// (one resident combined-N weight), stacking the packB-once win with fusion's shared packA +
+// single submit -- both levers, not a trade.
 //
 // Decode-safe by design: it does NOT madvise the F16 source (that stays behind the separate,
 // prefill-only ROCKET_PREPACK_MADVISE), so the GGUF stays mapped for CPU decode. The resident
@@ -2693,8 +2694,10 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     //     madvise), sized from free RAM (see rocket_f16_resident_on / ggml_backend_rocket_init).
     //   ROCKET_FORCE_PREPACK=1       -- the diagnostic force (default 2GB budget unless
     //     ROCKET_CACHE_MB set; +prefill-only ROCKET_PREPACK_MADVISE). Both HW-validated coherent.
-    // Either disables QKV/gate-up fusion (rocket_fuse_on) so ALL weights reach this resident
-    // path -- residenting the fused weights beats fusing them [HW sweep, see rocket_f16_resident_on].
+    // This is the per-node resident path; a fusable group (QKV / gate-up) under
+    // ROCKET_F16_RESIDENT instead goes to ggml_backend_rocket_mul_mat_group_resident (one
+    // resident combined-N weight = residency + fusion stacked). ROCKET_FORCE_PREPACK disables
+    // fusion, so it residents every weight here individually.
     static int no_prepack = -1;
     if (no_prepack < 0) { const char * e = getenv("ROCKET_NO_PREPACK"); no_prepack = e ? atoi(e) : 0; }
     static int force_prepack = -1;
@@ -2838,12 +2841,13 @@ static bool rocket_fuse_on(void) {
         const char * ns = getenv("ROCKET_NO_STREAM");      // fusion needs the stream path
         const char * fp = getenv("ROCKET_FORCE_PREPACK");  // prepacked fusion is deferred
         const char * i8 = getenv("ROCKET_INT8");           // int8 routes via the single-node path
-        // ROCKET_F16_RESIDENT residents ALL weights (incl. QKV/gate-up), which requires the
-        // per-node path -- so it too turns fusion off (residenting the fused weights is the
-        // bigger win; see rocket_f16_resident_on).
+        // ROCKET_F16_RESIDENT keeps fusion ON: the group runner routes each fusable group
+        // through ggml_backend_rocket_mul_mat_group_resident (one resident combined-N weight),
+        // which stacks residency's pack-B-once win with fusion's shared pack-A + single submit.
+        // (ROCKET_FORCE_PREPACK -- the 2GB diagnostic -- still turns fusion off via `fp`, staying
+        // on the per-node resident path.) ROCKET_NO_FUSE=1 forces per-node for a clean A/B.
         v = ((nf ? atoi(nf) : 0) == 0 && (ns ? atoi(ns) : 0) == 0
-             && (fp ? atoi(fp) : 0) == 0 && (i8 ? atoi(i8) : 0) == 0
-             && !rocket_f16_resident_on()) ? 1 : 0;
+             && (fp ? atoi(fp) : 0) == 0 && (i8 ? atoi(i8) : 0) == 0) ? 1 : 0;
     }
     return v > 0;
 }
@@ -2877,6 +2881,11 @@ static bool rocket_node_fusable(const ggml_tensor * op) {
         && K > 2048;                       // streaming regime (not prepacked)
 }
 
+// Resident-fused sibling (defined after this function); tried first when ROCKET_F16_RESIDENT
+// is on, with the streaming-fused body below as the fallback.
+static int ggml_backend_rocket_mul_mat_group_resident(ggml_backend_rocket_context * ctx,
+                                                      ggml_tensor ** nodes, int ng);
+
 // Run a group (>=2) of static-F16 MUL_MATs that share src1 as one fused matmul.
 // Returns 0 on success (every member's dst written); <0 to tell the caller to run
 // the members individually (NOTHING written, so fallback is clean). Members all
@@ -2891,6 +2900,13 @@ static int ggml_backend_rocket_mul_mat_group(ggml_backend_rocket_context * ctx,
     // without the caller needing ROCKET_NO_FUSE.
     if (ctx->bf16_mode < 0) { const char * e = getenv("ROCKET_BF16"); ctx->bf16_mode = e ? atoi(e) : 0; }
     if (ctx->bf16_mode) return -1;
+
+    // Resident-fused: with ROCKET_F16_RESIDENT on, pack the group into one resident
+    // combined-N weight (pack-once, reused across micro-batches/prefills). On decline (small
+    // one-shot M, over budget, IOVA/floor full) fall through to the streaming-fused path below.
+    if (rocket_f16_resident_on()) {
+        if (ggml_backend_rocket_mul_mat_group_resident(ctx, nodes, ng) == 0) return 0;
+    }
 
     // The streaming context drives the fused matmul; create it lazily (mirrors the
     // single-node path). On failure, fall back to per-node.
@@ -2935,6 +2951,114 @@ static int ggml_backend_rocket_mul_mat_group(ggml_backend_rocket_context * ctx,
                                  (float *)nodes[i]->data, M, Ns[i], scales.data());
         col0 += Ns[i];
         rocket_mul_mat_post(nodes[i], "fused");
+    }
+    return 0;
+}
+
+// Resident sibling of ggml_backend_rocket_mul_mat_group: pack a fusable group's weights
+// ONCE into a single RESIDENT combined-N weight (Q|K|V or gate|up laid contiguously along
+// N), cached under a COMPOSITE key (the members' stable names joined by '|'), and reuse it
+// across every micro-batch / prefill. Combines the two independent levers: residency's
+// pack-B-once (eliminates the per-call weight scatter) AND fusion's shared activation pack +
+// single submit over the combined N. Engaged only when ROCKET_F16_RESIDENT is on (the
+// group runner tries it first, then falls back to the streaming-fused path on decline).
+//
+// The combined resident weight is BYTE-IDENTICAL to the streaming-fused layout: both scatter
+// the concatenated [Ntot,K] weight into the driver's (N/16,K/32,16,32) tiles
+// (rocket_weights_pack on a host concat == mm_pack_weights_seg on the segments), so greedy
+// output matches the streaming path. The concat buffer is transient (copied into the resident
+// BOs by rocket_weights_pack, freed on return); the resident weight bytes equal the sum of the
+// members' bytes, i.e. no extra RAM over residenting them individually.
+//
+// Returns 0 (all members' dst written) or <0 to fall back cleanly (nothing written): small
+// one-shot M (< max_tile), over budget / IOVA full / MemAvailable floor, no stable weight
+// identity, or a driver failure.
+static int ggml_backend_rocket_mul_mat_group_resident(
+        ggml_backend_rocket_context * ctx, ggml_tensor ** nodes, int ng) {
+    if (ctx->dev_failed) return -1;
+    if (!ctx->dev) {
+        ctx->dev = rocket_ctx_create(ctx->n_threads);
+        if (!ctx->dev) { ctx->dev_failed = true; return -1; }
+    }
+
+    const ggml_tensor * src1 = nodes[0]->src[1];      // shared input A[M,K]
+    const int64_t K  = src1->ne[0];
+    const int64_t M  = src1->ne[1];
+    const int     Mp = rocket_pad_m((int)M);
+
+    // Composite key = the members' stable weight names joined by '|'. Any member without a
+    // stable identity (empty key -- e.g. a ggml auto-name) makes the whole group uncacheable.
+    std::string key;
+    int64_t Ntot = 0;
+    for (int i = 0; i < ng; i++) {
+        const std::string mk = rocket_weight_key(nodes[i]->src[0]);
+        if (mk.empty()) return -1;
+        if (i) key += '|';
+        key += mk;
+        Ntot += nodes[i]->src[0]->ne[1];
+    }
+
+    rocket_weights * w = nullptr;
+    auto it = ctx->wcache.find(key);
+    if (it != ctx->wcache.end()) {
+        if (it->second.K == (int)K && it->second.N == (int)Ntot) {
+            w = it->second.w;
+        } else {                                      // composite shape drift: re-pack
+            rocket_weights_free(ctx->dev, it->second.w);
+            ctx->resident_bytes -= it->second.bytes;
+            ctx->wcache.erase(it);
+        }
+    }
+    if (!w) {
+        // Small one-shot M streams via the caller's streaming-fused fallback (no wasted
+        // resident pack); mirrors the single-weight prepacked path's max_tile pivot.
+        if (Mp < rocket_hw_current()->max_tile) return -1;
+        // Budget / OOM-floor admission -- identical policy to build_resident (single path).
+        if (ctx->dev_resident_full) return -1;
+        const size_t est = (size_t)Ntot * K * sizeof(ggml_fp16_t);
+        if (ctx->cache_budget && ctx->resident_bytes + est > ctx->cache_budget) return -1;
+        if (ctx->resident_floor_bytes) {
+            const size_t avail = rocket_meminfo_bytes("MemAvailable");
+            if (avail && avail < ctx->resident_floor_bytes) { ctx->dev_resident_full = true; return -1; }
+        }
+        // Concatenate the members' fp16 weights into one [Ntot,K] buffer (member i's ne[1]*K
+        // fp16 rows, back to back). All members are F16 + contiguous (rocket_node_fusable).
+        std::vector<ggml_fp16_t> comb((size_t)Ntot * K);
+        size_t off = 0;
+        for (int i = 0; i < ng; i++) {
+            const ggml_tensor * a = nodes[i]->src[0];
+            const size_t nb = (size_t)a->ne[1] * K;
+            memcpy(comb.data() + off, a->data, nb * sizeof(ggml_fp16_t));
+            off += nb;
+        }
+        w = rocket_weights_pack(ctx->dev, Mp, (int)K, (int)Ntot,
+                                reinterpret_cast<const _Float16 *>(comb.data()));
+        if (!w) { ctx->dev_resident_full = true; return -1; }  // IOVA/alloc full -> stream the rest
+        rocketraii::scope_guard w_guard([&] { rocket_weights_free(ctx->dev, w); });
+        ctx->wcache[key] = { w, Mp, (int)K, (int)Ntot, est };
+        w_guard.dismiss();
+        ctx->resident_bytes += est;
+    }
+
+    // One shared activation pack (per-row scaled fp16, pad rows zero) + one combined compute.
+    std::vector<ggml_fp16_t> A16((size_t)Mp * K);
+    std::vector<ggml_fp16_t> C16((size_t)Mp * Ntot);
+    std::vector<float>       scales((size_t)M);
+    rocket_pack_activations((const float *)src1->data, A16.data(), (int)M, (int)K, scales.data());
+
+    int rc = rocket_matmul_fp16_prepacked(ctx->dev, Mp, (int)K, (int)Ntot,
+                reinterpret_cast<const _Float16 *>(A16.data()),
+                reinterpret_cast<_Float16 *>(C16.data()), w);
+    if (rc != 0) return -1;   // rc==-2 (M below resident tiling) or driver fail -> stream-fused
+
+    // Split the combined [M, Ntot] output back into each member's own dst (per-row unscale).
+    int64_t col0 = 0;
+    for (int i = 0; i < ng; i++) {
+        const int64_t Ni = nodes[i]->src[0]->ne[1];
+        rocket_unpack_output_seg(C16.data(), Ntot, col0,
+                                 (float *)nodes[i]->data, M, Ni, scales.data());
+        col0 += Ni;
+        rocket_mul_mat_post(nodes[i], "fused-resident");
     }
     return 0;
 }
