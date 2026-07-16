@@ -29,8 +29,9 @@ builds and runs on its own; this backend links it.
   ggml-rocket/        # this project
 ```
 
-The complete per-model benchmarks, the full `ROCKET_*` knob table, the diagnostic-logging channel,
-and the implementation notes are in [API.md](API.md).
+The complete per-model benchmarks, a **recommended-configuration-by-workload** table (which opt-ins
+to add for chat / agentic / RAG / MoE, and the RAM each needs), the full `ROCKET_*` knob table, the
+diagnostic-logging channel, and the implementation notes are in [API.md](API.md).
 
 ## Performance
 

@@ -333,6 +333,28 @@ rises by attacking the dispatch floor (fewer, bigger, batched submits), not by n
 datatype. On-device integer K-accumulation — which would let int8 keep its narrow weights *and*
 avoid the int32 readback — does not exist on this silicon.
 
+## Recommended configurations
+
+The performance datapath is default-on — fp16 K-accumulation (`ROCKET_KACC`), CBUF DATA_REUSE
+(`ROCKET_REUSE=2`), asymmetric tiling (`ROCKET_MM_ASYM`), threaded dequant (`ROCKET_DEQUANT_THREADS`),
+and attention offload (`ROCKET_FLASH_ATTN`) all engage without configuration. Set the backend up as in
+[Build and run](README.md#build-and-run) (600 MHz clock, `sudo -E`, absolute `GGML_BACKEND_PATH`), then
+add opt-ins by workload. Each residency lever trades RAM for speed and falls back to streaming if the
+budget does not fit, so it is safe to request.
+
+| Workload | Precision | Add | Effect |
+|---|---|---|---|
+| Interactive chat, short prompts | any | nothing — pick `Q4_K_M` for decode speed | Prefill is below the offload floor (`ROCKET_MIN_M`); the turn is decode-bound, and quant sets the stream rate |
+| Agentic / RAG / long prompts | quantized GGUF | `-b 2048 -ub 2048` | A quant GGUF re-dequantizes per micro-batch; `-ub 2048` ~doubles prefill over the `-ub 512` default |
+| Agentic / RAG, repeated prefill | quantized GGUF, fp16 fits RAM | `+ ROCKET_QUANT_RESIDENT=auto` | Dequant + pack once → fp16 prefill parity (~1.5×). Needs ~the fp16 model size free |
+| Agentic / RAG, repeated prefill | F16, fits ~2× RAM | `+ ROCKET_F16_RESIDENT=auto` | Pack weights once across turns; single-digit-percent gain |
+| Any | MoE (gpt-oss, …), experts fit RAM | `-b 2048 -ub 2048 + ROCKET_MOE=1` | Routed experts resident as int8: up to 2.16× at pp2048. A loss if the stack does not fit — leave off otherwise |
+| Model too big at F16 | — | a `Q4_K_M` GGUF, or `ROCKET_INT4=1` from an F16 GGUF | Footprint, not speed — quantization does not speed prefill here |
+
+`ROCKET_INT8` / `ROCKET_INT4` / `ROCKET_BF16` are numerically faithful but tie the prefill throughput of
+fp16; use them to fit a model in less RAM, never to speed prefill. Confirm the intended mode engaged by
+running once with `ROCKET_LOG_STDERR=1` (llama-bench otherwise prints no backend lines).
+
 ## Runtime knobs
 
 The backend reads a set of `ROCKET_*` env vars. `sudo` strips the environment — always use `sudo -E`.
