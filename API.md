@@ -14,6 +14,20 @@ is the guide; this is the reference.
   large-v3 2.14×, large-v3-turbo 2.12×. The decoder (autoregressive, M=1) stays on the CPU
   on both backends. **large-v3-turbo** keeps the full 32-layer encoder but a 4-layer decoder
   (~6× cheaper per step), so the NPU-accelerated encoder is the larger share of its pipeline.
+- **Multi-model STT via transcribe.cpp (HW-validated):** the same `.so` drops into transcribe.cpp
+  (a ggml-based host for Granite-Speech, Voxtral, MOSS diarize, SenseVoice, FunASR, Parakeet, …) and
+  offloads the **encoder**, with the same law as Whisper: encode always offloads (1.2×–2.7×, scaling
+  with encoder size × audio length), autoregressive decode is M=1 and stays on the CPU — except the
+  batched decode-prefill over the injected audio context on long audio, which offloads when large
+  enough. So the win is set by architecture: a **cross-attention decoder** (Granite-Speech) offloads
+  decode best (~1.9× on 120 s); a **big decoder-only over long audio** (Voxtral-mini 3B) offloads its
+  ~1500-token audio prefill (decode 1.46×, whole-pipeline 1.57×); a **small decoder-only** (MOSS /
+  FunASR 0.6B) is decode-bound and gains ~1.0–1.15× despite a ~1.6× encode; a **single-pass CTC**
+  (SenseVoice) has no decode (6.2× realtime, 1.26×). Encoder-only offload is bit-faithful CPU-vs-NPU;
+  a model whose decoder cross-attn offloads (Granite) can diverge late as fp16 accumulation perturbs
+  greedy decoding. **Q8_0 is the STT default** (ties or beats F16 on both backends at half the RAM,
+  because these models are less matmul-dominated than LLM prefill so the per-micro-batch dequant tax
+  is small). [HW A/B, 2026-07-21]
 - **Gemma-4-12B prefill (HW-validated):** coherent generation via the same drop-in on
   llama.cpp. Prefill GEMMs offload, decode stays on CPU.
 - **Phi-4 (14B) prefill (HW-validated):** the 14.66 B Phi-4 (arch `llama`, dense GQA — a different

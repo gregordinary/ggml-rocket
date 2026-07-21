@@ -10,9 +10,10 @@ A drop-in [ggml](https://github.com/ggml-org/ggml) backend for Rockchip NPUs (va
 the RK3588) that offloads LLM and Whisper prefill to the NPU through the mainline `rocket`
 DRM-accel driver.
 
-It builds as a runtime-loadable `libggml-rocket.so` that drops into stock llama.cpp and
-whisper.cpp: point `GGML_BACKEND_PATH` at it and the NPU appears as a ggml device, exactly like
-ggml's own BLAS backend. It runs the Whisper encoder end to end and the prefill of Gemma-4,
+It builds as a runtime-loadable `libggml-rocket.so` that drops into stock llama.cpp,
+whisper.cpp, and other ggml-based hosts (e.g. transcribe.cpp, a multi-model STT library): point
+`GGML_BACKEND_PATH` at it and the NPU appears as a ggml device, exactly like ggml's own BLAS
+backend. It runs the Whisper encoder end to end and the prefill of Gemma-4,
 Qwen3.5 / 3.6, Llama-3.2, Phi-4, Ministral and more on the NPU. Decode stays on the CPU: it is
 small-M work, and below `ROCKET_MIN_M` (default 128 rows) the per-call dispatch and weight packing
 outweigh the NPU's per-row advantage. That covers llama.cpp's single-row GEMV decode (~82× slower
@@ -55,8 +56,11 @@ perplexity-faithful to the CPU on every model. [HW sweep]
 | Qwen3.6-27B (hybrid) | 27.3B | 7.8 Q4 (4.4×) | 1.1 | 15.9 GB |
 
 Where the ratio is small the architecture keeps most prefill FLOPs off the NPU: the MoE expert FFNs
-of gpt-oss (1.04×) and DeepSeek (1.26×) stay on the CPU by default. The Whisper encoder is a
-separate case (1.18× → 2.14× by model size). Per-model prefill / decode / interactive detail, the
+of gpt-oss (1.04×) and DeepSeek (1.26×) stay on the CPU by default. Speech models are a separate
+case — the NPU offloads the **encoder**: the Whisper encoder wins 1.18× → 2.14× by model size, and
+through transcribe.cpp the same holds for Granite-Speech, Voxtral, MOSS and more (1.1×–1.7× on long
+audio, best where the encoder is large or the decoder cross-attends the audio). Per-model prefill /
+decode / interactive detail, the
 Gemma-4-12B walkthrough, and why quantization does not speed prefill at this operating point are in
 [API.md](API.md#models-and-precisions).
 
@@ -213,6 +217,33 @@ GGML_BACKEND_PATH=$PWD/build-dl/libggml-rocket.so \
 `sudo -E` because `/dev/accel/accel0` needs privilege and `-E` preserves the env var. The startup log
 lists a `ROCKET` / "RK3588 NPU" device; the `drm_mm "Memory manager not clean"` WARN at exit is a
 known-benign teardown race.
+
+### Drop into transcribe.cpp (multi-model STT)
+
+The same `.so` extends past Whisper to other STT families — Granite-Speech, Voxtral, MOSS diarize,
+SenseVoice, FunASR, Parakeet — through transcribe.cpp, a ggml-based multi-model speech host. It
+loads `libggml-rocket.so` the same way (its runner registers the NPU as an ACCEL device and logs
+`using accel backend: ROCKET`), and the offload is the same shape: the **encoder** runs on the NPU
+and, on long audio, the batched decode-prefill; the autoregressive decode stays on the CPU. So the
+win tracks encoder size and audio length — encode-heavy models (Voxtral's Whisper-large-v3, a
+cross-attention decoder like Granite) gain most; small decoder-only models are decode-bound and
+barely move.
+
+```sh
+# transcribe.cpp shared + DL-capable, CPU backend tuned for the A76 (else the CPU baseline is slow)
+cmake -B build -DTRANSCRIBE_BUILD_SHARED=ON -DTRANSCRIBE_GGML_BACKEND_DL=ON \
+  -DTRANSCRIBE_VULKAN=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+cmake --build build -j
+cp build/bin/libggml-cpu.so build/src/   # the ARM cpu module lands in build/bin; the backend scan globs build/src
+
+GGML_BACKEND_PATH=$PWD/../ggml-rocket/build-dl/libggml-rocket.so \
+  LD_LIBRARY_PATH=build/ggml/src:build/bin \
+  sudo -n -E ./build/bin/transcribe-cli -m /path/model.gguf -f audio.wav
+```
+
+Build the `.so` against transcribe.cpp's bundled ggml (`-DGGML_ROCKET_DL=ON -DHOST_DIR=<...>/transcribe.cpp`),
+as with any host. A `TRANSCRIBE_GGML_BACKEND_DL` build forces `GGML_NATIVE=OFF`, so the
+`-DGGML_CPU_ARM_ARCH=…` above is what keeps the CPU baseline honest.
 
 ### Drop into llama.cpp
 
