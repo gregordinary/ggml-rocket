@@ -1890,9 +1890,12 @@ static inline float rocket_weight_elem_f32(const void * Brow, int64_t k, ggml_ty
 
 // Worker count for the quantized-weight dequant fan-out below. ROCKET_DEQUANT_THREADS
 // overrides it (set 1 to force the serial decode -- the A/B baseline; set N to pin the
-// count). Unset/0 => auto: hardware_concurrency capped at 8, matching the int4 quant
-// fan-out. Lazy-cached (the dequant is a per-micro-batch hot path); the first-call read
-// is unsynchronized but idempotent, like the file's other getenv caches.
+// count). Unset/0 => auto: the BIG-core count. NOT hardware_concurrency: on RK3588 the A55
+// little cores are a ~7x-slower straggler on this fp16 dequant, so an 8-thread equal-chunk
+// fan-out that lands 4 workers on the A55s runs ~3.4x slower than a 4-thread big-core-only
+// one (the A76 workers finish and idle-wait at the join) [HW measured]. The pool
+// workers are pinned to the big cluster (rocket_dequant_pool::worker). Fallback to hw if no
+// big cluster is detected. Lazy-cached (per-micro-batch hot path); idempotent first read.
 static int rocket_dequant_threads(void) {
     static int v = -1;
     if (v < 0) {
@@ -1901,9 +1904,14 @@ static int rocket_dequant_threads(void) {
         if (req > 0) {
             v = req;
         } else {
-            const unsigned hw = std::thread::hardware_concurrency();
-            const int n = (int)(hw ? hw : 1);
-            v = n > 8 ? 8 : n;
+            const int nb = rocket_num_big_cores();   // A76 count, or 0 if no big cluster
+            if (nb >= 1) {
+                v = nb;
+            } else {
+                const unsigned hw = std::thread::hardware_concurrency();
+                const int n = (int)(hw ? hw : 1);
+                v = n > 8 ? 8 : n;
+            }
         }
     }
     return v;
@@ -1939,6 +1947,7 @@ public:
     }
 private:
     void worker(int i) {
+        rocket_pin_worker(i);   // keep this persistent dequant worker on an A76, never an A55
         long mygen = 0;
         for (;;) {
             const std::function<void(int)> * job;
