@@ -152,8 +152,20 @@ struct rocket_rk3576_chunk {
     std::vector<int8_t> qB;        // [N*Kc] int8, NPU-row-major, ALWAYS rotated
     std::vector<float>  b_scale;   // [N] per-output-channel weight dequant scale
     std::vector<float>  cbound;    // [N] 127/(128*sum_k|qB[n][k]|+1): the no-saturate scale
+    // [N] sum_k|qB[n][k]| itself. cbound is derived from it, and the library's C-ramp
+    // planner needs the same integer on every call — an O(N*K) pass over a weight that
+    // does not change. Held here so the entry can be handed it instead
+    // (rocket_matmul_int8_rk3576_perc_sa). N*8 bytes, 6.4 MB over this model's 197 sites.
+    std::vector<int64_t> sumabs;
     std::vector<double> colmax;    // [N] frozen |accumulator| max, running over calibration
     std::vector<float>  scale_n;   // [N] what the entry is handed once frozen
+    // The weight packed once into a DEVICE BO (rocket_rk3576_wbo_create), created at
+    // this chunk's first CONVERGED call — calibration still reads qB — after which qB
+    // is dropped: the cube is the same N*Kc bytes, so the swap is memory-neutral and
+    // the entry's per-call cube memset + copy + cache maintenance and the weight BO's
+    // per-tile allocate/free go away (rocket_matmul_int8_rk3576_perc_wbo). Freed with
+    // ctx->rk76_fd wherever this chunk dies. ROCKET_RK3576_WDEV=0 keeps the qB path.
+    struct rocket_rk3576_wbo * wbo = nullptr;
     int K0, Kc;                    // this chunk's offset into K, and its depth
 };
 struct rocket_rk3576_weight {
@@ -323,6 +335,10 @@ struct ggml_backend_rocket_context {
                                // 1 = every offloaded GEMM, 2 = only K-split ones)
     int    rk76_fd     = -1;
     bool   rk76_failed = false;
+    // One device-weight-cache create failed (device memory, most likely): stop trying
+    // for later weights too — on a board small enough to refuse one cube, growing the
+    // resident set further is the wrong direction. The weights already resident stay.
+    bool   rk76_wdev_off = false;
 
     // int4 W4A4 path, opt-in via ROCKET_INT4=1 (the int4 sibling of the int8 one-shot
     // path above). Native int4xint4->int16 NPU matmul; per-row activation + per-channel
@@ -1069,6 +1085,46 @@ static inline int8_t rocket_q8(float x, float inv) {
     return (int8_t)q;
 }
 
+// NEON row kernels for the symmetric-int8 quant loops on the RK3576 route. The scalar
+// loops pay one lrintf@plt CALL per element, and the L1d set-conflict class measured on
+// this route rides on exactly that call's per-element stack traffic (the q8 phase moved
+// 9.9 -> 21.9 s across binary epochs with the loop's instructions identical); a lane
+// loop with no per-element call gives that congruence nothing to form on. The lane
+// forms are rk_quant_act_i8_group's (the MoE path's, further down): amax by vabs/vmax
+// -- max is exact, no rounding -- and quantize by fmul then vcvtnq_s32_f32, which
+// rounds to nearest ties-to-even exactly as lrintf does under the default rounding
+// mode. The float pre-clamp to +/-127 makes the saturating narrows exact and matches
+// the scalar's integer clamp on every value including the +/-127.5 ties (both sides
+// land on 127/-127). Bit-identical to the scalar tail by construction; the RK3576
+// `--chunks 4` equality cell gates it on real data.
+static inline float rk_amax_row(const float * src, int64_t n) {
+    float amax = 0.0f;
+    int64_t k = 0;
+#ifdef ROCKET_NEON_F32
+    float32x4_t vm = vdupq_n_f32(0.0f);
+    for (; k + 4 <= n; k += 4) vm = vmaxq_f32(vm, vabsq_f32(vld1q_f32(src + k)));
+    amax = vmaxvq_f32(vm);
+#endif
+    for (; k < n; k++) { const float v = fabsf(src[k]); if (v > amax) amax = v; }
+    return amax;
+}
+static inline void rk_q8_row(const float * src, int8_t * dst, int64_t n, float inv) {
+    int64_t k = 0;
+#ifdef ROCKET_NEON_F32
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    const float32x4_t vhi  = vdupq_n_f32(127.0f), vlo = vdupq_n_f32(-127.0f);
+    auto qv = [&](const float * p) {
+        return vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(p), vinv), vlo), vhi));
+    };
+    for (; k + 16 <= n; k += 16) {
+        const int16x8_t s0 = vcombine_s16(vqmovn_s32(qv(src + k     )), vqmovn_s32(qv(src + k +  4)));
+        const int16x8_t s1 = vcombine_s16(vqmovn_s32(qv(src + k +  8)), vqmovn_s32(qv(src + k + 12)));
+        vst1q_s8(dst + k, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
+    }
+#endif
+    for (; k < n; k++) dst[k] = rocket_q8(src[k], inv);
+}
+
 // A[M,K] f32 -> int8 [M,K] + per-row scale a_scale[m] (= amax_row/127).
 static void rocket_quant_act_int8(const float * src, int8_t * dst,
                                   int64_t M, int64_t K, float * a_scale) {
@@ -1307,11 +1363,9 @@ static int rocket_quant_wt_int8_had(const void * src, bool f16, int8_t * dst,
         if ((blocks ? rk_hadamard_rotate_blocks(tmp, (int)K)
                     : rk_hadamard_rotate(tmp, (int)K)) < 0) return -1;
         if (prof) { rot += rocket_now_ms() - t0; t0 = rocket_now_ms(); }
-        float amax = 0.0f;
-        for (int64_t k = 0; k < K; k++) { const float v = fabsf(tmp[k]); if (v > amax) amax = v; }
+        const float amax = rk_amax_row(tmp, K);
         const float s = (amax > 0.0f) ? amax / 127.0f : 1.0f, inv = 1.0f / s;
-        int8_t * d = dst + n * K;
-        for (int64_t k = 0; k < K; k++) d[k] = rocket_q8(tmp[k], inv);
+        rk_q8_row(tmp, dst + n * K, K, inv);
         if (prof) qt += rocket_now_ms() - t0;
         b_scale[n] = s;
     }
@@ -1801,18 +1855,17 @@ static int rk76_quant_act(const float * src, int8_t * dst, int64_t M, int64_t K,
         float * r = rot + m * K;
         for (int64_t k = 0; k < K; k++) r[k] = src[m * src_stride + k];
         if (rk76_rotate(r, (int)K) < 0) return -1;
-        float rmax = 0.0f;
-        for (int64_t k = 0; k < K; k++) { const float v = fabsf(r[k]); if (v > rmax) rmax = v; }
+        const float rmax = rk_amax_row(r, K);
         if (rmax > amax) amax = rmax;
         if (per_row) {
             const float s = (rmax > 0.0f) ? rmax / 127.0f : 1.0f, inv = 1.0f / s;
-            for (int64_t k = 0; k < K; k++) dst[m * K + k] = rocket_q8(r[k], inv);
+            rk_q8_row(r, dst + m * K, K, inv);
             a_scale[m] = s;
         }
     }
     if (per_row) return 0;
     const float s = (amax > 0.0f) ? amax / 127.0f : 1.0f, inv = 1.0f / s;
-    for (int64_t i = 0; i < M * K; i++) dst[i] = rocket_q8(rot[i], inv);
+    rk_q8_row(rot, dst, M * K, inv);
     for (int64_t m = 0; m < M; m++) a_scale[m] = s;
     return 0;
 }
@@ -1920,8 +1973,32 @@ static void rk76_dequant(const int8_t * src, float * dst, int64_t M, int64_t N,
 //
 // ROCKET_RK3576_CALSCAN selects the form and exists to price it: 0 column-outer, 1
 // row-major with an `int` accumulator, 2 (default) row-major with a byte one.
+// ROCKET_RK3576_WSA: hand the entry this weight's cached per-column sum of |qB| instead
+// of letting it recompute one (default 1; 0 restores the recomputing entry, for pricing
+// the pass). The two are bit-identical by construction — the frontend's integer IS what
+// the library would sum — so this is a cost knob, not an accuracy one.
+static int rk76_wsa(void) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("ROCKET_RK3576_WSA"); on = e ? atoi(e) != 0 : 1; }
+    return on;
+}
+
+// ROCKET_RK3576_WDEV: once a weight's calibration converges, pack it into a device BO
+// and hand the entry that object (rocket_matmul_int8_rk3576_perc_wbo) instead of the
+// row-major qB, then DROP qB — the cube is the same N*Kc bytes, so device memory goes
+// up by what host memory comes down. =0 restores the per-call pack for pricing. Created
+// lazily at the first converged call rather than at cache build, because calibration
+// still reads qB (the bootstrap operand and the calmap instrument) and an early create
+// would double-hold every weight through calibration instead of one at a time.
+static int rk76_wdev(void) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("ROCKET_RK3576_WDEV"); on = e ? atoi(e) != 0 : 1; }
+    return on;
+}
+
 static int rk76_bootstrap_pass(int fd, int M, int K, int N, const int8_t * qA,
                                const int8_t * qB, const float * scale_n,
+                               const int64_t * sumabs,
                                int8_t * C8, double * est, char * satcol) {
     static int form = -1;
     if (form < 0) {
@@ -1931,7 +2008,8 @@ static int rk76_bootstrap_pass(int fd, int M, int K, int N, const int8_t * qA,
     }
     const int fe_prof = rk76_prof_on();
     double werr = 0.0;
-    if (rocket_matmul_int8_rk3576_perc(fd, M, K, N, qA, qB, NULL, scale_n, C8, &werr) != 0)
+    if (rocket_matmul_int8_rk3576_perc_sa(fd, M, K, N, qA, qB, NULL, scale_n,
+                                          rk76_wsa() ? sumabs : NULL, C8, &werr) != 0)
         return -1;
     double fet0 = RK76_FE_T0();
     if (form == 2) {
@@ -2061,6 +2139,8 @@ static int ggml_backend_rocket_mul_mat_rk3576(
     if (it != ctx->rk76_wcache.end() && (it->second.N != N || it->second.K != K)) {
         // Same name, different shape: the record's calibration belongs to the old shape.
         ctx->rk76_resident_bytes -= it->second.bytes;
+        for (auto & q : it->second.ch)
+            if (q.wbo) { rocket_rk3576_wbo_free(ctx->rk76_fd, q.wbo); q.wbo = nullptr; }
         ctx->rk76_wcache.erase(it);
         it = ctx->rk76_wcache.end();
     }
@@ -2068,7 +2148,8 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         // The int8 weight is N*Ktot however it is cut; only the per-column vectors are
         // paid per chunk.
         const size_t est = (size_t)N * K
-                         + kc.size() * (size_t)N * (3 * sizeof(float) + sizeof(double));
+                         + kc.size() * (size_t)N * (3 * sizeof(float) + sizeof(double)
+                                                    + sizeof(int64_t));
         if (key.empty() || (ctx->int8_cache_budget != 0
                             && ctx->rk76_resident_bytes + est > ctx->int8_cache_budget))
             return -1;   // don't re-quantize per call; this weight runs on the fp16 path
@@ -2093,6 +2174,7 @@ static int ggml_backend_rocket_mul_mat_rk3576(
                                              q.b_scale.data(), tmp.data(),
                                              rk76_rot_blocks(q.Kc), K) < 0) return -1;
                 q.cbound.resize((size_t)N);
+                q.sumabs.resize((size_t)N);
                 q.colmax.assign((size_t)N, 0.0);
                 q.scale_n.resize((size_t)N);
                 for (int n = 0; n < N; n++) {
@@ -2101,10 +2183,15 @@ static int ggml_backend_rocket_mul_mat_rk3576(
                     // multiplier. Held as a SCALE so the bootstrap can hand it straight
                     // over. It is a per-CHUNK bound, and tighter than the whole-K one by
                     // exactly the contraction it no longer covers.
-                    double s = 0.0;
+                    // Accumulated as the INTEGER the library's ramp planner wants, then
+                    // widened for cbound. |qB| is 0-128 and Kc <= 8960, so the sum is
+                    // under 2^21 and the double conversion is exact — cbound is the same
+                    // float either way.
+                    int64_t s = 0;
                     const int8_t * row = q.qB.data() + (size_t)n * q.Kc;
-                    for (int k = 0; k < q.Kc; k++) s += (double)(row[k] < 0 ? -row[k] : row[k]);
-                    q.cbound[n] = (float)(127.0 / (128.0 * s + 1.0));
+                    for (int k = 0; k < q.Kc; k++) s += row[k] < 0 ? -(int64_t)row[k] : (int64_t)row[k];
+                    q.sumabs[n] = s;
+                    q.cbound[n] = (float)(127.0 / (128.0 * (double)s + 1.0));
                 }
                 k0 += q.Kc;
             }
@@ -2194,12 +2281,14 @@ static int ggml_backend_rocket_mul_mat_rk3576(
             int M1 = M;
             if (rk76_calrows() > 0 && rk76_calrows() < M) M1 = rk76_calrows();
             if (rk76_bootstrap_pass(ctx->rk76_fd, M1, q.Kc, N, qA.data(), q.qB.data(),
-                                    q.cbound.data(), C8.data(), est1.data(), NULL) < 0)
+                                    q.cbound.data(), q.sumabs.data(),
+                                    C8.data(), est1.data(), NULL) < 0)
                 return -1;
             for (int n = 0; n < N; n++)
                 sc2[n] = (float)(127.0 / (est1[n] * (double)ctx->rk76_bootmargin));
             if (rk76_bootstrap_pass(ctx->rk76_fd, M, q.Kc, N, qA.data(), q.qB.data(),
-                                    sc2.data(), C8.data(), est2.data(), sat.data()) < 0)
+                                    sc2.data(), q.sumabs.data(),
+                                    C8.data(), est2.data(), sat.data()) < 0)
                 return -1;
             for (int n = 0; n < N; n++) {
                 const double v = sat[n] ? est1[n] * (double)ctx->rk76_bootmargin : est2[n];
@@ -2229,11 +2318,34 @@ static int ggml_backend_rocket_mul_mat_rk3576(
             continue;
         }
 
+        // The device weight cache: create at the first converged call, then drop qB.
+        // On failure, latch off for the whole context — a board that refused one cube
+        // should not be asked to hold more — and stay on the per-call path, which is
+        // still there because qB was not dropped.
+        if (rk76_wdev() && !ctx->rk76_wdev_off && !q.wbo) {
+            if (rocket_rk3576_wbo_create(ctx->rk76_fd, q.Kc, N, q.qB.data(),
+                                         &q.wbo) == 0) {
+                q.qB.clear();
+                q.qB.shrink_to_fit();
+            } else {
+                ctx->rk76_wdev_off = true;
+                ROCKET_LOGW("[rk3576] device weight cache create failed at N=%d Kc=%d "
+                            "(device memory, most likely) -- staying on the per-call "
+                            "weight pack from here on\n", N, q.Kc);
+            }
+        }
+
         double werr = 0.0;
         fet0 = RK76_FE_T0();
-        if (rocket_matmul_int8_rk3576_perc(ctx->rk76_fd, M, q.Kc, N, qA.data(),
-                                           q.qB.data(), NULL, q.scale_n.data(),
-                                           C8.data(), &werr) != 0)
+        int mmrc = q.wbo
+            ? rocket_matmul_int8_rk3576_perc_wbo(ctx->rk76_fd, M, q.Kc, N, qA.data(),
+                                                 q.wbo, NULL, q.scale_n.data(),
+                                                 q.sumabs.data(), C8.data(), &werr)
+            : rocket_matmul_int8_rk3576_perc_sa(ctx->rk76_fd, M, q.Kc, N, qA.data(),
+                                                q.qB.data(), NULL, q.scale_n.data(),
+                                                rk76_wsa() ? q.sumabs.data() : NULL,
+                                                C8.data(), &werr);
+        if (mmrc != 0)
             return -1;
         RK76_FE_ADD(entry, fet0);
         fet0 = RK76_FE_T0();
@@ -4018,6 +4130,12 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
     if (ctx->i4_dev) {   // resident int4 weights hold BOs on the ctx fds -> free first
         for (auto & kv : ctx->i4_rwcache) rocket_i4_weights_free(ctx->i4_dev, kv.second.w);
         rocket_i4_ctx_free(ctx->i4_dev);
+    }
+    if (ctx->rk76_fd >= 0) {   // rk3576 device weight cubes + any pooled transient BOs
+        for (auto & kv : ctx->rk76_wcache)
+            for (auto & q : kv.second.ch)
+                if (q.wbo) { rocket_rk3576_wbo_free(ctx->rk76_fd, q.wbo); q.wbo = nullptr; }
+        rocket_rk3576_bo_pool_drain(ctx->rk76_fd);
     }
     delete ctx;
     delete backend;
