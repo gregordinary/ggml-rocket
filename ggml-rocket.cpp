@@ -106,6 +106,46 @@ struct rocket_int8_weight {
     int N, K; bool hadamard; size_t bytes;
 };
 
+// One RK3576 W8A8 weight: the same per-output-channel rotated int8 weight as
+// rocket_int8_weight, plus the two things that part's entry needs and the RK3588's does
+// not. rocket_matmul_int8_rk3576_perc() writes int8 through a per-output-COLUMN requant,
+// so the caller must hand it a per-column output scale — and the scale a column wants is
+// set by that column's accumulator, which is what the call produces. `colmax` is the
+// frozen estimate of that accumulator's per-column magnitude, accumulated over the first
+// `cal_calls` forward passes and then read-only.
+//
+// WHAT THE FROZEN SCALE COSTS AND WHY THE SAFETY FACTOR IS HERE. Simulated on two real
+// models' own prefill activations, freezing the colmax exactly costs Qwen2.5-1.5B 1.047x
+// wikitext-2 perplexity and SmolLM2-1.7B 1.133x against fp32, where an oracle per-column
+// scale costs 1.0025x / 1.008x. One global multiplier on the frozen colmax before it is
+// inverted recovers 87% of that on both models (1.008x / 1.020x), and its floor is FLAT
+// over 1.5-3.0 — so this is one constant, not a per-model tuning job. A larger
+// calibration set buys the same thing more slowly (four times the windows recovers 71% /
+// 66%), which is why `cal_done` stops at 2 and the factor carries the weight.
+//
+// AND THE FACTOR IS WHAT ABSORBS THE BOOTSTRAP'S OWN ERROR, which is why the default sits
+// at the TOP of that flat floor rather than in the middle. `colmax` here is estimated from
+// the part's int8 output, not read off an accumulator, and its 0.3% per-column error costs
+// SmolLM2 0.018 of ratio at safety 2.0 and 0.0021 at 3.0 — while the exactly-frozen arm
+// moves 0.0017 between the same two points. A dial that is flat for an exact scale is not
+// flat for an estimated one. [host arithmetic over two models, 2026-08-11]
+struct rocket_rk3576_weight {
+    std::vector<int8_t> qB;        // [N*K] int8, NPU-row-major, ALWAYS rotated
+    std::vector<float>  b_scale;   // [N] per-output-channel weight dequant scale
+    std::vector<float>  cbound;    // [N] 127/(128*sum_k|qB[n][k]|+1): the no-saturate scale
+    std::vector<double> colmax;    // [N] frozen |accumulator| max, running over calibration
+    std::vector<float>  scale_n;   // [N] what the entry is handed once frozen
+    int cal_done;                  // calibration forwards recorded so far
+    int N, K; size_t bytes;
+    // The saturation the frozen scale did NOT anticipate, over every frozen call. A
+    // nonzero rate is the calibration set failing to cover the scored activations, which
+    // is the failure this route's tail arm measured; it is REPORTED rather than acted on,
+    // because re-freezing mid-run makes a model's output depend on how many tokens
+    // preceded it.
+    uint64_t sat_elems, tot_elems;
+    bool sat_warned;
+};
+
 // One resident rotated-int4 weight: per-channel-quantized (and, when Hadamard is
 // on, pre-rotated) int4 weight stored one value-per-int8_t in [-7,7], + its scales.
 // The int4 sibling of rocket_int8_weight. group==0 is per-channel (b_scale is [N]);
@@ -241,6 +281,23 @@ struct ggml_backend_rocket_context {
     std::unordered_map<std::string, rocket_int8_weight> int8_wcache;
     size_t int8_resident_bytes = 0;
     size_t int8_cache_budget   = (size_t)4096 << 20;
+
+    // RK3576 W8A8 path, selected by the DETECTED PART (rocket_hw_current()) rather than
+    // by an env knob, because the RK3588 int8 entry writes int32 with no output requant
+    // and this one writes int8 through a per-column one — different arithmetic, different
+    // cached record, different failure modes. It reuses ROCKET_INT8 as its opt-in and
+    // rocket_weight_key() / rk_build_H60() / the budgeted-cache discipline as-is.
+    // The rotation is NOT optional here (ROCKET_INT8_HADAMARD does not gate it): without
+    // it one per-column output requant still costs 1.54x / 1.06x perplexity on the two
+    // models measured, and the unrotated route is additionally CHAOTIC — a 2% per-column
+    // divisor change moved one model's perplexity nine orders of magnitude.
+    std::unordered_map<std::string, rocket_rk3576_weight> rk76_wcache;
+    size_t rk76_resident_bytes = 0;
+    int    rk76_ncal   = -1;   // ROCKET_RK3576_NCAL:   calibration forwards (default 2)
+    float  rk76_calsafe = 0.0f; // ROCKET_RK3576_CALSAFE: colmax safety factor (default 2)
+    float  rk76_bootmargin = 0.0f; // ROCKET_RK3576_BOOTMARGIN (default 1.5)
+    int    rk76_fd     = -1;
+    bool   rk76_failed = false;
 
     // int4 W4A4 path, opt-in via ROCKET_INT4=1 (the int4 sibling of the int8 one-shot
     // path above). Native int4xint4->int16 NPU matmul; per-row activation + per-channel
@@ -573,6 +630,16 @@ static int rocket_moe_m_bucket_env(void) {
 // (budget sized from free RAM at init); off for "0" / unset. The budget VALUE is applied
 // to ctx->cache_budget in ggml_backend_rocket_init (this no-ctx gate only reports on/off,
 // so the device supports_op path can read it without a context handle).
+// ROCKET_INT8, read without a context handle. The RK3576 branch of supports_op needs it:
+// on that part the W8A8 route is the only matmul route, so whether the op can be claimed
+// at all depends on whether int8 mode is on. ctx->int8_mode is the same knob and stays
+// the one the dispatch reads.
+static bool rocket_int8_mode_on(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ROCKET_INT8"); v = (e && atoi(e) > 0) ? 1 : 0; }
+    return v > 0;
+}
+
 static bool rocket_quant_resident_on(void) {
     static int v = -1;
     if (v < 0) {
@@ -1137,6 +1204,40 @@ static int rk_hadamard_rotate(float *row, int K) {
     for (; k < K; k++) row[k] *= inv;
     return 0;
 }
+// BLOCK-DIAGONAL rotation, for a K that is neither a power of two nor 60*2^k.
+//
+// rk_hadamard_ok() covers exactly the two constructions above, and they do not cover a K
+// like Qwen2.5-1.5B's 1536 (= 3*2^9): not a power of two, and 1536 % 60 != 0. That matters
+// more than a missing shape, because 1536 is the contraction depth of EVERY projection in
+// one of the two models the W8A8 accuracy numbers were measured on — so without this the
+// RK3576 entry refuses that whole model and the port cannot run the arithmetic it was
+// budgeted from.
+//
+// This is the construction those numbers were computed in: H_b applied to each aligned
+// block of b = the largest power of two dividing K, which is still orthonormal (so
+// (A H)(B H)^T = A B^T exactly) and smears an outlier over its block rather than over the
+// whole contraction. That makes it the WEAKER of the two — it is the fallback, not a
+// replacement — but it is always available and it is what the accuracy corpus used
+// wherever K was not a power of two. A K whose largest power-of-two divisor is under 32
+// is refused rather than rotated: at that block size the rotation stops smearing outliers
+// and the route's whole premise goes with it.
+static int rk_hadamard_rotate_blocks(float *row, int K) {
+    const int b = K & -K;                     // largest power of two dividing K
+    if (b < 32) return -1;
+    const float inv = 1.0f / sqrtf((float)b);
+    for (int i = 0; i < K; i += b) {
+        rk_fwht(row + i, b);
+        int k = 0;
+#ifdef ROCKET_NEON_F32
+        const float32x4_t vinv = vdupq_n_f32(inv);
+        for (; k + 4 <= b; k += 4)
+            vst1q_f32(row + i + k, vmulq_f32(vld1q_f32(row + i + k), vinv));
+#endif
+        for (; k < b; k++) row[i + k] *= inv;
+    }
+    return 0;
+}
+
 // Hadamard variants of the quant kernels: rotate each row into `tmp` (K floats,
 // caller-owned, reused) then quantize. Same per-row / per-channel symmetric int8.
 // Return 0, or <0 if a row's K exceeds the rotation bound (caller -> CPU fallback).
@@ -1161,8 +1262,11 @@ static int rocket_quant_act_int8_had(const float * src, int8_t * dst,
     if (prof) { rocket_i8prof_arm(); g_i8prof.act_rot += rot; g_i8prof.act_q += qt; g_i8prof.act_calls++; }
     return 0;
 }
+// `blocks` selects the block-diagonal construction for a K the two exact ones do not
+// cover (rk_hadamard_rotate_blocks); the RK3576 entry is the only caller that passes it.
 static int rocket_quant_wt_int8_had(const void * src, bool f16, int8_t * dst,
-                                     int64_t N, int64_t K, float * b_scale, float * tmp) {
+                                     int64_t N, int64_t K, float * b_scale, float * tmp,
+                                     bool blocks = false) {
     const bool prof = rocket_convprof_on();
     double rot = 0, qt = 0, t0 = 0;
     for (int64_t n = 0; n < N; n++) {
@@ -1170,7 +1274,8 @@ static int rocket_quant_wt_int8_had(const void * src, bool f16, int8_t * dst,
         const float       * brow32 = (const float       *)src + n * K;
         if (prof) t0 = rocket_now_ms();
         for (int64_t k = 0; k < K; k++) tmp[k] = f16 ? ggml_fp16_to_fp32(brow16[k]) : brow32[k];
-        if (rk_hadamard_rotate(tmp, (int)K) < 0) return -1;
+        if ((blocks ? rk_hadamard_rotate_blocks(tmp, (int)K)
+                    : rk_hadamard_rotate(tmp, (int)K)) < 0) return -1;
         if (prof) { rot += rocket_now_ms() - t0; t0 = rocket_now_ms(); }
         float amax = 0.0f;
         for (int64_t k = 0; k < K; k++) { const float v = fabsf(tmp[k]); if (v > amax) amax = v; }
@@ -1417,6 +1522,355 @@ static int ggml_backend_rocket_mul_mat_int8(
     if (rc != 0) return -1;
 
     rocket_dequant_int8(C32.data(), (float *)dst->data, M, N, a_scale.data(), b_scale);
+    return 0;
+}
+
+// ===========================================================================
+// RK3576 W8A8. A DIFFERENT ROUTE, not a parameterization of the one above.
+//
+// The RK3588 int8 entry hands back a raw int32 accumulator and the host applies both
+// scales. The RK3576's writes int8: any output element wider than one byte poisons that
+// part's NEXT submit across processes, so the int32 sibling is not a route a frontend
+// takes. What the part gives instead is a per-output-COLUMN requant in the DPU epilogue,
+// and the whole port hangs off supplying its scale.
+//
+// THE ROUTE, and every piece of it is load-bearing on the two models measured:
+//
+//   1. rotate A and B by an orthonormal Hadamard along K. MANDATORY, not a knob.
+//   2. quantize A PER TENSOR and B PER OUTPUT CHANNEL. Per-axis INPUT scales are free at
+//      this interface and better on every per-GEMM norm, and end to end they are 38x
+//      WORSE on one model of two and 1.08x better on the other — so the per-tensor
+//      activation scale is the measured choice, not the lazy one.
+//   3. per-column output requant, whose scale is frozen from a calibration pass and
+//      divided by a safety factor near 2 (see rocket_rk3576_weight).
+//   4. host dequantize by the scale the entry was ASKED for, not the gain its integer
+//      ramp delivered. The two differ by `worst_rel_err` (0.5-0.9% median on a real
+//      model's shapes); de-quantizing by the achieved gain instead is a measured WASH and
+//      is deliberately not done.
+//
+// Composed, that route measures 1.008x / 1.020x wikitext-2 perplexity against fp32 on
+// Qwen2.5-1.5B and SmolLM2-1.7B, with the frozen scale and the safety factor — against
+// 1.11x / 2.26x for the per-tensor output scale this replaces.
+// [host arithmetic over two models, 2026-08-10; the DEVICE composition of the route is
+//  gated separately — nothing here was measured on the part]
+//
+// M carries NO constraint on this part (M=1 computes), which is the opposite of the
+// RK3588, where rows are the conv's spatial height and height < 4 mis-computes. So there
+// is deliberately no rocket_pad_m() here.
+//
+// WHERE THIS CODE AND THAT INSTRUMENT KNOWINGLY DIFFER, so a device-vs-host comparison is
+// read against the right reference: rocket_q8() clamps to [-127, 127] and the simulator
+// clips to [-128, 127], which can differ by one code on the single most negative element
+// of a tensor; and for a K of the form 60*2^k this code takes the stronger Kronecker
+// H_64 (x) H_60 where the simulator would take the block-diagonal fallback. Neither model
+// behind the accuracy numbers has such a K, so that second one is unscored either way.
+
+static bool rocket_rk3576_selected(void) {
+    const struct rocket_hw_profile * hw = rocket_hw_current();
+    return hw && hw->name && strcmp(hw->name, "rk3576") == 0;
+}
+
+// ---------------------------------------------------------------------------------
+// RK3576 W8A8 frontend phase profiling — ROCKET_MM_PROFILE, the same knob the library's
+// three accumulators use, and its own exit line beside theirs.
+//
+// The library's buckets stop at the entry, and on this route the terms OUTSIDE it are not
+// a rounding error: the activation rotation is O(M*K log K) every call, the dequantize is
+// O(M*N) every call, and the three scratch vectors are value-initialized, so each call
+// memsets M*K*4 + M*K + M*N bytes before it computes anything. None of those has a bucket
+// in rocket_matmul.c, and a term with no bucket is charged to whichever neighbour spans it.
+//
+// WHAT IT CANNOT SEE: the rest of the model. Attention, the norms, rope, the scheduler and
+// every CPU-placed matmul are outside this handler, so these buckets and the library's sum
+// to the OFFLOADED path's time and not to the prefill wall. Reading a share of the wall off
+// them is the error the caps here have made five times running.
+static int rk76_prof_on(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("ROCKET_MM_PROFILE") != NULL;
+    return v;
+}
+static struct {
+    double valloc, quant, cal, entry, dequant;
+    long calls, cal_calls;
+} g_rk76_fe;
+static int g_rk76_fe_armed = 0;
+// ROCKET_LOGI and NOT GGML_LOG_*, for the reason the convert/i8/moe dumps above give: the
+// tool this has to survive is llama-bench, which installs a no-op ggml log callback and
+// swallows everything sent through ggml. ROCKET_LOG_STDERR=1 tees the rocket channel past
+// it. A profiler silenced by the profiling harness reads as "nothing to report".
+static void rk76_fe_dump(void) {
+    ROCKET_LOGI("ROCKET rk3576 frontend profile total(ms): valloc=%.0f quant+rot=%.0f "
+                "calibrate=%.0f entry=%.0f dequant=%.0f  over %ld calls "
+                "(%ld of them calibration forwards)\n",
+                g_rk76_fe.valloc, g_rk76_fe.quant, g_rk76_fe.cal, g_rk76_fe.entry,
+                g_rk76_fe.dequant, g_rk76_fe.calls, g_rk76_fe.cal_calls);
+}
+static double rk76_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+// The handler runs on the backend's single graph_compute dispatch thread, so the
+// accumulator needs no lock; arm the dump on first use, as the library's do.
+#define RK76_FE_T0()       (fe_prof ? rk76_now_ms() : 0.0)
+#define RK76_FE_ADD(f, t0) do { if (fe_prof) {                                   \
+        if (!g_rk76_fe_armed) { atexit(rk76_fe_dump); g_rk76_fe_armed = 1; }     \
+        g_rk76_fe.f += rk76_now_ms() - (t0); } } while (0)
+
+// Which rotation this K takes. The two exact constructions where they exist, the
+// block-diagonal fallback otherwise — and the fallback is what carries a K like Qwen's
+// 1536. `blocks` is the same choice made once for the weight and every activation, since a
+// weight rotated by one H and activations by another does not reconstruct the product.
+static bool rk76_rot_blocks(int K)   { return !rk_hadamard_ok(K); }
+static bool rk76_rot_ok(int K) {
+    return rk_hadamard_ok(K) || (K & -K) >= 32;
+}
+static int rk76_rotate(float * row, int K) {
+    return rk76_rot_blocks(K) ? rk_hadamard_rotate_blocks(row, K)
+                              : rk_hadamard_rotate(row, K);
+}
+
+// A[M,K] f32 -> rotated int8 [M,K] + ONE per-tensor scale. The per-tensor scale is the
+// measured choice (see above), and it is why this cannot call
+// rocket_quant_act_int8_had(): that one writes a scale per row. `rot` is caller-owned
+// [M*K] scratch — the rotation is the expensive half (~2 ms at M=512 K=2048) and is done
+// once, not once per pass.
+static int rk76_quant_act(const float * src, int8_t * dst, int64_t M, int64_t K,
+                          float * a_scale, float * rot) {
+    float amax = 0.0f;
+    for (int64_t m = 0; m < M; m++) {
+        float * r = rot + m * K;
+        for (int64_t k = 0; k < K; k++) r[k] = src[m * K + k];
+        if (rk76_rotate(r, (int)K) < 0) return -1;
+        for (int64_t k = 0; k < K; k++) { const float v = fabsf(r[k]); if (v > amax) amax = v; }
+    }
+    const float s = (amax > 0.0f) ? amax / 127.0f : 1.0f, inv = 1.0f / s;
+    for (int64_t i = 0; i < M * K; i++) dst[i] = rocket_q8(rot[i], inv);
+    *a_scale = s;
+    return 0;
+}
+
+// int8 C[M,N] -> f32 dst: dst[m,n] = C[m,n]/scale_n[n] * a_scale * b_scale[n].
+// scale_n is what the entry was ASKED for; see (4) above for why not the achieved gain.
+static void rk76_dequant(const int8_t * src, float * dst, int64_t M, int64_t N,
+                         float a_scale, const float * b_scale, const float * scale_n,
+                         uint64_t * sat_elems) {
+    std::vector<float> f((size_t)N);
+    uint64_t sat = 0;
+    for (int64_t n = 0; n < N; n++) f[n] = a_scale * b_scale[n] / scale_n[n];
+    for (int64_t m = 0; m < M; m++) {
+        const int8_t * srow = src + m * N;
+        float * drow = dst + m * N;
+        for (int64_t n = 0; n < N; n++) {
+            const int v = srow[n];
+            if (v >= 127 || v <= -127) sat++;
+            drow[n] = (float)v * f[n];
+        }
+    }
+    if (sat_elems) *sat_elems += sat;
+}
+
+// One bootstrap pass: run the entry at `scale_n` and read each column's largest |C8| back
+// as an estimate of that column's accumulator magnitude. Returns <0 if the entry refused.
+//
+// This is how a caller gets the frozen colmax WITHOUT a host int32 GEMM. The accumulator
+// never leaves the part, so the estimate comes from the part's own int8 output: pass one
+// runs at 127/(128*sum_k|B[n][k]|), the analytic accumulator bound, which overshoots a
+// real column by ~60x and therefore cannot saturate, and pass two runs at the first
+// pass's readback times a margin so the codes are actually spent. A column that saturates
+// in pass two keeps pass one's margined value, which over-estimates — the safe direction,
+// since a frozen scale that is too TIGHT is what the tail measurement says costs a model.
+static int rk76_bootstrap_pass(int fd, int M, int K, int N, const int8_t * qA,
+                               const int8_t * qB, const float * scale_n,
+                               int8_t * C8, double * est, char * satcol) {
+    double werr = 0.0;
+    if (rocket_matmul_int8_rk3576_perc(fd, M, K, N, qA, qB, NULL, scale_n, C8, &werr) != 0)
+        return -1;
+    for (int n = 0; n < N; n++) {
+        int mx = 0; bool sat = false;
+        for (int m = 0; m < M; m++) {
+            int v = C8[(size_t)m * N + n];
+            if (v < 0) v = -v;
+            if (v > mx) mx = v;
+            if (v >= 127) sat = true;
+        }
+        // A column reading back all-zero is one whose accumulator is under half a code at
+        // THIS scale; credit it the code it would have taken, so no column is later
+        // handed a zero scale and pass two still has something to refine.
+        if (mx < 1) mx = 1;
+        est[n] = (double)mx / (double)scale_n[n];
+        if (satcol) satcol[n] = sat ? 1 : 0;
+    }
+    return 0;
+}
+
+// W8A8 matmul for one plain 2D static-weight GEMM on the RK3576. Returns 0 (dst written)
+// or <0 to fall through to the fp16 path. Caller checks K%32, N%32 and 2D-ness; the
+// library refuses K >= 6176 itself (no single-task plan; the K-split route wedges the part
+// until it is rebooted), which puts every FFN down-projection on the CPU.
+static int ggml_backend_rocket_mul_mat_rk3576(
+        ggml_backend_rocket_context * ctx, ggml_tensor * dst,
+        int M, int K, int N) {
+    const ggml_tensor * src0 = dst->src[0];   // weights -> B[N,K]
+    const ggml_tensor * src1 = dst->src[1];   // input   -> A[M,K]
+
+    if (ctx->rk76_failed) return -1;
+    if (ctx->rk76_fd < 0) {
+        ctx->rk76_fd = rocket_open();
+        if (ctx->rk76_fd < 0) { ctx->rk76_failed = true; return -1; }
+    }
+    if (ctx->rk76_ncal < 0) {
+        const char * e = getenv("ROCKET_RK3576_NCAL");   ctx->rk76_ncal = e ? atoi(e) : 2;
+        // 3.0, not 2.0: the frozen colmax here is BOOTSTRAPPED, and a bootstrap's 0.3%
+        // per-column error costs SmolLM2-1.7B 0.018 of ratio at safety 2.0 against 0.0021
+        // at 3.0 — an 88% reduction — while the exactly-frozen arm moves only 0.0017
+        // between the two, so 3.0 is inside that model's floor. Qwen2.5-1.5B's exact arm
+        // is 1.008x at both. [host arithmetic; Qwen's BOOTSTRAPPED arm at 3.0 is
+        // [expected] from its 0.000055 gap at 2.0, not measured]
+        e = getenv("ROCKET_RK3576_CALSAFE");   ctx->rk76_calsafe = e ? (float)atof(e) : 3.0f;
+        e = getenv("ROCKET_RK3576_BOOTMARGIN"); ctx->rk76_bootmargin = e ? (float)atof(e) : 1.5f;
+        if (ctx->rk76_calsafe <= 0.0f)    ctx->rk76_calsafe = 3.0f;
+        if (ctx->rk76_bootmargin < 1.0f)  ctx->rk76_bootmargin = 1.5f;
+    }
+    // The rotation is the route, so a K no construction can express is a decline, not a
+    // fallback to an unrotated run — that route is chaotic, not merely less accurate.
+    if (!rk76_rot_ok(K)) return -1;
+    rk_build_H60();
+
+    // ---- weights: quantize+rotate ONCE per stable name, and hold the calibration state
+    // beside them. Keyed on the weight NAME, as every other cache here is: src0->data is
+    // reused by the scheduler across distinct weights.
+    const bool b_f16 = (src0->type == GGML_TYPE_F16);
+    const std::string key = rocket_weight_key(src0);
+    auto it = key.empty() ? ctx->rk76_wcache.end() : ctx->rk76_wcache.find(key);
+    if (it != ctx->rk76_wcache.end() && (it->second.N != N || it->second.K != K)) {
+        // Same name, different shape: the record's calibration belongs to the old shape.
+        ctx->rk76_resident_bytes -= it->second.bytes;
+        ctx->rk76_wcache.erase(it);
+        it = ctx->rk76_wcache.end();
+    }
+    if (it == ctx->rk76_wcache.end()) {
+        const size_t est = (size_t)N * K
+                         + (size_t)N * (3 * sizeof(float) + sizeof(double));
+        if (key.empty() || (ctx->int8_cache_budget != 0
+                            && ctx->rk76_resident_bytes + est > ctx->int8_cache_budget))
+            return -1;   // don't re-quantize per call; this weight runs on the fp16 path
+        rocket_rk3576_weight e;
+        e.qB.resize((size_t)N * K);
+        e.b_scale.resize((size_t)N);
+        {
+            std::vector<float> tmp((size_t)K);
+            if (rocket_quant_wt_int8_had(src0->data, b_f16, e.qB.data(), N, K,
+                                         e.b_scale.data(), tmp.data(),
+                                         rk76_rot_blocks(K)) < 0) return -1;
+        }
+        e.cbound.resize((size_t)N);
+        e.colmax.assign((size_t)N, 0.0);
+        e.scale_n.resize((size_t)N);
+        for (int n = 0; n < N; n++) {
+            // |acc| <= 128 * sum_k |B[n][k]| for int8 A, and this is the same term the
+            // library's own C-ramp planner uses to cap the per-column multiplier. Held as
+            // a SCALE so the bootstrap can hand it straight over.
+            double s = 0.0;
+            const int8_t * row = e.qB.data() + (size_t)n * K;
+            for (int k = 0; k < K; k++) s += (double)(row[k] < 0 ? -row[k] : row[k]);
+            e.cbound[n] = (float)(127.0 / (128.0 * s + 1.0));
+        }
+        e.cal_done = 0; e.N = N; e.K = K; e.bytes = est;
+        e.sat_elems = 0; e.tot_elems = 0; e.sat_warned = false;
+        it = ctx->rk76_wcache.emplace(key, std::move(e)).first;
+        ctx->rk76_resident_bytes += est;
+        if (rocket_debug_on())
+            GGML_LOG_DEBUG("[rk3576-cache] +%-22s N=%6d K=%6d  resident=%zuMB\n",
+                           key.c_str(), N, K, ctx->rk76_resident_bytes >> 20);
+    }
+    rocket_rk3576_weight & w = it->second;
+
+    // ---- activations: rotated + per-tensor quantized, every call
+    const int fe_prof = rk76_prof_on();
+    double fet0 = RK76_FE_T0();
+    std::vector<float>  rot((size_t)M * K);
+    std::vector<int8_t> qA((size_t)M * K);
+    RK76_FE_ADD(valloc, fet0);
+    float a_scale = 1.0f;
+    fet0 = RK76_FE_T0();
+    if (rk76_quant_act((const float *)src1->data, qA.data(), M, K, &a_scale, rot.data()) < 0)
+        return -1;
+    RK76_FE_ADD(quant, fet0);
+
+    fet0 = RK76_FE_T0();
+    std::vector<int8_t> C8((size_t)M * N);
+    RK76_FE_ADD(valloc, fet0);
+    if (fe_prof) g_rk76_fe.calls++;
+
+    if (w.cal_done < ctx->rk76_ncal) {
+        // ---- calibration forward: two device passes to estimate this window's per-column
+        // accumulator maxima, then accumulate the running max. The SECOND pass's surface
+        // is the one handed back — it is a correct output at a scale ~BOOTMARGIN loose,
+        // which costs resolution and nothing else.
+        if (fe_prof) g_rk76_fe.cal_calls++;
+        fet0 = RK76_FE_T0();
+        std::vector<double> est1((size_t)N), est2((size_t)N);
+        std::vector<char>   sat((size_t)N, 0);   // char, not bool: &v[0] must be writable
+        if (rk76_bootstrap_pass(ctx->rk76_fd, M, K, N, qA.data(), w.qB.data(),
+                                w.cbound.data(), C8.data(), est1.data(), NULL) < 0)
+            return -1;
+        std::vector<float> sc2((size_t)N);
+        for (int n = 0; n < N; n++)
+            sc2[n] = (float)(127.0 / (est1[n] * (double)ctx->rk76_bootmargin));
+        if (rk76_bootstrap_pass(ctx->rk76_fd, M, K, N, qA.data(), w.qB.data(),
+                                sc2.data(), C8.data(), est2.data(), sat.data()) < 0)
+            return -1;
+        for (int n = 0; n < N; n++) {
+            const double v = sat[n] ? est1[n] * (double)ctx->rk76_bootmargin : est2[n];
+            if (v > w.colmax[n]) w.colmax[n] = v;
+        }
+        w.cal_done++;
+        if (w.cal_done == ctx->rk76_ncal) {
+            for (int n = 0; n < N; n++) {
+                const double cm = w.colmax[n] > 0.0 ? w.colmax[n] : 1.0;
+                w.scale_n[n] = (float)(127.0 / (cm * (double)ctx->rk76_calsafe));
+            }
+            if (rocket_debug_on())
+                GGML_LOG_DEBUG("[rk3576-cal] %-22s frozen over %d forward(s), "
+                               "safety %.2f\n", key.c_str(), w.cal_done,
+                               (double)ctx->rk76_calsafe);
+        }
+        RK76_FE_ADD(cal, fet0);
+        fet0 = RK76_FE_T0();
+        rk76_dequant(C8.data(), (float *)dst->data, M, N, a_scale,
+                     w.b_scale.data(), sc2.data(), NULL);
+        RK76_FE_ADD(dequant, fet0);
+        return 0;
+    }
+
+    double werr = 0.0;
+    fet0 = RK76_FE_T0();
+    if (rocket_matmul_int8_rk3576_perc(ctx->rk76_fd, M, K, N, qA.data(), w.qB.data(),
+                                       NULL, w.scale_n.data(), C8.data(), &werr) != 0)
+        return -1;
+    RK76_FE_ADD(entry, fet0);
+    fet0 = RK76_FE_T0();
+    rk76_dequant(C8.data(), (float *)dst->data, M, N, a_scale,
+                 w.b_scale.data(), w.scale_n.data(), &w.sat_elems);
+    RK76_FE_ADD(dequant, fet0);
+    w.tot_elems += (uint64_t)M * N;
+    // The policy for a call whose accumulator exceeds the frozen scale: COUNT it and say
+    // so once. Re-freezing here would make the model's output depend on how many tokens
+    // preceded it, and widening only the offending columns re-runs the call. The
+    // measurement behind the threshold: at safety 2.0 the saturating fraction of the
+    // surface is 0.000-0.004% on both models, against 0.180% at safety 1.0 — so a rate
+    // this side of a tenth of a percent means the calibration set did not cover the
+    // activations it is being asked about, and the lever is a larger safety factor.
+    if (!w.sat_warned && w.tot_elems >= (uint64_t)1 << 20
+        && w.sat_elems * 1000 > w.tot_elems) {
+        w.sat_warned = true;
+        ROCKET_LOGI("[rocket] %s: %.3f%% of the RK3576 W8A8 output saturates against a "
+                    "scale frozen over %d forward(s); raise ROCKET_RK3576_CALSAFE "
+                    "(now %.2f) or ROCKET_RK3576_NCAL (now %d)\n",
+                    key.c_str(), 100.0 * (double)w.sat_elems / (double)w.tot_elems,
+                    ctx->rk76_ncal, (double)ctx->rk76_calsafe, ctx->rk76_ncal);
+    }
     return 0;
 }
 
@@ -2629,11 +3083,20 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
         // otherwise the one-shot per-call path. Either returning 0 means done; <0
         // falls through to the fp16 path below (the un-resident weight's F16 source
         // is intact -- madvise only drops sources of weights that went resident).
-        const int r8 = ctx->int8_resident
-            ? ggml_backend_rocket_mul_mat_int8_resident(ctx, dst, (int)M, (int)K, (int)N)
-            : ggml_backend_rocket_mul_mat_int8(ctx, dst, (int)M, (int)K, (int)N);
+        // On the RK3576 the W8A8 route is a different one — int8 out through a per-column
+        // requant, not int32 out — so the branch is chosen off the DETECTED PART, not off
+        // a knob. A mis-selected branch here is a REFUSAL and not a wrong surface: the
+        // RK3588 generators refuse on this part by construction and the RK3576 entries
+        // refuse there, which is the one place this port is protected by the library
+        // rather than by review.
+        const int r8 = rocket_rk3576_selected()
+            ? ggml_backend_rocket_mul_mat_rk3576(ctx, dst, (int)M, (int)K, (int)N)
+            : (ctx->int8_resident
+                ? ggml_backend_rocket_mul_mat_int8_resident(ctx, dst, (int)M, (int)K, (int)N)
+                : ggml_backend_rocket_mul_mat_int8(ctx, dst, (int)M, (int)K, (int)N));
         if (r8 == 0) {
-            rocket_mul_mat_post(dst, ctx->int8_resident ? "int8r" : "int8");
+            rocket_mul_mat_post(dst, rocket_rk3576_selected() ? "i8-76"
+                                     : (ctx->int8_resident ? "int8r" : "int8"));
             return;
         }
     }
@@ -4357,6 +4820,31 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             // to the type's block size so each [K] row is a whole number of quant blocks
             // (K%32 below already covers Q8_0's block 32; K-quants use 256).
             const bool a_quant = ggml_is_quantized(a->type);
+            // On the RK3576 the W8A8 route is the ONLY matmul route: the RK3588 fp16
+            // generators refuse on that part by construction, so an op accepted here and
+            // then declined by the W8A8 entry does not fall back — it fails at compute
+            // time. So the gate is exactly what that entry can run, and nothing wider.
+            // K >= 6176 is the library's own refusal (no single-task plan; the K-split
+            // route wedges the part until it is rebooted), which puts every FFN
+            // down-projection on the CPU — 24 of 168 layers on Qwen2.5-1.5B, and that
+            // placement is already inside the port's measured 2.37x model-weighted cap.
+            if (rocket_rk3576_selected()) {
+                return rocket_int8_mode_on()
+                    && a->op == GGML_OP_NONE
+                    && (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32)
+                    && b->type == GGML_TYPE_F32
+                    && op->type == GGML_TYPE_F32
+                    && ggml_is_contiguous(a) && ggml_is_contiguous(b)
+                    && ggml_is_contiguous(op)
+                    && a->ne[0] == b->ne[0]
+                    && a->ne[2] == 1 && a->ne[3] == 1
+                    && b->ne[2] == 1 && b->ne[3] == 1
+                    && (K % 32 == 0) && (N % 32 == 0)   // int8 weight k-group AND N-group
+                    && K >= 64 && N >= 32
+                    && K < 6176                         // the library refuses at/above this
+                    && rk76_rot_ok((int)K)              // the rotation is the route
+                    && M >= rocket_min_m();
+            }
             return a->op == GGML_OP_NONE
                 && (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32
                     || a->type == GGML_TYPE_BF16   // decoded to fp16; ROCKET_BF16=1 selects the fp32-out datapath
