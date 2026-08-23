@@ -7,55 +7,13 @@
  * For each shape: build dst = ggml_mul_mat(W[K,N], X[K,M]) -> [N,M], run it on the
  * CPU backend and on the rocket backend with identical inputs, compare.
  */
-#include "ggml.h"
-#include "ggml-alloc.h"
-#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-rocket.h"
+#include "test-common.h"
 
 #include <vector>
 #include <cstdio>
 #include <cmath>
-
-// run dst = mul_mat(W,X) on `backend`; W is F16 weights [K,N], X is F32 input [K,M].
-// fills `out` with the [N*M] f32 result.
-static bool run(ggml_backend_t backend, int K, int N, int M,
-                const std::vector<float> & Wf, const std::vector<float> & Xf,
-                std::vector<float> & out)
-{
-    ggml_init_params ip = { /*.mem_size=*/ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
-                            /*.mem_buffer=*/ NULL, /*.no_alloc=*/ true };
-    ggml_context * ctx = ggml_init(ip);
-
-    ggml_tensor * W = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, N);  // weights
-    ggml_tensor * X = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);  // input
-    ggml_set_input(W); ggml_set_input(X);
-    ggml_tensor * dst = ggml_mul_mat(ctx, W, X);                     // -> [N, M]
-    ggml_set_output(dst);
-
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, dst);
-
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!buf) { fprintf(stderr, "alloc_ctx_tensors failed\n"); ggml_free(ctx); return false; }
-
-    // set inputs (convert W to f16)
-    std::vector<ggml_fp16_t> W16((size_t)K*N);
-    ggml_fp32_to_fp16_row(Wf.data(), W16.data(), (int64_t)K*N);
-    ggml_backend_tensor_set(W, W16.data(), 0, ggml_nbytes(W));
-    ggml_backend_tensor_set(X, Xf.data(), 0, ggml_nbytes(X));
-
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "graph_compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return false;
-    }
-
-    out.resize((size_t)N*M);
-    ggml_backend_tensor_get(dst, out.data(), 0, ggml_nbytes(dst));
-
-    ggml_backend_buffer_free(buf);
-    ggml_free(ctx);
-    return true;
-}
 
 // Run ng matmuls D[i] = mul_mat(W[i], X) that all SHARE input X, on `backend`.
 // W[i] is F16 [K, Ns[i]], X is F32 [K, M]; fills outs[i] with the [Ns[i]*M] f32
@@ -107,7 +65,7 @@ static bool run_group(ggml_backend_t backend, int K, const int * Ns, int ng, int
     return true;
 }
 
-// Like run(), but the weight is stored QUANTIZED (Q8_0 / Q4_K / ...). Wf (f32 [K*N])
+// Like rk_run_mul_mat(), but the weight is stored QUANTIZED (Q8_0 / Q4_K / ...). Wf (f32 [K*N])
 // is quantized into the tensor with ggml_quantize_chunk -- the exact payload a real
 // GGUF holds -- so this exercises the rocket backend's dequant->fp16->NPU path
 // (supports_op accepts the quant weight; the streaming/mt path dequantizes it). Returns
@@ -180,8 +138,8 @@ int main() {
         for (size_t i = 0; i < Wf.size(); i++) Wf[i] = ((int)(i*7)%13-6)*0.05f;
         for (size_t i = 0; i < Xf.size(); i++) Xf[i] = ((int)(i*5)%11-5)*0.05f;
 
-        bool ok = run(cpu, s.K, s.N, s.M, Wf, Xf, oc)
-               && run(rocket, s.K, s.N, s.M, Wf, Xf, orr);
+        bool ok = rk_run_mul_mat(cpu,    GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, oc)
+               && rk_run_mul_mat(rocket, GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, orr);
         if (!ok) { fails++; continue; }
 
         // An element is bad only if it fails BOTH tolerances at once (large abs alone
@@ -218,7 +176,8 @@ int main() {
         const int outlier_row = 3;
         for (int k = 0; k < K; k++) Xf[(size_t)outlier_row*K + k] = ((k%7)-3)*300.0f;  // |.|<=900
 
-        bool ok = run(cpu, K, N, M, Wf, Xf, oc) && run(rocket, K, N, M, Wf, Xf, orr);
+        bool ok = rk_run_mul_mat(cpu,    GGML_TYPE_F16, K, N, M, 1, Wf, Xf, oc)
+               && rk_run_mul_mat(rocket, GGML_TYPE_F16, K, N, M, 1, Wf, Xf, orr);
         if (!ok) { fprintf(stderr, "outlier test: backend run failed\n"); fails++; }
         else {
             // Check the SMALL (non-outlier) rows specifically.

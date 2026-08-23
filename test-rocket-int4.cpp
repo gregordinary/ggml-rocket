@@ -17,56 +17,15 @@
  * Off-device (no NPU) -> SKIP (77). On-device it PASSES if every shape clears the
  * cosine floor (default 0.90; tighten via ROCKET_INT4_COS_MIN) and is finite.
  */
-#include "ggml.h"
-#include "ggml-alloc.h"
-#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-rocket.h"
+#include "test-common.h"
 
 #include <vector>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <random>
-
-// dst = mul_mat(W,X); W is F16 weights [K,N], X is F32 input [K,M] -> out [N*M] f32.
-// (Identical to test-rocket-matmul's run(): the rocket backend's path is chosen by
-// the ROCKET_* env, so with ROCKET_INT4=1 this exercises the native int4 matmul.)
-static bool run(ggml_backend_t backend, int K, int N, int M,
-                const std::vector<float> & Wf, const std::vector<float> & Xf,
-                std::vector<float> & out)
-{
-    ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), NULL, true };
-    ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * W = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, N);
-    ggml_tensor * X = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
-    ggml_set_input(W); ggml_set_input(X);
-    ggml_tensor * dst = ggml_mul_mat(ctx, W, X);
-    ggml_set_output(dst);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, dst);
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!buf) { fprintf(stderr, "alloc_ctx_tensors failed\n"); ggml_free(ctx); return false; }
-    std::vector<ggml_fp16_t> W16((size_t)K*N);
-    ggml_fp32_to_fp16_row(Wf.data(), W16.data(), (int64_t)K*N);
-    ggml_backend_tensor_set(W, W16.data(), 0, ggml_nbytes(W));
-    ggml_backend_tensor_set(X, Xf.data(), 0, ggml_nbytes(X));
-    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-    if (ok) { out.resize((size_t)N*M); ggml_backend_tensor_get(dst, out.data(), 0, ggml_nbytes(dst)); }
-    ggml_backend_buffer_free(buf);
-    ggml_free(ctx);
-    return ok;
-}
-
-static double cosine(const std::vector<float> & a, const std::vector<float> & b) {
-    double dot = 0, na = 0, nb = 0;
-    for (size_t i = 0; i < a.size(); i++) {
-        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return -2.0;  // NaN/Inf -> fail
-        dot += (double)a[i]*b[i]; na += (double)a[i]*a[i]; nb += (double)b[i]*b[i];
-    }
-    if (na == 0 || nb == 0) return 0.0;
-    return dot / (sqrt(na)*sqrt(nb));
-}
 
 int main() {
     // Force the int4 path in the rocket backend; the caller can still set
@@ -108,10 +67,10 @@ int main() {
         for (int c = 0; c < s.K; c += 512)
             for (int m = 0; m < s.M; m++) Xf[(size_t)m*s.K + c] *= 30.0f;
 
-        if (!run(cpu, s.K, s.N, s.M, Wf, Xf, golden)) { fprintf(stderr, "cpu run failed\n"); fails++; continue; }
-        if (!run(rocket, s.K, s.N, s.M, Wf, Xf, got))  { fprintf(stderr, "rocket run failed\n"); fails++; continue; }
+        if (!rk_run_mul_mat(cpu, GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, golden, s.name)) { fprintf(stderr, "cpu run failed\n"); fails++; continue; }
+        if (!rk_run_mul_mat(rocket, GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, got, s.name))  { fprintf(stderr, "rocket run failed\n"); fails++; continue; }
 
-        double cos = cosine(golden, got);
+        double cos = rk_cosine(golden, got);
         bool pass = cos >= cos_min;
         printf("  %-14s K=%5d N=%5d M=%4d  cos=%.5f -> %s\n",
                s.name, s.K, s.N, s.M, cos, pass ? "PASS" : "FAIL");

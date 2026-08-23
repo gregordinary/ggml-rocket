@@ -11,10 +11,19 @@
  * CPU: the shape contract (K%32, N%16, K>=64, N>=64, M>=min_m), static-leaf-weight only,
  * and "MUL_MAT only". Complements test-rocket-matmul (the offloaded math) and
  * test-rocket-bf16 (the bf16 decode route).
+ *
+ * THE ACCEPT-SET IS PER-PART. On the RK3588 a weight reaches the NPU as fp16, so BF16 and
+ * the ggml-quantized types are accepted (decoded / dequantized on the way) and attention
+ * offloads. The RK3576 has no fp16 matmul encoder at all: its only matmul route is the
+ * W8A8 one, which ROCKET_INT8 selects and which takes an F16/F32 leaf on a K%32/N%32 shape
+ * -- so bf16, the quantized types and FLASH_ATTN_EXT are declined there, and declining is
+ * correct (claiming them would hand the scheduler work only the host reference can do).
+ * Each expectation below therefore names the part it holds for.
  */
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-rocket.h"
+#include "test-common.h"   // rk_is_rk3576()
 
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +105,13 @@ static bool fa_supported(ggml_backend_dev_t dev, int head_dim, int n_tokens, int
     printf("  [%s] %s\n", _c ? "PASS" : "FAIL", msg); if (!_c) fails++; } while (0)
 
 int main() {
+    // The RK3576's only matmul route is the W8A8 one, and ROCKET_INT8 selects it. Set it
+    // BEFORE the first supports_op call: rocket_int8_mode_on() caches the knob on first
+    // read, so a later setenv would not be seen. With it unset the part offloads no matmul
+    // at all, which is correct but asserts nothing.
+    const bool rk76 = rk_is_rk3576();
+    if (rk76) setenv("ROCKET_INT8", "1", 1);
+
     ggml_backend_reg_t reg = ggml_backend_rocket_reg();
     if (!reg || ggml_backend_reg_dev_count(reg) == 0) {
         fprintf(stderr, "rocket backend registry/device unavailable\n");
@@ -111,15 +127,27 @@ int main() {
     // a BF16 weight is decoded to fp16 on the streaming/mt path, same as F32).
     CHECK( mm_supported(dev, K, N, M, GGML_TYPE_F16),  "F16 leaf weight, valid shape  -> offload" );
     CHECK( mm_supported(dev, K, N, M, GGML_TYPE_F32),  "F32 leaf weight, valid shape  -> offload" );
-    CHECK( mm_supported(dev, K, N, M, GGML_TYPE_BF16), "BF16 leaf weight, valid shape -> offload (decoded to fp16)" );
+    // BF16 reaches the NPU by being decoded to fp16 — an RK3588-only route. The RK3576's
+    // W8A8 entry takes an F16/F32 leaf and quantizes it itself; bf16 is not on its list.
+    CHECK( mm_supported(dev, K, N, M, GGML_TYPE_BF16) == !rk76,
+           rk76 ? "BF16 leaf weight              -> CPU (no bf16 decode route on rk3576)"
+                : "BF16 leaf weight, valid shape -> offload (decoded to fp16)" );
 
     // ACCEPT — quantized leaf weights: dequantized to fp16 on the streaming/mt path, but
     // only at M >= rocket_min_m_quant (the per-microbatch dequant needs more rows to
     // amortize than the F16 path). K=256 is a whole number of blocks for Q8_0 (block 32)
     // and the K-quants (256).
-    CHECK( mm_supported(dev, K, N, Mq, GGML_TYPE_Q8_0), "Q8_0 leaf, K%32==0,  M>=quant floor -> offload" );
-    CHECK( mm_supported(dev, K, N, Mq, GGML_TYPE_Q4_K), "Q4_K leaf, K%256==0, M>=quant floor -> offload" );
-    CHECK( mm_supported(dev, K, N, Mq, GGML_TYPE_Q6_K), "Q6_K leaf, K%256==0, M>=quant floor -> offload" );
+    // On the RK3576 there is no dequant->fp16 path to reach, so a ggml-quantized weight
+    // stays on the CPU whatever M is.
+    CHECK( mm_supported(dev, K, N, Mq, GGML_TYPE_Q8_0) == !rk76,
+           rk76 ? "Q8_0 leaf                            -> CPU (no dequant->fp16 on rk3576)"
+                : "Q8_0 leaf, K%32==0,  M>=quant floor -> offload" );
+    CHECK( mm_supported(dev, K, N, Mq, GGML_TYPE_Q4_K) == !rk76,
+           rk76 ? "Q4_K leaf                            -> CPU (no dequant->fp16 on rk3576)"
+                : "Q4_K leaf, K%256==0, M>=quant floor -> offload" );
+    CHECK( mm_supported(dev, K, N, Mq, GGML_TYPE_Q6_K) == !rk76,
+           rk76 ? "Q6_K leaf                            -> CPU (no dequant->fp16 on rk3576)"
+                : "Q6_K leaf, K%256==0, M>=quant floor -> offload" );
     // REJECT — a quantized weight below the higher quant floor (but above the F16 floor):
     // the dequant doesn't amortize, so a short quant prefill stays on the CPU even at an M
     // that an F16 weight offloads at. Pins the rocket_min_m_quant > rocket_min_m gap.
@@ -132,6 +160,12 @@ int main() {
     // REJECT — shape-contract violations stay on the CPU.
     CHECK( !mm_supported(dev, 80,  N, M, GGML_TYPE_F16), "K%32!=0 (K=80)   -> CPU" );
     CHECK( !mm_supported(dev, K,  70, M, GGML_TYPE_F16), "N%16!=0 (N=70)   -> CPU" );
+    // The two parts round N differently: the RK3588 fp16 route wants N%16, the RK3576 int8
+    // weight N-group is 32. N=112 is a multiple of 16 and not of 32, so it is the shape
+    // that separates them — offloadable on one part, CPU on the other.
+    CHECK( mm_supported(dev, K, 112, M, GGML_TYPE_F16) == !rk76,
+           rk76 ? "N%32!=0 (N=112)  -> CPU (rk3576 int8 N-group is 32)"
+                : "N=112 (N%16==0) -> offload" );
     CHECK( !mm_supported(dev, 32,  N, M, GGML_TYPE_F16), "K<64 (K=32)      -> CPU" );
     CHECK( !mm_supported(dev, K,  48, M, GGML_TYPE_F16), "N<64 (N=48)      -> CPU" );
     CHECK( !mm_supported(dev, K,   N, 1, GGML_TYPE_F16), "M=1 decode GEMV  -> CPU" );
@@ -148,8 +182,13 @@ int main() {
     // via supports_op + the expand passes (see ggml_backend_rocket_device_offload_op). So
     // pinning supports_op is exactly what guards FA placement; assert its accept/reject set.
     const int HD = 64, NH = 8, NKVH = 2;   // head_dim%32==0, GQA 8/2 divides cleanly
-    CHECK(  fa_supported(dev, HD, 256, NH, 1024, NKVH, GGML_TYPE_F16, 0.0f),
-            "FA: F16 KV, n_tokens>=min_t, n_kv>=min_kv -> offload" );
+    // Every compute path in the FA handler goes through rocket_matmul_fp16, which refuses
+    // on any profile that is not rk3588 — so the RK3576 declines the op rather than claim
+    // work only the single-threaded host reference could do. The remaining FA cases below
+    // are rejected on both parts, for the reasons their labels give.
+    CHECK(  fa_supported(dev, HD, 256, NH, 1024, NKVH, GGML_TYPE_F16, 0.0f) == !rk76,
+            rk76 ? "FA: F16 KV                                -> CPU (no fp16 attention encoder on rk3576)"
+                 : "FA: F16 KV, n_tokens>=min_t, n_kv>=min_kv -> offload" );
     CHECK( !fa_supported(dev, HD,   1, NH, 1024, NKVH, GGML_TYPE_F16, 0.0f),
             "FA: decode (n_tokens=1 < min_t)           -> CPU" );
     CHECK( !fa_supported(dev, HD, 256, NH,  512, NKVH, GGML_TYPE_F16, 0.0f),

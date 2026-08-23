@@ -30,6 +30,7 @@
 #include <string>
 #include <memory>
 #include <cstring>
+#include <cctype>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -216,6 +217,15 @@ struct rocket_i4_resident {
     int Mp, N, K, group; bool hadamard; size_t bytes;   // Mp = pack-time padded M (informational)
 };
 
+// One host-cached fp32 weight for the bf16 datapath. The bf16 matmul entry takes fp32 and
+// truncates to bf16 on the scatter, so this is the form the route re-derives from the
+// BF16/F16 source on every micro-batch unless it is held. See bf16_wcache for why holding
+// it is opt-in where the other caches are not.
+struct rocket_bf16_weight {
+    std::vector<float> Bf;         // [N*K] fp32
+    int N, K; size_t bytes;
+};
+
 // One RESIDENT natively-quantized MoE expert weight: the expert's [N,K] GGUF-quant
 // payload ingested ONCE into int8 codes + per-(output-channel, K-group) fp32 scales,
 // scattered into resident NPU int8 tile BOs, and the host int8 copy dropped. Keyed on
@@ -256,18 +266,23 @@ struct ggml_backend_rocket_context {
     rocket_stream * stream = nullptr;
     bool stream_failed = false;
 
-    // Reusable host scratch for the streaming mul_mat path. Allocating the [N,K] dequant
-    // buffer (B16) and the [Mp,N] output (C16) fresh per op made each call mmap + page-fault
-    // a large buffer -- ~17-60ms for the big quantized B16 weight on the A76 [HW measured].
-    // Holding them on the context (grow-only high-water mark) keeps the pages resident, so
-    // a steady prefill reuses them with no re-fault. Both are fully overwritten before read
-    // (B16 by the dequant's N*K rows; the per-op read region of C16 by the matmul), so
-    // reuse is bit-identical to a fresh allocation. Only touched by graph_compute, which is
-    // not re-entrant per backend, and each backend instance has its own context -> no
-    // cross-thread sharing. A16 keeps its fresh value-init (its pad rows M..Mp-1 rely on
-    // zero-init, so it is the one buffer not safe to blindly reuse) and `scales` is tiny.
-    std::vector<ggml_fp16_t> scratch_B16;
-    std::vector<ggml_fp16_t> scratch_C16;
+    // Reusable per-call host scratch. See rk_scratch for why these live here and what the
+    // reuse does and does not zero; the buffers below are grouped by ROLE, and each is shared
+    // by every route that plays that role, because no two of those routes run at once.
+    //
+    // The fp16 dense family -- prepacked, streaming, streaming-fused, resident-fused:
+    std::vector<ggml_fp16_t> scratch_B16;    // [N,K] transient weight dequant (streaming)
+    std::vector<ggml_fp16_t> scratch_C16;    // [Mp, N or sum N] fp16 output
+    std::vector<ggml_fp16_t> scratch_A16;    // [Mp,K] packed activation; PAD ROWS must be cleared
+    std::vector<float>       scratch_scales; // [M] per-row activation scale
+    // The integer family -- one-shot and resident int8, one-shot and resident int4, RK3576:
+    std::vector<int8_t>      scratch_qA;     // [Mp,K] quantized activation; PAD ROWS must be cleared
+    std::vector<float>       scratch_ascale; // [Mp] per-tensor or per-row activation scale
+    std::vector<float>       scratch_rot;    // [K] or [M,K] rotation workspace (Hadamard)
+    std::vector<int32_t>     scratch_C32;    // [Mp,N] int32 accumulator readback (RK3588)
+    std::vector<float>       scratch_Cf;     // [Mp,N] f32 readback (int4 group-wise)
+    std::vector<int8_t>      scratch_C8;     // [M,N] int8 readback (RK3576)
+    std::vector<float>       scratch_dqf;    // [N] per-column dequant factors (RK3576)
     // Keyed on the STABLE logical weight name, NOT src0->data. ggml-backend-sched
     // copies our weights into a small POOLED buffer (the model's mmapped weights
     // live in a buffer our supports_buft rejects), and it REUSES those slots across
@@ -278,6 +293,13 @@ struct ggml_backend_rocket_context {
     // "blk.0.attn_q.weight") is unique and stable per pass, and the weights are
     // constant, so packing once per name is correct regardless of copy churn.
     std::unordered_map<std::string, rocket_weight_entry> wcache;
+    // The individual names held INSIDE a live composite (fused-group) wcache entry, whose key
+    // is those names joined by '|'. A weight can reach the per-node prepacked path even after
+    // its group went resident -- a scheduler split that presents fewer than two fusable members
+    // falls through to the single-node route -- and it would then be packed a SECOND time under
+    // its own name. Nothing evicts either copy, so the duplicate would be permanent and the
+    // full weight's footprint. The per-node path consults this and streams instead.
+    std::unordered_set<std::string> wcache_fused_members;
 
     // Resident-weight budget. The prepacked cache holds each packed weight in NPU
     // BOs for the life of the backend; for a 12B model that is ~20GB of NPU BOs on
@@ -327,6 +349,11 @@ struct ggml_backend_rocket_context {
     // models measured, and the unrotated route is additionally CHAOTIC — a 2% per-column
     // divisor change moved one model's perplexity nine orders of magnitude.
     std::unordered_map<std::string, rocket_rk3576_weight> rk76_wcache;
+    // DRAM charged to this cache, wherever it sits. The NPU has no private memory, so a
+    // weight held as a device cube costs the same bytes as the host qB it replaced -- which
+    // is why the WDEV swap below leaves this counter alone rather than uncharging the host
+    // copy. Read it as total residency, not host residency; the budget it gates is a RAM
+    // budget and a device BO spends that RAM too.
     size_t rk76_resident_bytes = 0;
     int    rk76_ncal   = -1;   // ROCKET_RK3576_NCAL:   calibration forwards (default 2)
     float  rk76_calsafe = 0.0f; // ROCKET_RK3576_CALSAFE: colmax safety factor (default 2)
@@ -403,7 +430,21 @@ struct ggml_backend_rocket_context {
     int  bf16_mode   = -1;          // ROCKET_BF16 (-1 = unqueried)
     int  bf16_fd     = -1;
     bool bf16_failed = false;
-    std::vector<float> bf16_bscratch;   // reused F16->fp32 weight scratch
+    std::vector<float> bf16_bscratch;   // reused ->fp32 weight scratch (the uncached route)
+    std::vector<float> bf16_apad;       // reused [Mp,K] padded activation
+    std::vector<float> bf16_cpad;       // reused [Mp,N] padded output
+    // OPTIONAL fp32 weight cache, keyed on the stable weight name like every other cache
+    // here, and OFF by default -- which is the one place this route differs from its
+    // siblings on purpose. Every other cache stores a form no larger than its source (int8
+    // is half of fp16, int4 a quarter, the fp16 resident tiles the same); this one stores
+    // fp32, which is TWICE the bf16 weight it came from, so a blanket cache of a 24 GB bf16
+    // model asks for 48 GB. The per-call conversion it replaces is nonetheless this route's
+    // dominant host term -- ROCKET_MM_PROFILE's dequant bucket now says by how much -- so
+    // ROCKET_BF16_CACHE_MB is the lever, and the profiler is how to size it. Over-budget
+    // weights fall back to converting into bf16_bscratch per call, correctly.
+    std::unordered_map<std::string, rocket_bf16_weight> bf16_wcache;
+    size_t bf16_resident_bytes = 0;
+    size_t bf16_cache_budget   = 0;   // 0 = cache off (ROCKET_BF16_CACHE_MB)
     // Streaming bf16 matmul context: persistent worker fds + per-shape resident scratch
     // BOs, re-packed A/B per call (rocket_matmul_bf16_stream). Created lazily on the first
     // offloaded bf16 op; turns the prior slow single-fd path into a multicore/resident one
@@ -427,6 +468,13 @@ struct ggml_backend_rocket_context {
     // Created lazily on the first offloaded FA op; the _mt path is the fallback if create fails.
     rocket_fa_ctx * fa_ctx = nullptr;
     bool fa_ctx_failed = false;
+    // The handler's own gather/scatter tiles, held here for the same reason rocket_fa_ctx
+    // holds the score matrices: Kd and Vd are each n_kv_heads*n_kv*head_dim fp16, which at
+    // long context is the same 8-16 MB range that crosses glibc's mmap threshold and would
+    // otherwise mmap + fault + munmap every call, one layer above the buffers the FA context
+    // was introduced to stop doing exactly that. All five are fully written by the gather
+    // before anything reads them.
+    std::vector<ggml_fp16_t> fa_Qd, fa_Kd, fa_Vd, fa_Md, fa_Od;
 
     // MUL_MAT_ID (MoE routed-expert FFN) path, OPT-IN via ROCKET_MOE=1 (default off --
     // quant-MoE offload is dequant-bound, a net loss; see rocket_moe_on). llama.cpp
@@ -508,6 +556,102 @@ struct ggml_backend_rocket_context {
 // Configuration, environment knobs, and profiling counters
 // ===========================================================================
 
+// The set-but-empty rule, implemented once.
+//
+// getenv returns a non-NULL "" for a set-but-empty var -- ROCKET_MIN_M=, or =$VAR with VAR
+// unset, which is the shape a benchmark wrapper produces when it forwards a knob it was not
+// given. atoi("") is 0, so a knob read as `e ? atoi(e) : dflt` silently takes 0 instead of its
+// default. For a knob whose default is non-zero that changes what the model computes, not just
+// how fast: NCAL=0 skips the RK3576 calibration and then divides by an all-zero scale vector,
+// and INT4_HADAMARD=0 drops the rotation that carries cosine from ~0.79 to ~0.98. Every knob
+// below goes through these, so the rule is stated once here rather than re-derived at ~40 read
+// sites -- and a knob that wants "0" says so explicitly.
+//
+// Presence-only diagnostics (ROCKET_DEBUG, ROCKET_MM_PROFILE, ROCKET_AB, ROCKET_DUMP,
+// ROCKET_FA_TIMING) deliberately do NOT use these: they are documented as "set to anything to
+// arm", so an empty value arms them, and nothing they do changes a result.
+static inline int rocket_knob_int(const char * name, int dflt) {
+    const char * e = getenv(name);
+    return (e && *e) ? atoi(e) : dflt;
+}
+static inline float rocket_knob_float(const char * name, float dflt) {
+    const char * e = getenv(name);
+    return (e && *e) ? (float)atof(e) : dflt;
+}
+// For a knob whose only question is on/off. `>0` rather than `!=0` so a negative reads as off.
+static inline bool rocket_knob_on(const char * name, bool dflt) {
+    const char * e = getenv(name);
+    return (e && *e) ? (atoi(e) > 0) : dflt;
+}
+
+// Per-call host scratch, held on the context.
+//
+// A fresh std::vector per op mmaps, page-faults and value-initialises the whole buffer before
+// anything is computed -- ~17-60 ms for the big quantized [N,K] weight buffer on the A76
+// [HW measured], and the fused paths' [Mp, sum N] output is the largest buffer this backend
+// touches (9.4 MB for a QKV group at Mp=512). Held on the context as a grow-only high-water
+// mark, the pages stay resident and a steady prefill reuses them with no re-fault.
+//
+// resize() is the reuse AND, on growth, the zeroing: it value-initialises only the new tail,
+// so the memset is paid once per shape rather than once per call. What it does NOT do is
+// re-zero what was already there -- so a buffer whose bytes are not all written before they
+// are read needs its own explicit clear. The one class of those here is a PAD-ROW buffer
+// (A16, qA): the packer writes rows 0..M-1 and rows M..Mp-1 must be zero. See
+// rocket_pack_activations_scratch, and the explicit memsets beside the integer quantizers.
+//
+// Only graph_compute touches these, it is not re-entrant per backend, and each backend
+// instance has its own context -- so there is no cross-thread sharing. Routes that could
+// share one buffer do not run concurrently (one node's matmul at a time, and a route that
+// declines has released its pointers before it returns), which is what lets the fp16 family
+// share one output buffer and the integer family share one quantized-activation buffer.
+template <typename T>
+static inline T * rk_scratch(std::vector<T> & v, size_t n) {
+    if (v.size() < n) v.resize(n);
+    return v.data();
+}
+
+// Drop a weight-cache entry that is about to be replaced or discarded, uncharging its
+// bytes from the cache's budget counter first.
+//
+// Every weight cache in this file -- eight of them, over four precisions and two parts --
+// pairs "the key is present at a shape this call cannot use" with "subtract its bytes
+// before erasing it". That pairing was a convention each copy had to remember, and two of
+// them once did not: the counter then only ever climbed, and the budget started refusing
+// weights that would have fit. Here it is one call, so there is nothing left to forget.
+//
+// `release` frees whatever the entry owns beyond its own members -- an NPU BO, a device
+// cube -- and is a no-op lambda for a cache whose entry is only host vectors. It runs
+// BEFORE the erase, while the entry is still alive.
+template <typename Map, typename Release>
+static inline void rk_cache_evict(Map & cache, typename Map::iterator it,
+                                  size_t & charged, Release && release) {
+    if (it == cache.end()) return;
+    charged -= it->second.bytes;
+    release(it->second);
+    cache.erase(it);
+}
+
+// The three knobs each integer route reads from BOTH its one-shot and its resident entry.
+// Cached on the context rather than in a function static because they are per-backend, and
+// read through one accessor so the default cannot drift between the two spellings of the
+// same route. The rotation defaults differ by width on purpose: int8 is usable without it
+// and int4 is not (cos ~0.79 -> ~0.98), so int8 opts in and int4 opts out.
+static inline bool rocket_int8_hadamard(ggml_backend_rocket_context * ctx) {
+    if (ctx->int8_hadamard < 0) ctx->int8_hadamard = rocket_knob_int("ROCKET_INT8_HADAMARD", 0);
+    return ctx->int8_hadamard != 0;
+}
+static inline bool rocket_int4_hadamard(ggml_backend_rocket_context * ctx) {
+    if (ctx->int4_hadamard < 0) ctx->int4_hadamard = rocket_knob_int("ROCKET_INT4_HADAMARD", 1);
+    return ctx->int4_hadamard != 0;
+}
+// The CONFIGURED group, not a validated one: what makes a group usable differs between the
+// two int4 routes (the one-shot degrades an invalid group to per-channel, the resident one
+// declines), so each validates the value it gets.
+static inline int rocket_int4_group(ggml_backend_rocket_context * ctx) {
+    if (ctx->int4_group < 0) ctx->int4_group = rocket_knob_int("ROCKET_INT4_GROUP", 128);
+    return ctx->int4_group;
+}
+
 // ---------------------------------------------------------------------------
 // mul_mat
 // ---------------------------------------------------------------------------
@@ -556,12 +700,9 @@ static inline int rocket_pad_m(int M) { return (M + 3) & ~3; }
 static int rocket_min_m(void) {
     static int m = 0;
     if (m == 0) {
-        // getenv returns a non-NULL "" for a set-but-empty var (ROCKET_MIN_M=, or =$X with X
-        // unset -- the common benchmark-wrapper shape); atoi("")==0 would then clamp to the
-        // floor 4, silently re-arming the beam/small-M offload trap the 128 default exists to
-        // prevent. Treat set-empty as UNSET here and at every routing knob below.
-        const char * e = getenv("ROCKET_MIN_M");
-        m = (e && *e) ? atoi(e) : 128;
+        // Set-empty is UNSET (rocket_knob_int): atoi("")==0 would clamp to the floor 4 and
+        // silently re-arm the beam/small-M offload trap the 128 default exists to prevent.
+        m = rocket_knob_int("ROCKET_MIN_M", 128);
         if (m < 4) m = 4;
     }
     return m;
@@ -579,8 +720,7 @@ static int rocket_min_m(void) {
 static int rocket_min_m_quant(void) {
     static int m = 0;
     if (m == 0) {
-        const char * e = getenv("ROCKET_MIN_M_QUANT");
-        m = (e && *e) ? atoi(e) : 512;
+        m = rocket_knob_int("ROCKET_MIN_M_QUANT", 512);
         const int base = rocket_min_m();
         if (m < base) m = base;
     }
@@ -602,7 +742,7 @@ static int rocket_min_m_quant(void) {
 // quant prefill is dequant-bound.
 static bool rocket_moe_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_MOE"); v = (e && atoi(e) > 0) ? 1 : 0; }
+    if (v < 0) v = rocket_knob_on("ROCKET_MOE", false);
     return v > 0;
 }
 
@@ -614,8 +754,7 @@ static bool rocket_moe_on(void) {
 static int rocket_moe_min_tokens(void) {
     static int m = 0;
     if (m == 0) {
-        const char * e = getenv("ROCKET_MOE_MIN_TOKENS");
-        m = (e && *e) ? atoi(e) : 512;
+        m = rocket_knob_int("ROCKET_MOE_MIN_TOKENS", 512);
         const int base = rocket_min_m();
         if (m < base) m = base;
     }
@@ -631,7 +770,7 @@ static int rocket_moe_min_tokens(void) {
 // dequant to delete).
 static bool rocket_moe_native_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_MOE_NATIVE"); v = (e && *e) ? (atoi(e) > 0) : 1; }
+    if (v < 0) v = rocket_knob_on("ROCKET_MOE_NATIVE", true);
     return v > 0;
 }
 
@@ -641,7 +780,7 @@ static bool rocket_moe_native_on(void) {
 // and proportionally slower. Exists for the A/B; auto picks the readback floor.
 static int rocket_moe_group_env(void) {
     static int g = -1;
-    if (g < 0) { const char * e = getenv("ROCKET_MOE_GROUP"); g = e ? atoi(e) : 0; if (g < 0) g = 0; }
+    if (g < 0) { g = rocket_knob_int("ROCKET_MOE_GROUP", 0); if (g < 0) g = 0; }
     return g;
 }
 
@@ -651,8 +790,7 @@ static int rocket_moe_group_env(void) {
 // intermediate rung at 1.5x each power, so a power-of-two floor is what keeps every rung on the
 // M%4 hardware contract.
 static int rocket_moe_m_bucket_env(void) {
-    const char * e = getenv("ROCKET_MOE_M_BUCKET");
-    int g = (e && *e) ? atoi(e) : 64;
+    int g = rocket_knob_int("ROCKET_MOE_M_BUCKET", 64);
     if (g < 4) g = 4;
     int p = 4;
     while (p < g && p < (1 << 20)) p <<= 1;
@@ -677,7 +815,7 @@ static int rocket_moe_m_bucket_env(void) {
 // the one the dispatch reads.
 static bool rocket_int8_mode_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_INT8"); v = (e && atoi(e) > 0) ? 1 : 0; }
+    if (v < 0) v = rocket_knob_on("ROCKET_INT8", false);
     return v > 0;
 }
 
@@ -728,12 +866,12 @@ static bool rocket_f16_resident_on(void) {
 // context on the CPU, and ROCKET_FLASH_ATTN_MIN_T (default 16) keeps decode on the CPU.
 static bool rocket_flash_attn_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_FLASH_ATTN"); v = (e && *e) ? atoi(e) : 1; }
+    if (v < 0) v = rocket_knob_int("ROCKET_FLASH_ATTN", 1);
     return v > 0;
 }
 static int rocket_flash_attn_min_t(void) {
     static int t = 0;
-    if (t == 0) { const char * e = getenv("ROCKET_FLASH_ATTN_MIN_T"); t = (e && *e) ? atoi(e) : 16; if (t < 1) t = 1; }
+    if (t == 0) { t = rocket_knob_int("ROCKET_FLASH_ATTN_MIN_T", 16); if (t < 1) t = 1; }
     return t;
 }
 // ROCKET_FLASH_ATTN_MIN_KV (default 1024): an FA op offloads only when n_kv >= this. With the
@@ -750,7 +888,7 @@ static int rocket_flash_attn_min_t(void) {
 // independently picks the faster backend (both are correct).
 static int rocket_flash_attn_min_kv(void) {
     static int kv = 0;
-    if (kv == 0) { const char * e = getenv("ROCKET_FLASH_ATTN_MIN_KV"); kv = (e && *e) ? atoi(e) : 1024; if (kv < 1) kv = 1; }
+    if (kv == 0) { kv = rocket_knob_int("ROCKET_FLASH_ATTN_MIN_KV", 1024); if (kv < 1) kv = 1; }
     return kv;
 }
 // ROCKET_FLASH_ATTN_NO_CTX=1 forces the per-call mt path (fresh worker fds + per-call score
@@ -760,7 +898,7 @@ static int rocket_flash_attn_min_kv(void) {
 // FA analogue of ROCKET_NO_STREAM for the matmul path.
 static bool rocket_flash_attn_no_ctx(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_FLASH_ATTN_NO_CTX"); v = e ? atoi(e) : 0; }
+    if (v < 0) v = rocket_knob_int("ROCKET_FLASH_ATTN_NO_CTX", 0);
     return v > 0;
 }
 
@@ -915,64 +1053,72 @@ static void rocket_pack_activations(const float * src, ggml_fp16_t * dst,
     if (prof) rocket_convprof_add(rocket_now_ms() - t0, (double)M * K, false);
 }
 
-// Inverse of the per-row scale: fp16 result row m -> F32, multiplied back by
-// scales[m]. src/dst each hold M*N (N contiguous).
+// rocket_pack_activations into REUSED [Mp,K] scratch, with the pad rows cleared.
+//
+// The packer writes rows 0..M-1 only; the driver computes all Mp rows and the first M of
+// its output are bit-identical to an unpadded run ONLY if rows M..Mp-1 are zero. A fresh
+// vector gave that for free, a reused one does not -- and the failure is silent and
+// data-dependent, since a stale pad row still produces a full, plausible surface. Mp-M is
+// at most 3 rows, so the clear is not a cost worth avoiding.
+static ggml_fp16_t * rocket_pack_activations_scratch(std::vector<ggml_fp16_t> & scratch,
+                                                     const float * src, int64_t M, int64_t Mp,
+                                                     int64_t K, float * scales) {
+    ggml_fp16_t * A16 = rk_scratch(scratch, (size_t)Mp * K);
+    if (Mp > M) memset(A16 + (size_t)M * K, 0, (size_t)(Mp - M) * K * sizeof(ggml_fp16_t));
+    rocket_pack_activations(src, A16, M, K, scales);
+    return A16;
+}
+
+// Inverse of the per-row scale, one row: fp16 -> F32 multiplied back by the row's scale.
+// Every unpack in this file is this loop -- the whole-tile one, the fused matmul's column
+// slice, and the MoE handler's scatter into permuted destination rows. They differ only in
+// how they compute `src` and `dst` per row, so the kernel is written once.
+static inline void rk_unpack_row(const ggml_fp16_t * src, float * dst, int64_t N, float s) {
+    int64_t n = 0;
+#ifdef ROCKET_NEON_FP16
+    const float32x4_t vs = vdupq_n_f32(s);
+    const __fp16 * sh = (const __fp16 *)src;
+    for (; n + 4 <= N; n += 4)
+        vst1q_f32(dst + n, vmulq_f32(vcvt_f32_f16(vld1_f16(sh + n)), vs));
+#endif
+    for (; n < N; n++) dst[n] = ggml_fp16_to_fp32(src[n]) * s;
+}
+
+// The whole [M,N] tile: src/dst each hold M*N (N contiguous).
 static void rocket_unpack_output(const ggml_fp16_t * src, float * dst,
                                  int64_t M, int64_t N, const float * scales) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++) {
-        const float s = scales[m];
-        const ggml_fp16_t * srow = src + m * N;
-        float * drow = dst + m * N;
-        int64_t n = 0;
-#ifdef ROCKET_NEON_FP16
-        const float32x4_t vs = vdupq_n_f32(s);
-        const __fp16 * sh = (const __fp16 *)srow;
-        for (; n + 4 <= N; n += 4)
-            vst1q_f32(drow + n, vmulq_f32(vcvt_f32_f16(vld1_f16(sh + n)), vs));
-#endif
-        for (; n < N; n++) drow[n] = ggml_fp16_to_fp32(srow[n]) * s;
-    }
+    for (int64_t m = 0; m < M; m++)
+        rk_unpack_row(src + m * N, dst + m * N, N, scales[m]);
     if (prof) rocket_convprof_add(rocket_now_ms() - t0, (double)M * N, true);
 }
 
-// Like rocket_unpack_output, but the source is a column slice [col0, col0+Ni) of a
-// wider [M, src_stride] fp16 buffer (a fused matmul's combined-N output); the
-// destination is contiguous [M, Ni]. The per-row scale is shared across the fused
-// group (same activation A), so scales[] indexes the same rows.
+// The column slice [col0, col0+Ni) of a wider [M, src_stride] fp16 buffer (a fused matmul's
+// combined-N output) into a contiguous [M, Ni] destination. The per-row scale is shared
+// across the fused group (same activation A), so scales[] indexes the same rows.
 static void rocket_unpack_output_seg(const ggml_fp16_t * src, int64_t src_stride,
                                      int64_t col0, float * dst,
                                      int64_t M, int64_t Ni, const float * scales) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++) {
-        const float s = scales[m];
-        const ggml_fp16_t * srow = src + m * src_stride + col0;
-        float * drow = dst + m * Ni;
-        int64_t n = 0;
-#ifdef ROCKET_NEON_FP16
-        const float32x4_t vs = vdupq_n_f32(s);
-        const __fp16 * sh = (const __fp16 *)srow;
-        for (; n + 4 <= Ni; n += 4)
-            vst1q_f32(drow + n, vmulq_f32(vcvt_f32_f16(vld1_f16(sh + n)), vs));
-#endif
-        for (; n < Ni; n++) drow[n] = ggml_fp16_to_fp32(srow[n]) * s;
-    }
+    for (int64_t m = 0; m < M; m++)
+        rk_unpack_row(src + m * src_stride + col0, dst + m * Ni, Ni, scales[m]);
     if (prof) rocket_convprof_add(rocket_now_ms() - t0, (double)M * Ni, true);
 }
 
-// int8 convert profiler: split the int8 path's CPU-side cost into
+// Integer convert profiler: split the int8 AND int4 paths' CPU-side cost into
 // Hadamard ROTATE vs QUANT vs DEQUANT, for activations (every call) and weights
-// (once, cached). The fp16 g_convprof above does NOT cover the int8 _had kernels,
-// so the suspected-dominant per-call rotate+requant was invisible. Same
+// (once, cached). The fp16 g_convprof above does NOT cover the rotated kernels,
+// so the suspected-dominant per-call rotate+requant was invisible. One counter for both
+// widths: they are separate opt-in routes and never run in the same process. Same
 // ROCKET_MM_PROFILE knob; single-threaded (backend dispatch thread); own exit line.
 static struct { double act_rot, act_q, wt_rot, wt_q, dq;
                 long act_calls, wt_calls, dq_calls; } g_i8prof;
 static int g_i8prof_armed = 0;
 static void rocket_i8prof_dump(void) {
     ROCKET_LOGI(
-        "ROCKET int8 convert total(ms): act_rotate=%.0f act_quant=%.0f "
+        "ROCKET integer convert total(ms): act_rotate=%.0f act_quant=%.0f "
         "wt_rotate=%.0f wt_quant=%.0f dequant=%.0f  (act %ld, wt %ld, dq %ld calls)\n",
         g_i8prof.act_rot, g_i8prof.act_q, g_i8prof.wt_rot, g_i8prof.wt_q, g_i8prof.dq,
         g_i8prof.act_calls, g_i8prof.wt_calls, g_i8prof.dq_calls);
@@ -1043,7 +1189,7 @@ static inline void rocket_moeprof_arm(void) {
 // Diagnostic only: the reference is a scalar fp64 triple loop, seconds per probe.
 static int rocket_moe_cosine_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_MOE_COSINE"); v = (e && atoi(e) > 0) ? 1 : 0; }
+    if (v < 0) v = rocket_knob_on("ROCKET_MOE_COSINE", false);
     return v;
 }
 static struct { double sum, min; long n; } g_moecos = { 0.0, 2.0, 0 };
@@ -1076,14 +1222,20 @@ static double rocket_cosine_f32(const float * a, const float * b, size_t n) {
 // path's row-wise scale -- this tames a row's magnitude but NOT per-CHANNEL
 // activation outliers; that residual is the gibberish risk the Hadamard rotation
 // addresses. Weights are scaled PER OUTPUT CHANNEL (per row of B[N,K]); weights
-// are bounded so this is the easy half. The quant is scalar.
+// are bounded so this is the easy half. Both widths run through the same lane kernels
+// (rk_amax_row / rk_q_row); see rk_q_scalar for why the rail is a template parameter.
 // ===========================================================================
-static inline int8_t rocket_q8(float x, float inv) {
+// The rail is the ONLY thing that differs between the two widths (127 for int8, 7 for
+// int4), so it is a template parameter rather than a second copy of every kernel below.
+template <int QMAX>
+static inline int8_t rk_q_scalar(float x, float inv) {
     long q = lrintf(x * inv);
-    if (q >  127) q =  127;
-    if (q < -127) q = -127;
-    return (int8_t)q;
+    if (q >  QMAX) q =  QMAX;
+    if (q < -QMAX) q = -QMAX;
+    return (int8_t)q;   // int4 is stored one value per int8_t (the rocket_matmul_int4 contract)
 }
+static inline int8_t rocket_q8(float x, float inv) { return rk_q_scalar<127>(x, inv); }
+static inline int8_t rocket_q4(float x, float inv) { return rk_q_scalar<7>(x, inv); }
 
 // NEON row kernels for the symmetric-int8 quant loops on the RK3576 route. The scalar
 // loops pay one lrintf@plt CALL per element, and the L1d set-conflict class measured on
@@ -1108,11 +1260,12 @@ static inline float rk_amax_row(const float * src, int64_t n) {
     for (; k < n; k++) { const float v = fabsf(src[k]); if (v > amax) amax = v; }
     return amax;
 }
-static inline void rk_q8_row(const float * src, int8_t * dst, int64_t n, float inv) {
+template <int QMAX>
+static inline void rk_q_row(const float * src, int8_t * dst, int64_t n, float inv) {
     int64_t k = 0;
 #ifdef ROCKET_NEON_F32
     const float32x4_t vinv = vdupq_n_f32(inv);
-    const float32x4_t vhi  = vdupq_n_f32(127.0f), vlo = vdupq_n_f32(-127.0f);
+    const float32x4_t vhi  = vdupq_n_f32((float)QMAX), vlo = vdupq_n_f32(-(float)QMAX);
     auto qv = [&](const float * p) {
         return vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(p), vinv), vlo), vhi));
     };
@@ -1122,51 +1275,80 @@ static inline void rk_q8_row(const float * src, int8_t * dst, int64_t n, float i
         vst1q_s8(dst + k, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
     }
 #endif
-    for (; k < n; k++) dst[k] = rocket_q8(src[k], inv);
+    for (; k < n; k++) dst[k] = rk_q_scalar<QMAX>(src[k], inv);
+}
+static inline void rk_q8_row(const float * src, int8_t * dst, int64_t n, float inv) {
+    rk_q_row<127>(src, dst, n, inv);
 }
 
-// A[M,K] f32 -> int8 [M,K] + per-row scale a_scale[m] (= amax_row/127).
-static void rocket_quant_act_int8(const float * src, int8_t * dst,
-                                  int64_t M, int64_t K, float * a_scale) {
+// One row, symmetric, either width: max-abs -> scale -> quantize. Returns the row's
+// dequant scale. `src` is already f32 (a caller with an f16 source decodes into scratch).
+template <int QMAX>
+static inline float rk_quant_row(const float * src, int8_t * dst, int64_t K) {
+    const float amax = rk_amax_row(src, K);
+    const float s = (amax > 0.0f) ? amax / (float)QMAX : 1.0f;
+    rk_q_row<QMAX>(src, dst, K, 1.0f / s);
+    return s;
+}
+
+// A[M,K] f32 -> int [M,K] + per-row scale a_scale[m] (= amax_row/QMAX).
+//
+// Through the lane kernels above, which the ACTIVATION path wants more than the weight path
+// does: a weight is quantized once and cached, this runs on every micro-batch.
+template <int QMAX>
+static void rk_quant_act(const float * src, int8_t * dst,
+                         int64_t M, int64_t K, float * a_scale) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++) {
-        const float * row = src + m * K;
-        float amax = 0.0f;
-        for (int64_t k = 0; k < K; k++) { const float v = fabsf(row[k]); if (v > amax) amax = v; }
-        const float s   = (amax > 0.0f) ? amax / 127.0f : 1.0f;
-        const float inv = 1.0f / s;
-        int8_t * d = dst + m * K;
-        for (int64_t k = 0; k < K; k++) d[k] = rocket_q8(row[k], inv);
-        a_scale[m] = s;
-    }
+    for (int64_t m = 0; m < M; m++)
+        a_scale[m] = rk_quant_row<QMAX>(src + m * K, dst + m * K, K);
     if (prof) { rocket_i8prof_arm(); g_i8prof.act_q += rocket_now_ms() - t0; g_i8prof.act_calls++; }
 }
 
-// B[N,K] (f16 or f32) -> int8 [N,K] + per-channel scale b_scale[n] (= amax_row/127).
-static void rocket_quant_wt_int8(const void * src, bool f16, int8_t * dst,
-                                 int64_t N, int64_t K, float * b_scale) {
+// B[N,K] (f16 or f32) -> int [N,K] + per-channel scale b_scale[n] (= amax_row/QMAX).
+template <int QMAX>
+static void rk_quant_wt(const void * src, bool f16, int8_t * dst,
+                        int64_t N, int64_t K, float * b_scale) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
     for (int64_t n = 0; n < N; n++) {
+        if (!f16) {   // f32 source: the lane kernels read it in place
+            b_scale[n] = rk_quant_row<QMAX>((const float *)src + n * K, dst + n * K, K);
+            continue;
+        }
+        // f16 source: every element is decoded, so the lane kernels have nothing to read
+        // and the scalar form stands. (The rotated siblings below decode into scratch
+        // first, which is why they go through the lanes on both source types.)
         const ggml_fp16_t * brow16 = (const ggml_fp16_t *)src + n * K;
-        const float       * brow32 = (const float       *)src + n * K;
         float amax = 0.0f;
         for (int64_t k = 0; k < K; k++) {
-            const float v = fabsf(f16 ? ggml_fp16_to_fp32(brow16[k]) : brow32[k]);
+            const float v = fabsf(ggml_fp16_to_fp32(brow16[k]));
             if (v > amax) amax = v;
         }
-        const float s   = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+        const float s   = (amax > 0.0f) ? amax / (float)QMAX : 1.0f;
         const float inv = 1.0f / s;
         int8_t * d = dst + n * K;
         for (int64_t k = 0; k < K; k++)
-            d[k] = rocket_q8(f16 ? ggml_fp16_to_fp32(brow16[k]) : brow32[k], inv);
+            d[k] = rk_q_scalar<QMAX>(ggml_fp16_to_fp32(brow16[k]), inv);
         b_scale[n] = s;
     }
     if (prof) { rocket_i8prof_arm(); g_i8prof.wt_q += rocket_now_ms() - t0; g_i8prof.wt_calls++; }
 }
 
+static inline void rocket_quant_act_int8(const float * src, int8_t * dst,
+                                         int64_t M, int64_t K, float * a_scale) {
+    rk_quant_act<127>(src, dst, M, K, a_scale);
+}
+static inline void rocket_quant_wt_int8(const void * src, bool f16, int8_t * dst,
+                                        int64_t N, int64_t K, float * b_scale) {
+    rk_quant_wt<127>(src, f16, dst, N, K, b_scale);
+}
+
 // int32 C[M,N] -> f32 dst, applying both scales: dst[m,n] = C[m,n]*a_scale[m]*b_scale[n].
+//
+// The lane form keeps the scalar's association -- ((float)v * as) * b_scale[n], two separate
+// multiplies in that order -- so it is bit-identical, not merely close. There is no add for
+// -ffp-contract to fold either side into, which is what makes that claim hold.
 static void rocket_dequant_int8(const int32_t * src, float * dst,
                                 int64_t M, int64_t N,
                                 const float * a_scale, const float * b_scale) {
@@ -1176,7 +1358,14 @@ static void rocket_dequant_int8(const int32_t * src, float * dst,
         const float as = a_scale[m];
         const int32_t * srow = src + m * N;
         float * drow = dst + m * N;
-        for (int64_t n = 0; n < N; n++) drow[n] = (float)srow[n] * as * b_scale[n];
+        int64_t n = 0;
+#ifdef ROCKET_NEON_F32
+        const float32x4_t vas = vdupq_n_f32(as);
+        for (; n + 4 <= N; n += 4)
+            vst1q_f32(drow + n, vmulq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(srow + n)), vas),
+                                          vld1q_f32(b_scale + n)));
+#endif
+        for (; n < N; n++) drow[n] = (float)srow[n] * as * b_scale[n];
     }
     if (prof) { rocket_i8prof_arm(); g_i8prof.dq += rocket_now_ms() - t0; g_i8prof.dq_calls++; }
 }
@@ -1320,10 +1509,11 @@ static int rk_hadamard_rotate_blocks(float *row, int K) {
 }
 
 // Hadamard variants of the quant kernels: rotate each row into `tmp` (K floats,
-// caller-owned, reused) then quantize. Same per-row / per-channel symmetric int8.
+// caller-owned, reused) then quantize. Same per-row / per-channel symmetric quant.
 // Return 0, or <0 if a row's K exceeds the rotation bound (caller -> CPU fallback).
-static int rocket_quant_act_int8_had(const float * src, int8_t * dst,
-                                      int64_t M, int64_t K, float * a_scale, float * tmp) {
+template <int QMAX>
+static int rk_quant_act_had(const float * src, int8_t * dst,
+                            int64_t M, int64_t K, float * a_scale, float * tmp) {
     const bool prof = rocket_convprof_on();
     double rot = 0, qt = 0, t0 = 0;
     for (int64_t m = 0; m < M; m++) {
@@ -1332,13 +1522,8 @@ static int rocket_quant_act_int8_had(const float * src, int8_t * dst,
         for (int64_t k = 0; k < K; k++) tmp[k] = row[k];
         if (rk_hadamard_rotate(tmp, (int)K) < 0) return -1;
         if (prof) { rot += rocket_now_ms() - t0; t0 = rocket_now_ms(); }
-        float amax = 0.0f;
-        for (int64_t k = 0; k < K; k++) { const float v = fabsf(tmp[k]); if (v > amax) amax = v; }
-        const float s = (amax > 0.0f) ? amax / 127.0f : 1.0f, inv = 1.0f / s;
-        int8_t * d = dst + m * K;
-        for (int64_t k = 0; k < K; k++) d[k] = rocket_q8(tmp[k], inv);
+        a_scale[m] = rk_quant_row<QMAX>(tmp, dst + m * K, K);
         if (prof) qt += rocket_now_ms() - t0;
-        a_scale[m] = s;
     }
     if (prof) { rocket_i8prof_arm(); g_i8prof.act_rot += rot; g_i8prof.act_q += qt; g_i8prof.act_calls++; }
     return 0;
@@ -1349,9 +1534,10 @@ static int rocket_quant_act_int8_had(const float * src, int8_t * dst,
 // exactly one caller: the RK3576 K-split, whose chunk c reads columns [K0, K0+Kc) out of a
 // [N][Ktot] weight, so the sub-block is strided rather than contiguous and materializing it
 // would cost a second N*Kc buffer per chunk for nothing.
-static int rocket_quant_wt_int8_had(const void * src, bool f16, int8_t * dst,
-                                     int64_t N, int64_t K, float * b_scale, float * tmp,
-                                     bool blocks = false, int64_t src_stride = 0) {
+template <int QMAX>
+static int rk_quant_wt_had(const void * src, bool f16, int8_t * dst,
+                           int64_t N, int64_t K, float * b_scale, float * tmp,
+                           bool blocks = false, int64_t src_stride = 0) {
     const bool prof = rocket_convprof_on();
     double rot = 0, qt = 0, t0 = 0;
     if (src_stride <= 0) src_stride = K;
@@ -1363,97 +1549,53 @@ static int rocket_quant_wt_int8_had(const void * src, bool f16, int8_t * dst,
         if ((blocks ? rk_hadamard_rotate_blocks(tmp, (int)K)
                     : rk_hadamard_rotate(tmp, (int)K)) < 0) return -1;
         if (prof) { rot += rocket_now_ms() - t0; t0 = rocket_now_ms(); }
-        const float amax = rk_amax_row(tmp, K);
-        const float s = (amax > 0.0f) ? amax / 127.0f : 1.0f, inv = 1.0f / s;
-        rk_q8_row(tmp, dst + n * K, K, inv);
+        b_scale[n] = rk_quant_row<QMAX>(tmp, dst + n * K, K);
         if (prof) qt += rocket_now_ms() - t0;
-        b_scale[n] = s;
     }
     if (prof) { rocket_i8prof_arm(); g_i8prof.wt_rot += rot; g_i8prof.wt_q += qt; g_i8prof.wt_calls++; }
     return 0;
 }
 
+static inline int rocket_quant_act_int8_had(const float * src, int8_t * dst,
+                                            int64_t M, int64_t K, float * a_scale, float * tmp) {
+    return rk_quant_act_had<127>(src, dst, M, K, a_scale, tmp);
+}
+static inline int rocket_quant_wt_int8_had(const void * src, bool f16, int8_t * dst,
+                                           int64_t N, int64_t K, float * b_scale, float * tmp,
+                                           bool blocks = false, int64_t src_stride = 0) {
+    return rk_quant_wt_had<127>(src, f16, dst, N, K, b_scale, tmp, blocks, src_stride);
+}
+
 // ===========================================================================
-// int4 W4A4 quant. The int4 sibling of the int8 quant kernels above: SYMMETRIC
-// int4, q = round(x/s) clamped to [-7,7] (NOT -8, so +/- are symmetric and the
-// scale is exact both ways), s = amax/7. Activations PER ROW, weights PER OUTPUT
-// CHANNEL -- identical structure to int8, only the clamp/divisor (7 vs 127) and
-// the +/-7 range differ. The dequant (rocket_dequant_int8: int32 C * scales) and
-// the Hadamard rotation (rk_hadamard_rotate) are dtype-independent and reused
-// as-is. Each int4 value is stored one-per-int8_t (the rocket_matmul_int4 contract;
+// int4 W4A4 quant. SYMMETRIC int4, q = round(x/s) clamped to [-7,7] (NOT -8, so +/- are
+// symmetric and the scale is exact both ways), s = amax/7. Activations PER ROW, weights
+// PER OUTPUT CHANNEL. The structure is int8's and the only difference is the rail, so the
+// four entries below are the same four templates instantiated at 7 -- there is no second
+// copy of the loop to keep in step. The dequant (rocket_dequant_int8: int32 C * scales)
+// and the Hadamard rotation (rk_hadamard_rotate) are dtype-independent and reused as-is.
+// Each int4 value is stored one-per-int8_t (the rocket_matmul_int4 contract;
 // the driver nibble-packs into the NPU BOs). NOTE the [-7,7] range bounds the
 // int16-partial saturation in the matmul: |q*q| <= 49, so a K-tile of <=668 cannot
 // overflow int16 -- the in-model caller caps Kt accordingly (see mul_mat_int4).
 // ===========================================================================
-static inline int8_t rocket_q4(float x, float inv) {
-    long q = lrintf(x * inv);
-    if (q >  7) q =  7;
-    if (q < -7) q = -7;
-    return (int8_t)q;   // one int4 value per int8_t
+// The int4 entries are the int8 kernels at the other rail -- same lane code, same profiler
+// buckets, same per-row / per-channel placement. int4 and int8 are separate opt-in routes
+// that never run in one process, so they share g_i8prof rather than needing a second one.
+static inline void rocket_quant_act_int4(const float * src, int8_t * dst,
+                                         int64_t M, int64_t K, float * a_scale) {
+    rk_quant_act<7>(src, dst, M, K, a_scale);
 }
-// A[M,K] f32 -> int4 [M,K] (one per byte) + per-row scale a_scale[m] (= amax_row/7).
-static void rocket_quant_act_int4(const float * src, int8_t * dst,
-                                  int64_t M, int64_t K, float * a_scale) {
-    for (int64_t m = 0; m < M; m++) {
-        const float * row = src + m * K;
-        float amax = 0.0f;
-        for (int64_t k = 0; k < K; k++) { const float v = fabsf(row[k]); if (v > amax) amax = v; }
-        const float s = (amax > 0.0f) ? amax / 7.0f : 1.0f, inv = 1.0f / s;
-        int8_t * d = dst + m * K;
-        for (int64_t k = 0; k < K; k++) d[k] = rocket_q4(row[k], inv);
-        a_scale[m] = s;
-    }
+static inline void rocket_quant_wt_int4(const void * src, bool f16, int8_t * dst,
+                                        int64_t N, int64_t K, float * b_scale) {
+    rk_quant_wt<7>(src, f16, dst, N, K, b_scale);
 }
-// B[N,K] (f16 or f32) -> int4 [N,K] (one per byte) + per-channel scale b_scale[n].
-static void rocket_quant_wt_int4(const void * src, bool f16, int8_t * dst,
-                                 int64_t N, int64_t K, float * b_scale) {
-    for (int64_t n = 0; n < N; n++) {
-        const ggml_fp16_t * brow16 = (const ggml_fp16_t *)src + n * K;
-        const float       * brow32 = (const float       *)src + n * K;
-        float amax = 0.0f;
-        for (int64_t k = 0; k < K; k++) {
-            const float v = fabsf(f16 ? ggml_fp16_to_fp32(brow16[k]) : brow32[k]);
-            if (v > amax) amax = v;
-        }
-        const float s = (amax > 0.0f) ? amax / 7.0f : 1.0f, inv = 1.0f / s;
-        int8_t * d = dst + n * K;
-        for (int64_t k = 0; k < K; k++)
-            d[k] = rocket_q4(f16 ? ggml_fp16_to_fp32(brow16[k]) : brow32[k], inv);
-        b_scale[n] = s;
-    }
+static inline int rocket_quant_act_int4_had(const float * src, int8_t * dst,
+                                            int64_t M, int64_t K, float * a_scale, float * tmp) {
+    return rk_quant_act_had<7>(src, dst, M, K, a_scale, tmp);
 }
-// Hadamard variants: rotate each row into tmp (caller-owned, reused) then int4-quant.
-// Return 0, or <0 if K exceeds the rotation bound (caller -> CPU/fp16 fallback).
-static int rocket_quant_act_int4_had(const float * src, int8_t * dst,
-                                     int64_t M, int64_t K, float * a_scale, float * tmp) {
-    for (int64_t m = 0; m < M; m++) {
-        const float * row = src + m * K;
-        for (int64_t k = 0; k < K; k++) tmp[k] = row[k];
-        if (rk_hadamard_rotate(tmp, (int)K) < 0) return -1;
-        float amax = 0.0f;
-        for (int64_t k = 0; k < K; k++) { const float v = fabsf(tmp[k]); if (v > amax) amax = v; }
-        const float s = (amax > 0.0f) ? amax / 7.0f : 1.0f, inv = 1.0f / s;
-        int8_t * d = dst + m * K;
-        for (int64_t k = 0; k < K; k++) d[k] = rocket_q4(tmp[k], inv);
-        a_scale[m] = s;
-    }
-    return 0;
-}
-static int rocket_quant_wt_int4_had(const void * src, bool f16, int8_t * dst,
-                                    int64_t N, int64_t K, float * b_scale, float * tmp) {
-    for (int64_t n = 0; n < N; n++) {
-        const ggml_fp16_t * brow16 = (const ggml_fp16_t *)src + n * K;
-        const float       * brow32 = (const float       *)src + n * K;
-        for (int64_t k = 0; k < K; k++) tmp[k] = f16 ? ggml_fp16_to_fp32(brow16[k]) : brow32[k];
-        if (rk_hadamard_rotate(tmp, (int)K) < 0) return -1;
-        float amax = 0.0f;
-        for (int64_t k = 0; k < K; k++) { const float v = fabsf(tmp[k]); if (v > amax) amax = v; }
-        const float s = (amax > 0.0f) ? amax / 7.0f : 1.0f, inv = 1.0f / s;
-        int8_t * d = dst + n * K;
-        for (int64_t k = 0; k < K; k++) d[k] = rocket_q4(tmp[k], inv);
-        b_scale[n] = s;
-    }
-    return 0;
+static inline int rocket_quant_wt_int4_had(const void * src, bool f16, int8_t * dst,
+                                           int64_t N, int64_t K, float * b_scale, float * tmp) {
+    return rk_quant_wt_had<7>(src, f16, dst, N, K, b_scale, tmp);
 }
 
 // GROUP-WISE int4 quant: rotate the full K row (Hadamard) then quantize each K-group
@@ -1475,14 +1617,11 @@ static inline int rk_quant_int4_grouped_row(const float * srcf, const void * src
            const float * b32 = (const float *)srcv + r * K;
            for (int64_t k = 0; k < K; k++) tmp[k] = f16 ? ggml_fp16_to_fp32(b16[k]) : b32[k]; }
     if (had && rk_hadamard_rotate(tmp, (int)K) < 0) return -1;
-    for (int g = 0; g < nG; g++) {
-        float amax = 0.0f;
-        for (int k = 0; k < group; k++) { const float v = fabsf(tmp[(size_t)g*group + k]); if (v > amax) amax = v; }
-        const float s = (amax > 0.0f) ? amax / 7.0f : 1.0f, inv = 1.0f / s;
-        int8_t * d = dst + r * K + (size_t)g * group;
-        for (int k = 0; k < group; k++) d[k] = rocket_q4(tmp[(size_t)g*group + k], inv);
-        scale[(size_t)r * nG + g] = s;
-    }
+    // A group is a contiguous run of `group` floats, so it is the same max-abs -> scale ->
+    // quantize as a whole row: one lane kernel, per group.
+    for (int g = 0; g < nG; g++)
+        scale[(size_t)r * nG + g] =
+            rk_quant_row<7>(tmp + (size_t)g * group, dst + r * K + (size_t)g * group, group);
     return 0;
 }
 
@@ -1528,6 +1667,7 @@ static int rocket_quant_int4_grouped(const float * srcf, const void * srcv, bool
 // ===========================================================================
 static std::string rocket_weight_key(const ggml_tensor * t);   // defined below (fp16 wcache)
 static size_t rocket_meminfo_bytes(const char * field);        // defined below (init); read in build_resident
+static void   rocket_meminfo_read(const char * const * fields, size_t * out, int n);
 
 // W8A8 int8 matmul for one plain 2D static-weight GEMM, via the one-shot tiled
 // int8 driver. Returns 0 (dst written) or <0 to fall through to the fp16 path.
@@ -1547,10 +1687,7 @@ static int ggml_backend_rocket_mul_mat_int8(
     const int Mp = rocket_pad_m(M);   // driver needs M%4; pad rows quantize to 0
     const bool b_f16 = (src0->type == GGML_TYPE_F16);
 
-    if (ctx->int8_hadamard < 0) {
-        const char * e = getenv("ROCKET_INT8_HADAMARD"); ctx->int8_hadamard = e ? atoi(e) : 0;
-    }
-    const bool had = ctx->int8_hadamard && rk_hadamard_ok(K);
+    const bool had = rocket_int8_hadamard(ctx) && rk_hadamard_ok(K);
     if (had) rk_build_H60();
 
     // ---- weights: reuse the resident rotated-int8 weight if cached, else build it
@@ -1576,6 +1713,10 @@ static int ggml_backend_rocket_mul_mat_int8(
         if (key.empty() || (ctx->int8_cache_budget != 0
                             && ctx->int8_resident_bytes + est > ctx->int8_cache_budget))
             return -1;
+        // A live iterator here means the key is present at a shape/rotation this call
+        // cannot use; the insert below replaces that entry, so drop it first.
+        rk_cache_evict(ctx->int8_wcache, it, ctx->int8_resident_bytes, [](rocket_int8_weight &){});
+        it = ctx->int8_wcache.end();
 
         std::vector<int8_t> bq((size_t)N * K);
         std::vector<float>  bs((size_t)N);
@@ -1594,18 +1735,23 @@ static int ggml_backend_rocket_mul_mat_int8(
                     key.c_str(), N, K, (int)had, ctx->int8_resident_bytes >> 20);
     }
 
-    // ---- activations: always per call (cheap; M is small)
-    std::vector<int8_t> qA((size_t)Mp * K, 0);    // pad rows = 0
-    std::vector<float>  a_scale((size_t)Mp, 1.0f);
-    if (had) { std::vector<float> tmp((size_t)K);
-               if (rocket_quant_act_int8_had((const float *)src1->data, qA.data(), M, K, a_scale.data(), tmp.data()) < 0) return -1; }
-    else     { rocket_quant_act_int8((const float *)src1->data, qA.data(), M, K, a_scale.data()); }
+    // ---- activations: always per call (cheap; M is small), out of reused context scratch.
+    // The quantizer writes rows 0..M-1, so qA's pad rows are cleared explicitly -- on a
+    // reused buffer they otherwise carry the previous call's codes into the computed
+    // surface. a_scale's pad entries need no such clear: the matmul does not read them and
+    // the dequant below reads only rows 0..M-1.
+    int8_t * qA      = rk_scratch(ctx->scratch_qA, (size_t)Mp * K);
+    float  * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)Mp);
+    if (Mp > M) memset(qA + (size_t)M * K, 0, (size_t)(Mp - M) * K);
+    if (had) { float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
+               if (rocket_quant_act_int8_had((const float *)src1->data, qA, M, K, a_scale, tmp) < 0) return -1; }
+    else     { rocket_quant_act_int8((const float *)src1->data, qA, M, K, a_scale); }
 
-    std::vector<int32_t> C32((size_t)Mp * N);
-    int rc = rocket_matmul_int8(ctx->int8_fd, Mp, K, N, qA.data(), qB, C32.data());
+    int32_t * C32 = rk_scratch(ctx->scratch_C32, (size_t)Mp * N);
+    int rc = rocket_matmul_int8(ctx->int8_fd, Mp, K, N, qA, qB, C32);
     if (rc != 0) return -1;
 
-    rocket_dequant_int8(C32.data(), (float *)dst->data, M, N, a_scale.data(), b_scale);
+    rocket_dequant_int8(C32, (float *)dst->data, M, N, a_scale, b_scale);
     return 0;
 }
 
@@ -1799,18 +1945,15 @@ static bool rk76_ksplit(int Ktot, std::vector<int> * out) {
 
     static int split_on = -1, force = -1;
     if (split_on < 0) {
-        const char * e = getenv("ROCKET_RK3576_KSPLIT");
-        split_on = (e && atoi(e) != 0) ? 1 : 0;
-        e = getenv("ROCKET_RK3576_FORCESPLIT");
-        force = (e && atoi(e) != 0) ? 1 : 0;
+        split_on = rocket_knob_on("ROCKET_RK3576_KSPLIT", false);
+        force    = rocket_knob_on("ROCKET_RK3576_FORCESPLIT", false);
     }
     if (!force && rk76_k_single_ok(Ktot)) { if (out) out->push_back(Ktot); return true; }
     if (!split_on && !rk76_k_single_ok(Ktot)) return false;
 
     static int pref0 = -1;
     if (pref0 < 0) {
-        const char * e = getenv("ROCKET_RK3576_KCHUNK");
-        const int v = e ? atoi(e) : 0;
+        const int v = rocket_knob_int("ROCKET_RK3576_KCHUNK", 0);
         pref0 = rk76_k_single_ok(v) ? v : 0;
     }
     int rem = Ktot;
@@ -1877,9 +2020,17 @@ static int rk76_quant_act(const float * src, int8_t * dst, int64_t M, int64_t K,
 // the first chunk writes and the rest accumulate, so dst is never separately zeroed and
 // the f32 sum of the partials is the same pass as the dequantize. The sum is in f32 and
 // the partials are the part's own int8 output, so nothing here can overflow.
+// `f` is caller-owned [N] scratch. It is a parameter rather than a local because the K-split
+// calls this once per chunk, so a local would be one allocation per chunk per matmul.
+//
+// The loops below are deliberately NOT vectorized. Lane-wise `v * f[n]` would be the same
+// sequence of products and so bit-identical -- the constraint recorded here is on the
+// expression ORDER, not on the width -- but this function's reproducibility is the property
+// every accuracy arm on this route is read against, so a rewrite of it wants a measurement
+// on the part first, not a plausibility argument.
 static void rk76_dequant(const int8_t * src, float * dst, int64_t M, int64_t N,
                          const float * a_scale, const float * b_scale, const float * scale_n,
-                         uint64_t * sat_elems, bool acc, bool per_row_scale) {
+                         uint64_t * sat_elems, bool acc, bool per_row_scale, float * f) {
     // The per-TENSOR case folds `a_scale` into `f[]` and multiplies once, exactly as the
     // path shipped. Do NOT "simplify" this into the per-row form with a[m]==a: fp32 is not
     // associative, and re-associating this one product moved the split arm's perplexity
@@ -1887,7 +2038,6 @@ static void rk76_dequant(const int8_t * src, float * dst, int64_t M, int64_t N,
     // standard error and so not a real accuracy change, but it is a gratuitous one, and it
     // costs the shipped path its bit-for-bit reproducibility across builds — which is the
     // property every arm on this route is read against.
-    std::vector<float> f((size_t)N);
     uint64_t sat = 0;
     if (!per_row_scale) {
         // The shipped path, expression-for-expression. Do NOT fold this into the per-row
@@ -1979,7 +2129,7 @@ static void rk76_dequant(const int8_t * src, float * dst, int64_t M, int64_t N,
 // the library would sum — so this is a cost knob, not an accuracy one.
 static int rk76_wsa(void) {
     static int on = -1;
-    if (on < 0) { const char * e = getenv("ROCKET_RK3576_WSA"); on = e ? atoi(e) != 0 : 1; }
+    if (on < 0) on = rocket_knob_on("ROCKET_RK3576_WSA", true);
     return on;
 }
 
@@ -1992,7 +2142,7 @@ static int rk76_wsa(void) {
 // would double-hold every weight through calibration instead of one at a time.
 static int rk76_wdev(void) {
     static int on = -1;
-    if (on < 0) { const char * e = getenv("ROCKET_RK3576_WDEV"); on = e ? atoi(e) != 0 : 1; }
+    if (on < 0) on = rocket_knob_on("ROCKET_RK3576_WDEV", true);
     return on;
 }
 
@@ -2002,8 +2152,7 @@ static int rk76_bootstrap_pass(int fd, int M, int K, int N, const int8_t * qA,
                                int8_t * C8, double * est, char * satcol) {
     static int form = -1;
     if (form < 0) {
-        const char * e = getenv("ROCKET_RK3576_CALSCAN");
-        form = e ? atoi(e) : 2;
+        form = rocket_knob_int("ROCKET_RK3576_CALSCAN", 2);
         if (form < 0 || form > 2) form = 2;
     }
     const int fe_prof = rk76_prof_on();
@@ -2073,7 +2222,7 @@ static int rk76_bootstrap_pass(int fd, int M, int K, int N, const int8_t * qA,
 // costs an O(M*Kc + N*Kc) sweep a forward and belongs nowhere near a timed arm.
 static int rk76_calrows(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_RK3576_CALROWS"); v = e ? atoi(e) : 0; }
+    if (v < 0) v = rocket_knob_int("ROCKET_RK3576_CALROWS", 0);
     return v;
 }
 
@@ -2108,7 +2257,13 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         if (ctx->rk76_fd < 0) { ctx->rk76_failed = true; return -1; }
     }
     if (ctx->rk76_ncal < 0) {
-        const char * e = getenv("ROCKET_RK3576_NCAL");   ctx->rk76_ncal = e ? atoi(e) : 2;
+        // Clamped like calsafe/bootmargin below, and for a harder reason than tidiness: a
+        // ncal <= 0 makes `w.cal_done < ncal` false on the FIRST call, so the calibration
+        // block never runs, scale_n stays the all-zero vector resize() gave it, and the
+        // dequant's `b_scale[n] / scale_n[n]` divides by zero -- every offloaded matmul then
+        // writes inf/NaN into the model. There is no "skip calibration" mode to express here.
+        ctx->rk76_ncal = rocket_knob_int("ROCKET_RK3576_NCAL", 2);
+        if (ctx->rk76_ncal < 1) ctx->rk76_ncal = 2;
         // 3.0, not 2.0: the frozen colmax here is BOOTSTRAPPED, and a bootstrap's 0.3%
         // per-column error costs SmolLM2-1.7B 0.018 of ratio at safety 2.0 against 0.0021
         // at 3.0 — an 88% reduction — while the exactly-frozen arm moves only 0.0017
@@ -2116,10 +2271,10 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         // is 1.008x at both. [host arithmetic; Qwen's BOOTSTRAPPED arm at 3.0 is
         // [expected] from its 0.000055 gap at 2.0, not measured]
         // 2 keeps the per-row scale only where the K-split cut the weight; see the use site.
-        e = getenv("ROCKET_RK3576_AROW");      ctx->rk76_arow = e ? atoi(e) : 0;
+        ctx->rk76_arow = rocket_knob_int("ROCKET_RK3576_AROW", 0);
         if (ctx->rk76_arow < 0 || ctx->rk76_arow > 2) ctx->rk76_arow = 1;
-        e = getenv("ROCKET_RK3576_CALSAFE");   ctx->rk76_calsafe = e ? (float)atof(e) : 3.0f;
-        e = getenv("ROCKET_RK3576_BOOTMARGIN"); ctx->rk76_bootmargin = e ? (float)atof(e) : 1.5f;
+        ctx->rk76_calsafe    = rocket_knob_float("ROCKET_RK3576_CALSAFE", 3.0f);
+        ctx->rk76_bootmargin = rocket_knob_float("ROCKET_RK3576_BOOTMARGIN", 1.5f);
         if (ctx->rk76_calsafe <= 0.0f)    ctx->rk76_calsafe = 3.0f;
         if (ctx->rk76_bootmargin < 1.0f)  ctx->rk76_bootmargin = 1.5f;
     }
@@ -2138,10 +2293,12 @@ static int ggml_backend_rocket_mul_mat_rk3576(
     auto it = key.empty() ? ctx->rk76_wcache.end() : ctx->rk76_wcache.find(key);
     if (it != ctx->rk76_wcache.end() && (it->second.N != N || it->second.K != K)) {
         // Same name, different shape: the record's calibration belongs to the old shape.
-        ctx->rk76_resident_bytes -= it->second.bytes;
-        for (auto & q : it->second.ch)
-            if (q.wbo) { rocket_rk3576_wbo_free(ctx->rk76_fd, q.wbo); q.wbo = nullptr; }
-        ctx->rk76_wcache.erase(it);
+        const int fd = ctx->rk76_fd;
+        rk_cache_evict(ctx->rk76_wcache, it, ctx->rk76_resident_bytes,
+                       [fd](rocket_rk3576_weight & e) {
+                           for (auto & q : e.ch)
+                               if (q.wbo) { rocket_rk3576_wbo_free(fd, q.wbo); q.wbo = nullptr; }
+                       });
         it = ctx->rk76_wcache.end();
     }
     if (it == ctx->rk76_wcache.end()) {
@@ -2226,18 +2383,23 @@ static int ggml_backend_rocket_mul_mat_rk3576(
     // calibration forwards take the same flag, so the frozen scales match the mode.
     const bool arow = (ctx->rk76_arow == 2) ? (w.ch.size() > 1) : (ctx->rk76_arow != 0);
 
-    // ---- scratch, sized for the WIDEST chunk and reused by all of them. One allocation a
-    // call however K is cut: the three vectors are value-initialized, so sizing them per
-    // chunk would memset M*Ktot + M*Ktot + M*N bytes across the loop instead of
-    // M*Kmax + M*Kmax + M*N once.
+    // ---- scratch, sized for the WIDEST chunk and reused by all of them, and held on the
+    // CONTEXT across calls (see rk_scratch). One sizing a call however K is cut, and after
+    // the first call at a given shape the `valloc` bucket below is the resize's no-op rather
+    // than an mmap + fault + memset of M*Kmax + M*Kmax + M*N bytes.
+    //
+    // There is no pad-row question on this part: M carries no constraint here, and
+    // rk76_quant_act writes all M rows of `rot`, `qA` and `a_scale` on both the per-tensor
+    // and the per-row branch.
     const int fe_prof = rk76_prof_on();
     int kmax = 0;
     for (size_t c = 0; c < w.ch.size(); c++) if (w.ch[c].Kc > kmax) kmax = w.ch[c].Kc;
     double fet0 = RK76_FE_T0();
-    std::vector<float>  rot((size_t)M * kmax);
-    std::vector<int8_t> qA((size_t)M * kmax);
-    std::vector<int8_t> C8((size_t)M * N);
-    std::vector<float>  a_scale((size_t)M, 1.0f);
+    float  * rot     = rk_scratch(ctx->scratch_rot, (size_t)M * kmax);
+    int8_t * qA      = rk_scratch(ctx->scratch_qA, (size_t)M * kmax);
+    int8_t * C8      = rk_scratch(ctx->scratch_C8, (size_t)M * N);
+    float  * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)M);
+    float  * dqf     = rk_scratch(ctx->scratch_dqf, (size_t)N);  // rk76_dequant's [N] scratch
     RK76_FE_ADD(valloc, fet0);
     if (fe_prof) g_rk76_fe.calls++;
 
@@ -2259,8 +2421,8 @@ static int ggml_backend_rocket_mul_mat_rk3576(
 
         // activations: chunk c's columns, rotated and quantized, every call
         fet0 = RK76_FE_T0();
-        if (rk76_quant_act((const float *)src1->data + q.K0, qA.data(), M, q.Kc,
-                           a_scale.data(), rot.data(), K, arow) < 0)
+        if (rk76_quant_act((const float *)src1->data + q.K0, qA, M, q.Kc,
+                           a_scale, rot, K, arow) < 0)
             return -1;
         RK76_FE_ADD(quant, fet0);
 
@@ -2280,15 +2442,15 @@ static int ggml_backend_rocket_mul_mat_rk3576(
             // its surface is what the call returns.
             int M1 = M;
             if (rk76_calrows() > 0 && rk76_calrows() < M) M1 = rk76_calrows();
-            if (rk76_bootstrap_pass(ctx->rk76_fd, M1, q.Kc, N, qA.data(), q.qB.data(),
+            if (rk76_bootstrap_pass(ctx->rk76_fd, M1, q.Kc, N, qA, q.qB.data(),
                                     q.cbound.data(), q.sumabs.data(),
-                                    C8.data(), est1.data(), NULL) < 0)
+                                    C8, est1.data(), NULL) < 0)
                 return -1;
             for (int n = 0; n < N; n++)
                 sc2[n] = (float)(127.0 / (est1[n] * (double)ctx->rk76_bootmargin));
-            if (rk76_bootstrap_pass(ctx->rk76_fd, M, q.Kc, N, qA.data(), q.qB.data(),
+            if (rk76_bootstrap_pass(ctx->rk76_fd, M, q.Kc, N, qA, q.qB.data(),
                                     sc2.data(), q.sumabs.data(),
-                                    C8.data(), est2.data(), sat.data()) < 0)
+                                    C8, est2.data(), sat.data()) < 0)
                 return -1;
             for (int n = 0; n < N; n++) {
                 const double v = sat[n] ? est1[n] * (double)ctx->rk76_bootmargin : est2[n];
@@ -2312,8 +2474,8 @@ static int ggml_backend_rocket_mul_mat_rk3576(
                 fflush(cf);
             }
             fet0 = RK76_FE_T0();
-            rk76_dequant(C8.data(), (float *)dst->data, M, N, a_scale.data(),
-                         q.b_scale.data(), sc2.data(), NULL, c != 0, arow);
+            rk76_dequant(C8, (float *)dst->data, M, N, a_scale,
+                         q.b_scale.data(), sc2.data(), NULL, c != 0, arow, dqf);
             RK76_FE_ADD(dequant, fet0);
             continue;
         }
@@ -2325,6 +2487,8 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         if (rk76_wdev() && !ctx->rk76_wdev_off && !q.wbo) {
             if (rocket_rk3576_wbo_create(ctx->rk76_fd, q.Kc, N, q.qB.data(),
                                          &q.wbo) == 0) {
+                // rk76_resident_bytes deliberately does not move: the cube is the same
+                // N*Kc bytes of the same DRAM, so the entry's charge is unchanged.
                 q.qB.clear();
                 q.qB.shrink_to_fit();
             } else {
@@ -2338,19 +2502,19 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         double werr = 0.0;
         fet0 = RK76_FE_T0();
         int mmrc = q.wbo
-            ? rocket_matmul_int8_rk3576_perc_wbo(ctx->rk76_fd, M, q.Kc, N, qA.data(),
+            ? rocket_matmul_int8_rk3576_perc_wbo(ctx->rk76_fd, M, q.Kc, N, qA,
                                                  q.wbo, NULL, q.scale_n.data(),
-                                                 q.sumabs.data(), C8.data(), &werr)
-            : rocket_matmul_int8_rk3576_perc_sa(ctx->rk76_fd, M, q.Kc, N, qA.data(),
+                                                 q.sumabs.data(), C8, &werr)
+            : rocket_matmul_int8_rk3576_perc_sa(ctx->rk76_fd, M, q.Kc, N, qA,
                                                 q.qB.data(), NULL, q.scale_n.data(),
                                                 rk76_wsa() ? q.sumabs.data() : NULL,
-                                                C8.data(), &werr);
+                                                C8, &werr);
         if (mmrc != 0)
             return -1;
         RK76_FE_ADD(entry, fet0);
         fet0 = RK76_FE_T0();
-        rk76_dequant(C8.data(), (float *)dst->data, M, N, a_scale.data(),
-                     q.b_scale.data(), q.scale_n.data(), &w.sat_elems, c != 0, arow);
+        rk76_dequant(C8, (float *)dst->data, M, N, a_scale,
+                     q.b_scale.data(), q.scale_n.data(), &w.sat_elems, c != 0, arow, dqf);
         RK76_FE_ADD(dequant, fet0);
         w.tot_elems += (uint64_t)M * N;
     }
@@ -2418,12 +2582,7 @@ static int ggml_backend_rocket_mul_mat_int4(
     const int Mp = rocket_pad_m(M);   // driver needs M%4; pad rows quantize to 0
     const bool b_f16 = (src0->type == GGML_TYPE_F16);
 
-    // Hadamard defaults ON for int4 (unlike int8's opt-in): W4A4 is unusable without
-    // the outlier rotation (cos ~0.79 -> ~0.98). ROCKET_INT4_HADAMARD=0 disables it.
-    if (ctx->int4_hadamard < 0) {
-        const char * e = getenv("ROCKET_INT4_HADAMARD"); ctx->int4_hadamard = e ? atoi(e) : 1;
-    }
-    const bool had = ctx->int4_hadamard && rk_hadamard_ok(K);
+    const bool had = rocket_int4_hadamard(ctx) && rk_hadamard_ok(K);
     if (had) rk_build_H60();
 
     // ROCKET_INT4_GROUP=g: per-K-group dequant scales (the W4 quality lever). g must
@@ -2432,8 +2591,7 @@ static int ggml_backend_rocket_mul_mat_int4(
     // Default 128 = group-wise (best W4 quality + the group forces a saturation-safe
     // Kt). ROCKET_INT4_GROUP=0 selects per-channel; an invalid g (doesn't divide K,
     // not %32, or would saturate int16) silently degrades to per-channel.
-    if (ctx->int4_group < 0) { const char * e = getenv("ROCKET_INT4_GROUP"); ctx->int4_group = e ? atoi(e) : 128; }
-    int group = ctx->int4_group;
+    int group = rocket_int4_group(ctx);
     if (group > 0 && (group % 32 || K % group || 49 * group >= 32767)) group = 0;
     const int nG = group > 0 ? (int)(K / group) : 1;
 
@@ -2458,6 +2616,10 @@ static int ggml_backend_rocket_mul_mat_int4(
         if (key.empty() || (ctx->int4_cache_budget != 0
                             && ctx->int4_resident_bytes + est > ctx->int4_cache_budget))
             return -1;
+        // A live iterator here means the key is present at a shape/group/rotation this call
+        // cannot use; the insert below replaces that entry, so drop it first.
+        rk_cache_evict(ctx->int4_wcache, it, ctx->int4_resident_bytes, [](rocket_int4_weight &){});
+        it = ctx->int4_wcache.end();
 
         std::vector<int8_t> bq((size_t)N * K);
         std::vector<float>  bs((size_t)N * nG);
@@ -2478,36 +2640,46 @@ static int ggml_backend_rocket_mul_mat_int4(
                     key.c_str(), N, K, (int)had, group, ctx->int4_resident_bytes >> 20);
     }
 
-    // ---- activations: always per call (cheap; M is small), int4 [Mp,K] (pad rows = 0)
-    std::vector<int8_t> qA((size_t)Mp * K, 0);
+    // ---- activations: always per call (cheap; M is small), int4 [Mp,K] out of reused
+    // context scratch. The quantizers write rows 0..M-1, so both the codes and the scales
+    // of the pad rows are re-established explicitly (codes 0, scale 1) rather than inherited.
+    int8_t * qA = rk_scratch(ctx->scratch_qA, (size_t)Mp * K);
+    if (Mp > M) memset(qA + (size_t)M * K, 0, (size_t)(Mp - M) * K);
     if (group > 0) {
         // group-wise: per-(row,group) scales, fp32-accumulating matmul applies them.
-        std::vector<float> a_scale((size_t)Mp * nG, 1.0f);
-        std::vector<float> tmp((size_t)K);
+        float * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)Mp * nG);
+        for (int64_t i = (int64_t)M * nG; i < (int64_t)Mp * nG; i++) a_scale[i] = 1.0f;
+        float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
         if (rocket_quant_int4_grouped((const float *)src1->data, nullptr, true, false,
-                                      qA.data(), M, K, group, had, a_scale.data(), tmp.data()) < 0) return -1;
-        std::vector<float> Cf((size_t)Mp * N);
-        int rc = rocket_matmul_int4_groupwise(ctx->int4_fd, Mp, K, N, qA.data(), qB,
-                                              a_scale.data(), b_scale, Cf.data(), group);
+                                      qA, M, K, group, had, a_scale, tmp) < 0) return -1;
+        float * Cf = rk_scratch(ctx->scratch_Cf, (size_t)Mp * N);
+        int rc = rocket_matmul_int4_groupwise(ctx->int4_fd, Mp, K, N, qA, qB,
+                                              a_scale, b_scale, Cf, group);
         if (rc != 0) return -1;
-        memcpy((float *)dst->data, Cf.data(), (size_t)M * N * sizeof(float));  // first M rows
+        memcpy((float *)dst->data, Cf, (size_t)M * N * sizeof(float));  // first M rows
         return 0;
     }
 
-    std::vector<float>  a_scale((size_t)Mp, 1.0f);
-    if (had) { std::vector<float> tmp((size_t)K);
-               if (rocket_quant_act_int4_had((const float *)src1->data, qA.data(), M, K, a_scale.data(), tmp.data()) < 0) return -1; }
-    else     { rocket_quant_act_int4((const float *)src1->data, qA.data(), M, K, a_scale.data()); }
+    float * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)Mp);
+    for (int64_t i = M; i < Mp; i++) a_scale[i] = 1.0f;
+    if (had) { float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
+               if (rocket_quant_act_int4_had((const float *)src1->data, qA, M, K, a_scale, tmp) < 0) return -1; }
+    else     { rocket_quant_act_int4((const float *)src1->data, qA, M, K, a_scale); }
 
-    std::vector<int32_t> C32((size_t)Mp * N);
+    int32_t * C32 = rk_scratch(ctx->scratch_C32, (size_t)Mp * N);
     // kt_cap=480: [-7,7] int4 -> |K-tile partial| <= 49*480 < 32767, so the int16
     // output cannot saturate regardless of K (safe without ROCKET_MM_KT).
-    int rc = rocket_matmul_int4_ex(ctx->int4_fd, Mp, K, N, qA.data(), qB, C32.data(), 480);
+    int rc = rocket_matmul_int4_ex(ctx->int4_fd, Mp, K, N, qA, qB, C32, 480);
     if (rc != 0) return -1;
 
-    rocket_dequant_int8(C32.data(), (float *)dst->data, M, N, a_scale.data(), b_scale);
+    rocket_dequant_int8(C32, (float *)dst->data, M, N, a_scale, b_scale);
     return 0;
 }
+
+// Convert a BF16 / F16 / F32 [N,K] weight to fp32, rows fanned across the persistent
+// dequant pool. Defined with rocket_weight_to_fp16 (the fp16 sibling), below.
+static void rk_weight_to_fp32(const void * B_src, ggml_type t,
+                              int64_t N, int64_t K, float * Bf);
 
 // bf16 x bf16 -> fp32 path. The PAYOFF of the bf16 datatype: because
 // bf16 carries fp32's exponent range (HW-proven: matmul_bf16_rocket passes at
@@ -2541,46 +2713,72 @@ static int ggml_backend_rocket_mul_mat_bf16(
         if (ctx->bf16_fd < 0) { ctx->bf16_failed = true; return -1; }
     }
 
-    // weights -> fp32 scratch (reused); the bf16 matmul truncates fp32->bf16. Source
-    // may be native BF16 (the real model weights -> exact bf16->fp32), F16 (a fp16
-    // gguf, re-truncated to bf16), or F32.
-    // Reused fp32 weight scratch. It grows to the high-water N*K and is never shrunk:
-    // the bf16 path is a slow single-fd fallback, so holding the peak buffer (vs
-    // realloc churn across calls) is the right trade. It frees with the ctx.
-    std::vector<float> & Bf = ctx->bf16_bscratch;
-    if (Bf.size() < (size_t)N * K) Bf.resize((size_t)N * K);
-    if      (src0->type == GGML_TYPE_BF16) ggml_bf16_to_fp32_row((const ggml_bf16_t *)src0->data, Bf.data(), (size_t)N * K);
-    else if (src0->type == GGML_TYPE_F16)  ggml_fp16_to_fp32_row((const ggml_fp16_t *)src0->data, Bf.data(), (size_t)N * K);
-    else                                   memcpy(Bf.data(), src0->data, (size_t)N * K * sizeof(float));
+    // ---- weights -> fp32; the bf16 matmul truncates fp32->bf16 on the scatter. The source
+    // may be native BF16 (the model's own weights -> exact bf16->fp32), F16 (a fp16 GGUF,
+    // re-truncated to bf16), or F32 -- and an F32 source needs no conversion at all, so it
+    // is handed over in place rather than copied into a scratch of the same values.
+    const float * Bf = nullptr;
+    if (src0->type == GGML_TYPE_F32) {
+        Bf = (const float *)src0->data;
+    } else {
+        // Held fp32 form if this weight is cached (ROCKET_BF16_CACHE_MB); otherwise the
+        // conversion runs per call into the reused scratch. Either way it is TIMED into the
+        // streaming-dequant bucket -- without that, the route's dominant host term appears
+        // nowhere in a ROCKET_MM_PROFILE run and is charged to whichever neighbour spans it.
+        const std::string key = ctx->bf16_cache_budget ? rocket_weight_key(src0) : std::string();
+        auto it = key.empty() ? ctx->bf16_wcache.end() : ctx->bf16_wcache.find(key);
+        if (it != ctx->bf16_wcache.end() && it->second.N == N && it->second.K == K) {
+            Bf = it->second.Bf.data();
+        } else {
+            const bool wprof = rocket_convprof_on();
+            const double wt0 = wprof ? rocket_now_ms() : 0.0;
+            const size_t est = (size_t)N * K * sizeof(float);
+            const bool cacheable = !key.empty()
+                && ctx->bf16_resident_bytes + est <= ctx->bf16_cache_budget;
+            float * dstf;
+            if (cacheable) {
+                rk_cache_evict(ctx->bf16_wcache, it, ctx->bf16_resident_bytes,
+                               [](rocket_bf16_weight &){});
+                rocket_bf16_weight e;
+                e.Bf.resize((size_t)N * K); e.N = N; e.K = K; e.bytes = est;
+                auto & slot = (ctx->bf16_wcache[key] = std::move(e));
+                ctx->bf16_resident_bytes += est;
+                dstf = slot.Bf.data();
+                if (rocket_debug_on())
+                    GGML_LOG_DEBUG("[bf16-cache] +%-22s N=%6d K=%6d  resident=%zuMB\n",
+                                   key.c_str(), N, K, ctx->bf16_resident_bytes >> 20);
+            } else {
+                dstf = rk_scratch(ctx->bf16_bscratch, (size_t)N * K);
+            }
+            rk_weight_to_fp32(src0->data, src0->type, N, K, dstf);
+            if (wprof) rocket_convprof_add_dequant(rocket_now_ms() - wt0, (double)N * K);
+            Bf = dstf;
+        }
+    }
 
-    // activations: F32 straight through, NO scaling. Pad rows M..Mp-1 with zeros.
+    // activations: F32 straight through, NO scaling. Pad rows M..Mp-1 with zeros -- on a
+    // reused buffer that clear is per call, since the packer only fills 0..M-1.
     const float * Af;
-    std::vector<float> Apad;
     if (Mp == M) {
         Af = (const float *)src1->data;
     } else {
-        Apad.assign((size_t)Mp * K, 0.0f);
-        memcpy(Apad.data(), src1->data, (size_t)M * K * sizeof(float));
-        Af = Apad.data();
+        float * Apad = rk_scratch(ctx->bf16_apad, (size_t)Mp * K);
+        memcpy(Apad, src1->data, (size_t)M * K * sizeof(float));
+        memset(Apad + (size_t)M * K, 0, (size_t)(Mp - M) * K * sizeof(float));
+        Af = Apad;
     }
 
     // output fp32: write straight to dst when unpadded (dst is [M,N] contiguous F32,
     // guaranteed by the supports_op contiguity check); else via a padded buffer.
-    float * Cf;
-    std::vector<float> Cpad;
-    if (Mp == M) {
-        Cf = (float *)dst->data;
-    } else {
-        Cpad.resize((size_t)Mp * N);
-        Cf = Cpad.data();
-    }
+    float * Cf = (Mp == M) ? (float *)dst->data
+                           : rk_scratch(ctx->bf16_cpad, (size_t)Mp * N);
 
     int rc = ctx->bf16_stream
-        ? rocket_matmul_bf16_stream(ctx->bf16_stream, Mp, K, N, Af, Bf.data(), Cf)
-        : rocket_matmul_bf16(ctx->bf16_fd, Mp, K, N, Af, Bf.data(), Cf);
+        ? rocket_matmul_bf16_stream(ctx->bf16_stream, Mp, K, N, Af, Bf, Cf)
+        : rocket_matmul_bf16(ctx->bf16_fd, Mp, K, N, Af, Bf, Cf);
     if (rc != 0) return -1;
 
-    if (Mp != M) memcpy(dst->data, Cpad.data(), (size_t)M * N * sizeof(float));
+    if (Mp != M) memcpy(dst->data, Cf, (size_t)M * N * sizeof(float));
     return 0;
 }
 
@@ -2613,10 +2811,7 @@ static int ggml_backend_rocket_mul_mat_int8_resident(
 
     const int  Mp    = rocket_pad_m(M);
     const bool b_f16 = (src0->type == GGML_TYPE_F16);
-    if (ctx->int8_hadamard < 0) {
-        const char * e = getenv("ROCKET_INT8_HADAMARD"); ctx->int8_hadamard = e ? atoi(e) : 0;
-    }
-    const bool had = ctx->int8_hadamard && rk_hadamard_ok(K);
+    const bool had = rocket_int8_hadamard(ctx) && rk_hadamard_ok(K);
     if (had) rk_build_H60();
 
     const std::string key = rocket_weight_key(src0);
@@ -2635,9 +2830,9 @@ static int ggml_backend_rocket_mul_mat_int8_resident(
             && it->second.hadamard == had) {
             w = it->second.w; b_scale = it->second.b_scale.data();   // reuse across M
         } else {                              // genuine shape/hadamard change: re-pack
-            rocket_i8_weights_free(ctx->i8_dev, it->second.w);
-            ctx->i8_resident_bytes -= it->second.bytes;
-            ctx->i8_rwcache.erase(it);
+            rocket_i8_ctx * dev = ctx->i8_dev;
+            rk_cache_evict(ctx->i8_rwcache, it, ctx->i8_resident_bytes,
+                           [dev](rocket_i8_resident & e) { rocket_i8_weights_free(dev, e.w); });
         }
     }
     if (!w && ctx->i8_resident_full) return -1;
@@ -2696,18 +2891,21 @@ static int ggml_backend_rocket_mul_mat_int8_resident(
         }
     }
 
-    // ---- activations: per call (rotated when hadamard), int8 [Mp,K] (pad rows = 0)
-    std::vector<int8_t> qA((size_t)Mp * K, 0);
-    std::vector<float>  a_scale((size_t)Mp, 1.0f);
-    if (had) { std::vector<float> tmp((size_t)K);
-               if (rocket_quant_act_int8_had((const float *)src1->data, qA.data(), M, K, a_scale.data(), tmp.data()) < 0) return -1; }
-    else     { rocket_quant_act_int8((const float *)src1->data, qA.data(), M, K, a_scale.data()); }
+    // ---- activations: per call (rotated when hadamard), int8 [Mp,K] out of reused context
+    // scratch. qA's pad rows M..Mp-1 are cleared explicitly (the quantizer writes only
+    // 0..M-1); a_scale's are not read -- see the one-shot int8 path for why.
+    int8_t * qA      = rk_scratch(ctx->scratch_qA, (size_t)Mp * K);
+    float  * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)Mp);
+    if (Mp > M) memset(qA + (size_t)M * K, 0, (size_t)(Mp - M) * K);
+    if (had) { float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
+               if (rocket_quant_act_int8_had((const float *)src1->data, qA, M, K, a_scale, tmp) < 0) return -1; }
+    else     { rocket_quant_act_int8((const float *)src1->data, qA, M, K, a_scale); }
 
-    std::vector<int32_t> C32((size_t)Mp * N);
-    int rc = rocket_matmul_int8_prepacked(ctx->i8_dev, Mp, K, N, qA.data(), C32.data(), w);
+    int32_t * C32 = rk_scratch(ctx->scratch_C32, (size_t)Mp * N);
+    int rc = rocket_matmul_int8_prepacked(ctx->i8_dev, Mp, K, N, qA, C32, w);
     if (rc != 0) return -1;
 
-    rocket_dequant_int8(C32.data(), (float *)dst->data, M, N, a_scale.data(), b_scale);
+    rocket_dequant_int8(C32, (float *)dst->data, M, N, a_scale, b_scale);
     return 0;
 }
 
@@ -2734,16 +2932,13 @@ static int ggml_backend_rocket_mul_mat_int4_resident(
     const int  Mp    = rocket_pad_m(M);
     const bool b_f16 = (src0->type == GGML_TYPE_F16);
 
-    // Hadamard defaults ON for int4 (W4A4 is unusable without the outlier rotation).
-    if (ctx->int4_hadamard < 0) { const char * e = getenv("ROCKET_INT4_HADAMARD"); ctx->int4_hadamard = e ? atoi(e) : 1; }
-    const bool had = ctx->int4_hadamard && rk_hadamard_ok(K);
+    const bool had = rocket_int4_hadamard(ctx) && rk_hadamard_ok(K);
     if (had) rk_build_H60();
 
     // Group-wise only: the resident path forces Kt=group (one tile == one quant group,
     // saturation-safe). group==0 / invalid -> one-shot int4 path (its kt_cap handles
     // per-channel). 49*group<32767 keeps the int16 partial unsaturated.
-    if (ctx->int4_group < 0) { const char * e = getenv("ROCKET_INT4_GROUP"); ctx->int4_group = e ? atoi(e) : 128; }
-    const int group = ctx->int4_group;
+    const int group = rocket_int4_group(ctx);
     if (group <= 0 || group % 32 || K % group || 49 * group >= 32767) return -1;
     const int nG = (int)(K / group);
 
@@ -2764,9 +2959,9 @@ static int ggml_backend_rocket_mul_mat_int4_resident(
             && it->second.group == group && it->second.hadamard == had) {
             w = it->second.w; b_scale = it->second.b_scale.data();   // reuse across M
         } else {                              // genuine shape/group/hadamard change: re-pack
-            rocket_i4_weights_free(ctx->i4_dev, it->second.w);
-            ctx->i4_resident_bytes -= it->second.bytes;
-            ctx->i4_rwcache.erase(it);
+            rocket_i4_ctx * dev = ctx->i4_dev;
+            rk_cache_evict(ctx->i4_rwcache, it, ctx->i4_resident_bytes,
+                           [dev](rocket_i4_resident & e) { rocket_i4_weights_free(dev, e.w); });
         }
     }
     if (!w && ctx->i4_resident_full) return -1;
@@ -2816,19 +3011,23 @@ static int ggml_backend_rocket_mul_mat_int4_resident(
         }
     }
 
-    // ---- activations: per call, group-wise int4 [Mp,K] (pad rows = 0), rotated when
-    // hadamard. a_scale is [Mp*nG]; the matmul applies a_scale*b_scale per group in fp32.
-    std::vector<int8_t> qA((size_t)Mp * K, 0);
-    std::vector<float>  a_scale((size_t)Mp * nG, 1.0f);
-    { std::vector<float> tmp((size_t)K);
+    // ---- activations: per call, group-wise int4 [Mp,K], rotated when hadamard, out of
+    // reused context scratch. a_scale is [Mp*nG]; the matmul applies a_scale*b_scale per
+    // group in fp32. The quantizer writes rows 0..M-1, so the pad rows' codes (0) and
+    // scales (1) are re-established explicitly rather than inherited from the last call.
+    int8_t * qA      = rk_scratch(ctx->scratch_qA, (size_t)Mp * K);
+    float  * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)Mp * nG);
+    if (Mp > M) memset(qA + (size_t)M * K, 0, (size_t)(Mp - M) * K);
+    for (int64_t i = (int64_t)M * nG; i < (int64_t)Mp * nG; i++) a_scale[i] = 1.0f;
+    { float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
       if (rocket_quant_int4_grouped((const float *)src1->data, nullptr, true, false,
-                                    qA.data(), M, K, group, had, a_scale.data(), tmp.data()) < 0) return -1; }
+                                    qA, M, K, group, had, a_scale, tmp) < 0) return -1; }
 
-    std::vector<float> Cf((size_t)Mp * N);
-    int rc = rocket_matmul_int4_prepacked_gw(ctx->i4_dev, Mp, K, N, qA.data(),
-                                             a_scale.data(), b_scale, Cf.data(), w);
+    float * Cf = rk_scratch(ctx->scratch_Cf, (size_t)Mp * N);
+    int rc = rocket_matmul_int4_prepacked_gw(ctx->i4_dev, Mp, K, N, qA,
+                                             a_scale, b_scale, Cf, w);
     if (rc != 0) return -1;
-    memcpy((float *)dst->data, Cf.data(), (size_t)M * N * sizeof(float));  // first M rows
+    memcpy((float *)dst->data, Cf, (size_t)M * N * sizeof(float));  // first M rows
     return 0;
 }
 
@@ -2843,7 +3042,7 @@ static int ggml_backend_rocket_mul_mat_int4_resident(
 #ifdef ROCKET_DIAGNOSTICS
 static bool rocket_verify_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_VERIFY"); v = e ? atoi(e) : 0; }
+    if (v < 0) v = rocket_knob_int("ROCKET_VERIFY", 0);
     return v > 0;
 }
 #endif // ROCKET_DIAGNOSTICS
@@ -2965,7 +3164,20 @@ static rocket_dequant_pool & rocket_get_dequant_pool(void) {
 static bool rocket_weight_to_fp16(const void * B_src, ggml_type t,
                                   int64_t N, int64_t K, ggml_fp16_t * B16) {
     if (t == GGML_TYPE_F32) {
-        ggml_fp32_to_fp16_row((const float *)B_src, B16, N * K);
+        // Fanned like the BF16 and quantized branches below, and for the same reason: this
+        // runs per micro-batch on the prefill critical path, and rows are independent.
+        const float * b = (const float *)B_src;
+        auto cvt_rows = [&](int64_t n0, int64_t n1) {
+            ggml_fp32_to_fp16_row(b + n0 * K, B16 + n0 * K, (n1 - n0) * K);
+        };
+        const int nthr = rocket_dequant_threads();
+        if (N < 64 || nthr <= 1) { cvt_rows(0, N); return true; }
+        rocket_dequant_pool & pool = rocket_get_dequant_pool();
+        const int64_t per = (N + pool.size() - 1) / pool.size();
+        pool.run([&](int i) {
+            int64_t n0 = (int64_t)i * per, n1 = n0 + per > N ? N : n0 + per;
+            if (n0 < n1) cvt_rows(n0, n1);
+        });
         return true;
     }
     if (t == GGML_TYPE_BF16) {
@@ -3028,6 +3240,35 @@ static bool rocket_weight_to_fp16(const void * B_src, ggml_type t,
     }
     return false;
 }
+
+// The fp32 sibling, for the bf16 datapath: its matmul entry takes fp32 and truncates to
+// bf16 on the scatter, so this is the form that route needs. Same fan-out and the same
+// bit-identical-to-serial argument (disjoint output rows, no cross-row state). Only the
+// three unquantized types reach here -- supports_op does not claim a quantized weight for
+// the bf16 route, and a caller that got one would have to decode it to fp32 itself.
+static void rk_weight_to_fp32(const void * B_src, ggml_type t,
+                              int64_t N, int64_t K, float * Bf) {
+    auto cvt_rows = [&](int64_t n0, int64_t n1) {
+        const size_t o = (size_t)n0 * K, n = (size_t)(n1 - n0) * K;
+        if      (t == GGML_TYPE_BF16) ggml_bf16_to_fp32_row((const ggml_bf16_t *)B_src + o, Bf + o, n);
+        else if (t == GGML_TYPE_F16)  ggml_fp16_to_fp32_row((const ggml_fp16_t *)B_src + o, Bf + o, n);
+        else                          memcpy(Bf + o, (const float *)B_src + o, n * sizeof(float));
+    };
+    const int nthr = rocket_dequant_threads();
+    if (N < 64 || nthr <= 1) { cvt_rows(0, N); return; }
+    rocket_dequant_pool & pool = rocket_get_dequant_pool();
+    const int64_t per = (N + pool.size() - 1) / pool.size();
+    pool.run([&](int i) {
+        const int64_t n0 = (int64_t)i * per, n1 = n0 + per > N ? N : n0 + per;
+        if (n0 < n1) cvt_rows(n0, n1);
+    });
+}
+
+// The runtime CPU fallback's fp64 reference dot (defined below); the two diagnostics here
+// share it rather than each keeping a copy.
+static void rocket_cpu_matmul_slice(const float * A, const void * B, ggml_type wt,
+                                    float * C, int64_t M, int64_t N, int64_t K);
+
 #ifdef ROCKET_DIAGNOSTICS
 static void rocket_verify(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];   // weights B[N,K]
@@ -3038,14 +3279,16 @@ static void rocket_verify(const ggml_tensor * dst) {
     const float * C = (const float *)dst->data;    // row 0 (NPU result)
     double maxabs = 0, maxrel = 0; int nonfinite = 0; double amax = 0;
     for (int64_t k = 0; k < K; k++) { double a = fabs((double)A[k]); if (a > amax) amax = a; }
+    // ONE row through the shared fp64 reference (the same one the runtime fallback uses),
+    // rather than a third hand-written copy of the dot. It also handles a quantized weight
+    // correctly, which a per-element stride over a block layout does not.
+    std::vector<float> ref((size_t)N);
+    rocket_cpu_matmul_slice(A, src0->data, wt, ref.data(), 1, N, K);
     for (int64_t n = 0; n < N; n++) {
-        const char * Brow = (const char *)src0->data + (size_t)n * src0->nb[1];
-        double ref = 0;
-        for (int64_t k = 0; k < K; k++) ref += (double)A[k] * (double)rocket_weight_elem_f32(Brow, k, wt);
         const double got = C[n];
         if (!std::isfinite(got)) nonfinite++;
-        const double ad = fabs(got - ref);
-        const double rd = ad / (fabs(ref) + 1e-6);
+        const double ad = fabs(got - (double)ref[n]);
+        const double rd = ad / (fabs((double)ref[n]) + 1e-6);
         if (ad > maxabs) maxabs = ad;
         if (rd > maxrel) maxrel = rd;
     }
@@ -3095,21 +3338,18 @@ static int rocket_env_int(const char * name, int * cache) {
 // CPU fp32 reference matmul: dst[M,N] = src1[M,K] * src0[N,K]^T, written as M*N
 // contiguous F32 -- bit-for-bit the same destination region rocket_unpack_output
 // writes, so swapping it in isolates NPU side effects from the dst content.
+//
+// The whole-tensor spelling of rocket_cpu_matmul_slice: supports_op requires a contiguous
+// weight, so src0->nb[1] IS K*ggml_type_size(wt) and the two are the same traversal. One
+// implementation rather than two, which also gives the diagnostic the slice's correct
+// handling of a quantized weight (the per-element stride a second copy used reads a block
+// payload as raw floats).
 static void rocket_cpu_matmul(ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];   // weights B[N,K]
     const ggml_tensor * src1 = dst->src[1];   // input   A[M,K]
     const int64_t K = src0->ne[0], N = src0->ne[1], M = src1->ne[1];
-    const ggml_type wt = src0->type;
-    float * C = (float *)dst->data;
-    for (int64_t m = 0; m < M; m++) {
-        const float * A = (const float *)src1->data + m * K;
-        for (int64_t n = 0; n < N; n++) {
-            const char * Brow = (const char *)src0->data + (size_t)n * src0->nb[1];
-            double acc = 0;
-            for (int64_t k = 0; k < K; k++) acc += (double)A[k] * (double)rocket_weight_elem_f32(Brow, k, wt);
-            C[m * N + n] = (float)acc;
-        }
-    }
+    rocket_cpu_matmul_slice((const float *)src1->data, src0->data, src0->type,
+                            (float *)dst->data, M, N, K);
 }
 static bool rocket_cpu_forward_on(void) {
     static int v = -1; return rocket_env_int("ROCKET_CPU_FORWARD", &v) > 0;
@@ -3249,7 +3489,7 @@ static std::string rocket_weight_key(const ggml_tensor * t) {
 // (~22GB tiled) + GGUF (~22GB) coexistence fit under 32GB for prefill-only runs.
 static bool rocket_prepack_madvise_on(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("ROCKET_PREPACK_MADVISE"); v = e ? atoi(e) : 0; }
+    if (v < 0) v = rocket_knob_int("ROCKET_PREPACK_MADVISE", 0);
     return v > 0;
 }
 // True if `addr` lies in a FILE-BACKED mapping (a real backing file with a non-zero
@@ -3336,6 +3576,10 @@ static int ggml_backend_rocket_mul_mat_prepacked(
 
     const std::string key = rocket_weight_key(src0);
     if (key.empty()) return -1;               // no stable identity -> mt path
+    // Already resident inside a fused group's composite entry -> stream. Packing it again
+    // under its own name would hold the same weight twice, permanently (see
+    // wcache_fused_members); the streaming fallback is correct and costs only a per-call packB.
+    if (ctx->wcache_fused_members.count(key)) return -1;
     // Build (pack + cache + madvise) the resident weight, planning its tile layout at pack_m.
     // Returns the weight, or nullptr if the NPU's 32-bit IOVA window is full / over budget --
     // in which case the caller streams this weight via the per-call mt path. Once the window
@@ -3410,9 +3654,9 @@ static int ggml_backend_rocket_mul_mat_prepacked(
         if (it->second.K == K && it->second.N == N) {
             w = it->second.w;
         } else {                              // same buffer, different shape: re-pack
-            rocket_weights_free(ctx->dev, it->second.w);
-            ctx->resident_bytes -= it->second.bytes;
-            ctx->wcache.erase(it);
+            rocket_ctx * dev = ctx->dev;
+            rk_cache_evict(ctx->wcache, it, ctx->resident_bytes,
+                           [dev](rocket_weight_entry & e) { rocket_weights_free(dev, e.w); });
         }
     }
     if (!w) {
@@ -3434,14 +3678,15 @@ static int ggml_backend_rocket_mul_mat_prepacked(
         if (!(w = build_resident(Mp, b_src))) return -1;  // window full / over budget -> mt path
     }
 
-    std::vector<ggml_fp16_t> A16((size_t)Mp * K);   // value-initialized: pad rows = 0
-    std::vector<ggml_fp16_t> C16((size_t)Mp * N);
-    std::vector<float> scales((size_t)M);
-    rocket_pack_activations((const float *)src1->data, A16.data(), M, K, scales.data());
+    // Reused context scratch (see rk_scratch); A16's pad rows are cleared by the packer.
+    float       * scales = rk_scratch(ctx->scratch_scales, (size_t)M);
+    ggml_fp16_t * C16    = rk_scratch(ctx->scratch_C16, (size_t)Mp * N);
+    ggml_fp16_t * A16    = rocket_pack_activations_scratch(ctx->scratch_A16,
+                               (const float *)src1->data, M, Mp, K, scales);
 
     int rc = rocket_matmul_fp16_prepacked(ctx->dev, Mp, K, N,
-                reinterpret_cast<const _Float16 *>(A16.data()),
-                reinterpret_cast<_Float16 *>(C16.data()), w);
+                reinterpret_cast<const _Float16 *>(A16),
+                reinterpret_cast<_Float16 *>(C16), w);
 
     if (rc != 0) {
         // rc == -2: this compute M is smaller than the canonical resident tiling (a short-prompt
@@ -3471,7 +3716,7 @@ static int ggml_backend_rocket_mul_mat_prepacked(
     if (getenv("ROCKET_AB") && !ggml_is_quantized(src0->type)) {
         std::vector<ggml_fp16_t> Cmt((size_t)Mp * N);
         rocket_matmul_fp16_mt(Mp, (int)K, (int)N,
-            reinterpret_cast<const _Float16 *>(A16.data()),
+            reinterpret_cast<const _Float16 *>(A16),
             reinterpret_cast<const _Float16 *>(src0->data),
             reinterpret_cast<_Float16 *>(Cmt.data()), ctx->n_threads);
         double md = 0;
@@ -3501,9 +3746,9 @@ static int ggml_backend_rocket_mul_mat_prepacked(
             if (f) {
                 int hdr[4] = { (int)M, (int)K, (int)N, Mp };
                 fwrite(hdr, sizeof(int), 4, f);
-                fwrite(A16.data(),  sizeof(ggml_fp16_t), (size_t)Mp * K, f);
+                fwrite(A16,         sizeof(ggml_fp16_t), (size_t)Mp * K, f);
                 fwrite(src0->data,  sizeof(ggml_fp16_t), (size_t)N  * K, f);
-                fwrite(C16.data(),  sizeof(ggml_fp16_t), (size_t)Mp * N, f);  // in-context prepacked
+                fwrite(C16,         sizeof(ggml_fp16_t), (size_t)Mp * N, f);  // in-context prepacked
                 fwrite(Cmt.data(),  sizeof(ggml_fp16_t), (size_t)Mp * N, f);  // in-context mt
                 fclose(f);
                 GGML_LOG_DEBUG("[DUMP] wrote %s M=%d K=%d N=%d Mp=%d md=%.1f\n",
@@ -3516,7 +3761,7 @@ static int ggml_backend_rocket_mul_mat_prepacked(
     }
 #endif // ROCKET_DIAGNOSTICS
 
-    rocket_unpack_output(C16.data(), (float *)dst->data, M, N, scales.data());
+    rocket_unpack_output(C16, (float *)dst->data, M, N, scales);
     return 0;
 }
 
@@ -3565,7 +3810,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     // ROCKET_BF16 unset -- and for batched src1, or on a decline here -- bf16 weights
     // fall through to the fp16 streaming route below, which decodes bf16 to fp16 like
     // an F32 or quantized weight.
-    if (ctx->bf16_mode < 0) { const char * e = getenv("ROCKET_BF16"); ctx->bf16_mode = e ? atoi(e) : 0; }
+    if (ctx->bf16_mode < 0) ctx->bf16_mode = rocket_knob_int("ROCKET_BF16", 0);
     if (ctx->bf16_mode
         && !ggml_is_quantized(src0->type)   // quantized weights take the fp16 dequant path
         && src0->ne[2] == 1 && src0->ne[3] == 1
@@ -3585,8 +3830,8 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     // to the fp16 path below. Correctness-first bring-up (re-quants weights per call);
     // ROCKET_VERIFY=1 reports the per-op W8A8-vs-fp32 error (high max_rel localizes
     // the activation-outlier layers the Hadamard rotation must fix).
-    if (ctx->int8_mode < 0) { const char * e = getenv("ROCKET_INT8"); ctx->int8_mode = e ? atoi(e) : 0; }
-    if (ctx->int8_resident < 0) { const char * e = getenv("ROCKET_INT8_RESIDENT"); ctx->int8_resident = e ? atoi(e) : 0; }
+    if (ctx->int8_mode     < 0) ctx->int8_mode     = rocket_knob_int("ROCKET_INT8", 0);
+    if (ctx->int8_resident < 0) ctx->int8_resident = rocket_knob_int("ROCKET_INT8_RESIDENT", 0);
     // N%32 (int8 weight k-group) and K%32 (driver's int8 K-group) are the int8
     // shape contract. supports_op already gates K%32 for offloaded ops, but the
     // dispatch self-guards so a direct/edge caller can't reach rocket_matmul_int8
@@ -3623,8 +3868,8 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     // k-group is 64 (stricter than int8's N%32); K%32 as int8. Quantized src0 takes
     // the fp16 dequant path. A RAM/bandwidth play, not MAC-bound; W4A4 is a
     // hard quality regime, so it leans on ROCKET_INT4_HADAMARD + group-wise scales.
-    if (ctx->int4_mode < 0) { const char * e = getenv("ROCKET_INT4"); ctx->int4_mode = e ? atoi(e) : 0; }
-    if (ctx->int4_resident < 0) { const char * e = getenv("ROCKET_INT4_RESIDENT"); ctx->int4_resident = e ? atoi(e) : 0; }
+    if (ctx->int4_mode     < 0) ctx->int4_mode     = rocket_knob_int("ROCKET_INT4", 0);
+    if (ctx->int4_resident < 0) ctx->int4_resident = rocket_knob_int("ROCKET_INT4_RESIDENT", 0);
     if (ctx->int4_mode
         && !ggml_is_quantized(src0->type)   // quantized weights take the fp16 dequant path
         && (N % 64 == 0) && (K % 32 == 0)
@@ -3688,9 +3933,9 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     // resident combined-N weight = residency + fusion stacked). ROCKET_FORCE_PREPACK disables
     // fusion, so it residents every weight here individually.
     static int no_prepack = -1;
-    if (no_prepack < 0) { const char * e = getenv("ROCKET_NO_PREPACK"); no_prepack = e ? atoi(e) : 0; }
+    if (no_prepack < 0) no_prepack = rocket_knob_int("ROCKET_NO_PREPACK", 0);
     static int force_prepack = -1;
-    if (force_prepack < 0) { const char * e = getenv("ROCKET_FORCE_PREPACK"); force_prepack = e ? atoi(e) : 0; }
+    if (force_prepack < 0) force_prepack = rocket_knob_int("ROCKET_FORCE_PREPACK", 0);
     const bool cacheable = !no_prepack
         && (K <= 2048 || force_prepack || rocket_f16_resident_on())
         && (src0->type == GGML_TYPE_F16)
@@ -3714,16 +3959,13 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     const int64_t r3 = ne13 / ne03;
 
     const int64_t Mp = rocket_pad_m((int)M);   // pad rows to a multiple of 4
-    std::vector<ggml_fp16_t> A16((size_t)Mp * K);   // value-initialized: pad rows = 0
-    std::vector<float> scales((size_t)M);    // per-row activation scale
-    // C16 / B16 are reused context scratch (resize is a no-op once the high-water mark is
-    // reached, so the pages stay resident across the prefill -- no per-op re-fault). Both
-    // are fully written before read, so reuse is bit-identical to a fresh buffer.
-    ctx->scratch_C16.resize((size_t)Mp * N);
-    ggml_fp16_t * C16 = ctx->scratch_C16.data();
+    // All reused context scratch (see rk_scratch). A16's pad rows are cleared per call by
+    // rocket_pack_activations_scratch; C16 and B16 are fully written before they are read.
+    float       * scales = rk_scratch(ctx->scratch_scales, (size_t)M);   // per-row activation scale
+    ggml_fp16_t * C16    = rk_scratch(ctx->scratch_C16, (size_t)Mp * N);
     const bool b_is_f16 = (src0->type == GGML_TYPE_F16);
     ggml_fp16_t * B16 = nullptr;             // used when weights are F32 / BF16 / quantized
-    if (!b_is_f16) { ctx->scratch_B16.resize((size_t)N * K); B16 = ctx->scratch_B16.data(); }
+    if (!b_is_f16) B16 = rk_scratch(ctx->scratch_B16, (size_t)N * K);
 
     for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
@@ -3731,8 +3973,9 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
             const char * B_src = (const char *)src0->data + (i3 / r3) * nb03 + (i2 / r2) * nb02;
             char       * C_dst = (char *)dst->data + i3 * nb3 + i2 * nb2;
 
-            // A (input, F32) -> per-row scaled fp16 [M,K] (pad rows M..Mp-1 stay zero)
-            rocket_pack_activations((const float *)A_src, A16.data(), M, K, scales.data());
+            // A (input, F32) -> per-row scaled fp16 [Mp,K] (pad rows M..Mp-1 cleared)
+            ggml_fp16_t * A16 = rocket_pack_activations_scratch(ctx->scratch_A16,
+                                    (const float *)A_src, M, Mp, K, scales);
 
             // B (weights) -> fp16 [N,K]. F16 is zero-copy; F32 / BF16 / quantized
             // (Q8_0 / Q4_K / ...) are dequantized transiently into B16 -- the
@@ -3766,7 +4009,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
             // workers. On miss (disabled, cache full, or driver error) drop to the
             // per-call mt path; on its failure, to a CPU matmul.
             static int no_stream = -1;
-            if (no_stream < 0) { const char * e = getenv("ROCKET_NO_STREAM"); no_stream = e ? atoi(e) : 0; }
+            if (no_stream < 0) no_stream = rocket_knob_int("ROCKET_NO_STREAM", 0);
 
             int rc = -1;
             if (!no_stream && !ctx->stream_failed) {
@@ -3776,13 +4019,13 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
                 }
                 if (ctx->stream)
                     rc = rocket_matmul_fp16_stream(ctx->stream, (int)Mp, (int)K, (int)N,
-                            reinterpret_cast<const _Float16 *>(A16.data()),
+                            reinterpret_cast<const _Float16 *>(A16),
                             reinterpret_cast<const _Float16 *>(Bp),
                             reinterpret_cast<_Float16 *>(C16));
             }
             if (rc != 0)
                 rc = rocket_matmul_fp16_mt((int)Mp, (int)K, (int)N,
-                        reinterpret_cast<const _Float16 *>(A16.data()),
+                        reinterpret_cast<const _Float16 *>(A16),
                         reinterpret_cast<const _Float16 *>(Bp),
                         reinterpret_cast<_Float16 *>(C16),
                         ctx->n_threads);
@@ -3799,7 +4042,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
             }
 
             // C fp16 [M,N] -> dst F32, undoing the per-row activation scale
-            rocket_unpack_output(C16, (float *)C_dst, M, N, scales.data());
+            rocket_unpack_output(C16, (float *)C_dst, M, N, scales);
         }
     }
     rocket_mul_mat_post(dst, "mt");
@@ -3826,17 +4069,24 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
 static bool rocket_fuse_on(void) {
     static int v = -1;
     if (v < 0) {
-        const char * nf = getenv("ROCKET_NO_FUSE");
-        const char * ns = getenv("ROCKET_NO_STREAM");      // fusion needs the stream path
-        const char * fp = getenv("ROCKET_FORCE_PREPACK");  // prepacked fusion is deferred
-        const char * i8 = getenv("ROCKET_INT8");           // int8 routes via the single-node path
+        // The fused path is fp16-only, so EVERY knob that selects a different precision has
+        // to turn it off -- otherwise the group runner claims the fusable projections (Q/K/V,
+        // gate/up) in fp16 and the selected precision reaches only the matmuls that happen not
+        // to be in a group (o_proj, ffn_down, lm_head). That is not a slow run, it is a
+        // MIS-DESCRIBED one: an "int4 run" whose RAM footprint and quality numbers are mostly
+        // fp16's. int8 and int4 both route through the single-node dispatch; bf16 declines
+        // inside the group runner instead, because its knob is read per context.
+        //
         // ROCKET_F16_RESIDENT keeps fusion ON: the group runner routes each fusable group
         // through ggml_backend_rocket_mul_mat_group_resident (one resident combined-N weight),
         // which stacks residency's pack-B-once win with fusion's shared pack-A + single submit.
-        // (ROCKET_FORCE_PREPACK -- the 2GB diagnostic -- still turns fusion off via `fp`, staying
-        // on the per-node resident path.) ROCKET_NO_FUSE=1 forces per-node for a clean A/B.
-        v = ((nf ? atoi(nf) : 0) == 0 && (ns ? atoi(ns) : 0) == 0
-             && (fp ? atoi(fp) : 0) == 0 && (i8 ? atoi(i8) : 0) == 0) ? 1 : 0;
+        // (ROCKET_FORCE_PREPACK -- the 2GB diagnostic -- still turns fusion off, staying on the
+        // per-node resident path.) ROCKET_NO_FUSE=1 forces per-node for a clean A/B.
+        v = (   rocket_knob_int("ROCKET_NO_FUSE", 0)       == 0
+             && rocket_knob_int("ROCKET_NO_STREAM", 0)     == 0   // fusion needs the stream path
+             && rocket_knob_int("ROCKET_FORCE_PREPACK", 0) == 0   // prepacked fusion is deferred
+             && rocket_knob_int("ROCKET_INT8", 0)          == 0
+             && rocket_knob_int("ROCKET_INT4", 0)          == 0) ? 1 : 0;
     }
     return v > 0;
 }
@@ -3887,7 +4137,7 @@ static int ggml_backend_rocket_mul_mat_group(ggml_backend_rocket_context * ctx,
     // bf16 has no fused path yet -> decline so each member runs individually through
     // ggml_backend_rocket_mul_mat (the bf16 branch). Keeps ROCKET_BF16 all-bf16
     // without the caller needing ROCKET_NO_FUSE.
-    if (ctx->bf16_mode < 0) { const char * e = getenv("ROCKET_BF16"); ctx->bf16_mode = e ? atoi(e) : 0; }
+    if (ctx->bf16_mode < 0) ctx->bf16_mode = rocket_knob_int("ROCKET_BF16", 0);
     if (ctx->bf16_mode) return -1;
 
     // Resident-fused: with ROCKET_F16_RESIDENT on, pack the group into one resident
@@ -3910,10 +4160,11 @@ static int ggml_backend_rocket_mul_mat_group(ggml_backend_rocket_context * ctx,
     const int64_t M  = src1->ne[1];
     const int     Mp = rocket_pad_m((int)M);
 
-    // Pack the shared activation ONCE (per-row scaled fp16; pad rows stay zero).
-    std::vector<ggml_fp16_t> A16((size_t)Mp * K);
-    std::vector<float>       scales((size_t)M);
-    rocket_pack_activations((const float *)src1->data, A16.data(), M, K, scales.data());
+    // Pack the shared activation ONCE (per-row scaled fp16; pad rows cleared). Reused
+    // context scratch -- the group's buffers are the largest this backend touches.
+    float       * scales = rk_scratch(ctx->scratch_scales, (size_t)M);
+    ggml_fp16_t * A16    = rocket_pack_activations_scratch(ctx->scratch_A16,
+                               (const float *)src1->data, M, Mp, K, scales);
 
     // Lay out the group's weights along the combined N.
     const _Float16 * Bs[ROCKET_MAX_FUSE];
@@ -3926,18 +4177,18 @@ static int ggml_backend_rocket_mul_mat_group(ggml_backend_rocket_context * ctx,
         Ntot += w->ne[1];
     }
 
-    std::vector<ggml_fp16_t> C16((size_t)Mp * Ntot);
+    ggml_fp16_t * C16 = rk_scratch(ctx->scratch_C16, (size_t)Mp * Ntot);
     int rc = rocket_matmul_fp16_stream_fused(ctx->stream, Mp, (int)K, Bs, Ns, ng,
-                reinterpret_cast<const _Float16 *>(A16.data()),
-                reinterpret_cast<_Float16 *>(C16.data()));
+                reinterpret_cast<const _Float16 *>(A16),
+                reinterpret_cast<_Float16 *>(C16));
     if (rc != 0) return rc;                            // nothing written -> caller falls back
 
     // Split the combined [M, Ntot] output into each member's own dst (per-row
     // unscale), honouring each dst separately so its consumers see what they expect.
     int64_t col0 = 0;
     for (int i = 0; i < ng; i++) {
-        rocket_unpack_output_seg(C16.data(), Ntot, col0,
-                                 (float *)nodes[i]->data, M, Ns[i], scales.data());
+        rocket_unpack_output_seg(C16, Ntot, col0,
+                                 (float *)nodes[i]->data, M, Ns[i], scales);
         col0 += Ns[i];
         rocket_mul_mat_post(nodes[i], "fused");
     }
@@ -3953,17 +4204,18 @@ static int ggml_backend_rocket_mul_mat_group(ggml_backend_rocket_context * ctx,
 // group runner tries it first, then falls back to the streaming-fused path on decline).
 //
 // The combined resident weight is BYTE-IDENTICAL to the streaming-fused layout: both scatter
-// the concatenated [Ntot,K] weight into the driver's (N/16,K/32,16,32) tiles
-// (rocket_weights_pack on a host concat == mm_pack_weights_seg on the segments), so greedy
-// output matches the streaming path. The concat buffer is transient (copied into the resident
-// BOs by rocket_weights_pack, freed on return); the resident weight bytes equal the sum of the
-// members' bytes, i.e. no extra RAM over residenting them individually.
+// the concatenated [Ntot,K] weight into the driver's (N/16,K/32,16,32) tiles through the SAME
+// segmented scatter (rocket_weights_pack_seg here, mm_pack_weights_seg inside the stream), so
+// greedy output matches the streaming path. Neither materializes a host [Ntot,K] concat; the
+// resident weight bytes equal the sum of the members' bytes, i.e. no extra RAM over
+// residenting them individually.
 //
 // Returns 0 (all members' dst written) or <0 to fall back cleanly (nothing written): small
 // one-shot M (< max_tile), over budget / IOVA full / MemAvailable floor, no stable weight
 // identity, or a driver failure.
 static int ggml_backend_rocket_mul_mat_group_resident(
         ggml_backend_rocket_context * ctx, ggml_tensor ** nodes, int ng) {
+    if (ng < 1 || ng > ROCKET_MAX_FUSE) return -1;   // the segment arrays below are that wide
     if (ctx->dev_failed) return -1;
     if (!ctx->dev) {
         ctx->dev = rocket_ctx_create(ctx->n_threads);
@@ -3978,12 +4230,15 @@ static int ggml_backend_rocket_mul_mat_group_resident(
     // Composite key = the members' stable weight names joined by '|'. Any member without a
     // stable identity (empty key -- e.g. a ggml auto-name) makes the whole group uncacheable.
     std::string key;
+    std::vector<std::string> member_keys;
     int64_t Ntot = 0;
+    member_keys.reserve((size_t)ng);
     for (int i = 0; i < ng; i++) {
-        const std::string mk = rocket_weight_key(nodes[i]->src[0]);
+        std::string mk = rocket_weight_key(nodes[i]->src[0]);
         if (mk.empty()) return -1;
         if (i) key += '|';
         key += mk;
+        member_keys.push_back(std::move(mk));
         Ntot += nodes[i]->src[0]->ne[1];
     }
 
@@ -3993,9 +4248,10 @@ static int ggml_backend_rocket_mul_mat_group_resident(
         if (it->second.K == (int)K && it->second.N == (int)Ntot) {
             w = it->second.w;
         } else {                                      // composite shape drift: re-pack
-            rocket_weights_free(ctx->dev, it->second.w);
-            ctx->resident_bytes -= it->second.bytes;
-            ctx->wcache.erase(it);
+            rocket_ctx * dev = ctx->dev;
+            rk_cache_evict(ctx->wcache, it, ctx->resident_bytes,
+                           [dev](rocket_weight_entry & e) { rocket_weights_free(dev, e.w); });
+            for (const std::string & mk : member_keys) ctx->wcache_fused_members.erase(mk);
         }
     }
     if (!w) {
@@ -4010,42 +4266,46 @@ static int ggml_backend_rocket_mul_mat_group_resident(
             const size_t avail = rocket_meminfo_bytes("MemAvailable");
             if (avail && avail < ctx->resident_floor_bytes) { ctx->dev_resident_full = true; return -1; }
         }
-        // Concatenate the members' fp16 weights into one [Ntot,K] buffer (member i's ne[1]*K
-        // fp16 rows, back to back). All members are F16 + contiguous (rocket_node_fusable).
-        std::vector<ggml_fp16_t> comb((size_t)Ntot * K);
-        size_t off = 0;
+        // The driver scatters each member straight into its global-N slice of the resident
+        // weight BO, so there is NO host [Ntot,K] concat buffer -- which at a gate|up group
+        // on an 8B model is a couple of hundred MB of transient allocation per group, on a
+        // board this file works hard to keep off the OOM line. All members are F16 and
+        // contiguous (rocket_node_fusable), which is what lets the pointers be handed over.
+        const _Float16 * Bs[ROCKET_MAX_FUSE];
+        int              Ns[ROCKET_MAX_FUSE];
         for (int i = 0; i < ng; i++) {
-            const ggml_tensor * a = nodes[i]->src[0];
-            const size_t nb = (size_t)a->ne[1] * K;
-            memcpy(comb.data() + off, a->data, nb * sizeof(ggml_fp16_t));
-            off += nb;
+            Bs[i] = reinterpret_cast<const _Float16 *>(nodes[i]->src[0]->data);
+            Ns[i] = (int)nodes[i]->src[0]->ne[1];
         }
-        w = rocket_weights_pack(ctx->dev, Mp, (int)K, (int)Ntot,
-                                reinterpret_cast<const _Float16 *>(comb.data()));
+        w = rocket_weights_pack_seg(ctx->dev, Mp, (int)K, (int)Ntot, Bs, Ns, ng);
         if (!w) { ctx->dev_resident_full = true; return -1; }  // IOVA/alloc full -> stream the rest
         rocketraii::scope_guard w_guard([&] { rocket_weights_free(ctx->dev, w); });
         ctx->wcache[key] = { w, Mp, (int)K, (int)Ntot, est };
         w_guard.dismiss();
         ctx->resident_bytes += est;
+        // Claim the members: each is now resident inside this composite, so the per-node
+        // prepacked path must not pack it a second time under its own name.
+        for (const std::string & mk : member_keys) ctx->wcache_fused_members.insert(mk);
     }
 
-    // One shared activation pack (per-row scaled fp16, pad rows zero) + one combined compute.
-    std::vector<ggml_fp16_t> A16((size_t)Mp * K);
-    std::vector<ggml_fp16_t> C16((size_t)Mp * Ntot);
-    std::vector<float>       scales((size_t)M);
-    rocket_pack_activations((const float *)src1->data, A16.data(), (int)M, (int)K, scales.data());
+    // One shared activation pack (per-row scaled fp16, pad rows cleared) + one combined
+    // compute, out of reused context scratch (see rk_scratch).
+    float       * scales = rk_scratch(ctx->scratch_scales, (size_t)M);
+    ggml_fp16_t * C16    = rk_scratch(ctx->scratch_C16, (size_t)Mp * Ntot);
+    ggml_fp16_t * A16    = rocket_pack_activations_scratch(ctx->scratch_A16,
+                               (const float *)src1->data, (int)M, Mp, (int)K, scales);
 
     int rc = rocket_matmul_fp16_prepacked(ctx->dev, Mp, (int)K, (int)Ntot,
-                reinterpret_cast<const _Float16 *>(A16.data()),
-                reinterpret_cast<_Float16 *>(C16.data()), w);
+                reinterpret_cast<const _Float16 *>(A16),
+                reinterpret_cast<_Float16 *>(C16), w);
     if (rc != 0) return -1;   // rc==-2 (M below resident tiling) or driver fail -> stream-fused
 
     // Split the combined [M, Ntot] output back into each member's own dst (per-row unscale).
     int64_t col0 = 0;
     for (int i = 0; i < ng; i++) {
         const int64_t Ni = nodes[i]->src[0]->ne[1];
-        rocket_unpack_output_seg(C16.data(), Ntot, col0,
-                                 (float *)nodes[i]->data, M, Ni, scales.data());
+        rocket_unpack_output_seg(C16, Ntot, col0,
+                                 (float *)nodes[i]->data, M, Ni, scales);
         col0 += Ni;
         rocket_mul_mat_post(nodes[i], "fused-resident");
     }
@@ -4136,6 +4396,7 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
             for (auto & q : kv.second.ch)
                 if (q.wbo) { rocket_rk3576_wbo_free(ctx->rk76_fd, q.wbo); q.wbo = nullptr; }
         rocket_rk3576_bo_pool_drain(ctx->rk76_fd);
+        rocket_close(ctx->rk76_fd);
     }
     delete ctx;
     delete backend;
@@ -4199,40 +4460,63 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     // Gather the op's strided/permuted operands into dense head-major fp16 tiles.
     const bool fatiming = rocket_fatiming_on();
     const double t_g0 = fatiming ? rocket_now_ms() : 0.0;
-    std::vector<ggml_fp16_t> Qd((size_t)n_head     * n_tokens * head_dim);   // [n_head][n_tokens][dk]
-    std::vector<ggml_fp16_t> Kd((size_t)n_kv_heads * n_kv     * head_dim);   // [n_kv_heads][n_kv][dk]
-    std::vector<ggml_fp16_t> Vd((size_t)n_kv_heads * dv       * n_kv);       // [n_kv_heads][dv][n_kv]
-    std::vector<ggml_fp16_t> Md((size_t)n_tokens   * n_kv);
-    std::vector<ggml_fp16_t> Od((size_t)n_head     * n_tokens * dv);         // [n_head][n_tokens][dv]
+    ggml_fp16_t * Qd = rk_scratch(ctx->fa_Qd, (size_t)n_head     * n_tokens * head_dim); // [n_head][n_tokens][dk]
+    ggml_fp16_t * Kd = rk_scratch(ctx->fa_Kd, (size_t)n_kv_heads * n_kv     * head_dim); // [n_kv_heads][n_kv][dk]
+    ggml_fp16_t * Vd = rk_scratch(ctx->fa_Vd, (size_t)n_kv_heads * dv       * n_kv);     // [n_kv_heads][dv][n_kv]
+    ggml_fp16_t * Md = rk_scratch(ctx->fa_Md, (size_t)n_tokens   * n_kv);
+    ggml_fp16_t * Od = rk_scratch(ctx->fa_Od, (size_t)n_head     * n_tokens * dv);       // [n_head][n_tokens][dv]
 
     const char * qb = (const char *)q->data;
     for (int h = 0; h < n_head; h++)
         for (int t = 0; t < n_tokens; t++) {
-            ggml_fp16_t * dstrow = Qd.data() + ((size_t)h * n_tokens + t) * head_dim;
+            ggml_fp16_t * dstrow = Qd + ((size_t)h * n_tokens + t) * head_dim;
             const char * src = qb + (size_t)t*q->nb[1] + (size_t)h*q->nb[2];
             for (int c = 0; c < head_dim; c++)   // Q is F32
                 dstrow[c] = ggml_fp32_to_fp16(*(const float *)(src + (size_t)c*q->nb[0]));
         }
-    const char * kb = (const char *)k->data;   // K F16 -> [n_kv_heads][n_kv][head_dim]
+    // K: [n_kv_heads][n_kv][head_dim]. In the normal KV-cache view a row IS contiguous
+    // (nb[0] == 2), so the walk is a memcpy; the strided loop stays as the general case,
+    // because the cache view is a promise about llama.cpp's graph and not about the op.
+    const char * kb = (const char *)k->data;
+    const bool k_row_contig = (k->nb[0] == sizeof(ggml_fp16_t));
     for (int hk = 0; hk < n_kv_heads; hk++)
         for (int j = 0; j < n_kv; j++) {
-            ggml_fp16_t * dstrow = Kd.data() + ((size_t)hk * n_kv + j) * head_dim;
+            ggml_fp16_t * dstrow = Kd + ((size_t)hk * n_kv + j) * head_dim;
             const char * src = kb + (size_t)j*k->nb[1] + (size_t)hk*k->nb[2];
+            if (k_row_contig) { memcpy(dstrow, src, (size_t)head_dim * sizeof(ggml_fp16_t)); continue; }
             for (int c = 0; c < head_dim; c++)
                 dstrow[c] = *(const ggml_fp16_t *)(src + (size_t)c*k->nb[0]);
         }
-    const char * vb = (const char *)v->data;   // V F16 -> [n_kv_heads][dv][n_kv]
-    for (int hk = 0; hk < n_kv_heads; hk++)
-        for (int c = 0; c < dv; c++) {
-            ggml_fp16_t * dstrow = Vd.data() + ((size_t)hk * dv + c) * n_kv;
-            const char * src = vb + (size_t)c*v->nb[0] + (size_t)hk*v->nb[2];
-            for (int j = 0; j < n_kv; j++)
-                dstrow[j] = *(const ggml_fp16_t *)(src + (size_t)j*v->nb[1]);
+    // V: [n_kv_heads][dv][n_kv] -- a genuine TRANSPOSE of the cache layout, so there is no
+    // contiguous run to copy either way. Walk it in cache-friendly blocks instead: reading
+    // BLK source rows at a time keeps the destination writes inside one set of cache lines
+    // per column block rather than touching dv distinct lines per element.
+    const char * vb = (const char *)v->data;
+    const int VBLK = 32;
+    for (int hk = 0; hk < n_kv_heads; hk++) {
+        const char  * vh = vb + (size_t)hk*v->nb[2];
+        ggml_fp16_t * vd = Vd + (size_t)hk * dv * n_kv;
+        for (int j0 = 0; j0 < n_kv; j0 += VBLK) {
+            const int j1 = (j0 + VBLK < n_kv) ? j0 + VBLK : n_kv;
+            for (int c = 0; c < dv; c++) {
+                ggml_fp16_t * dstrow = vd + (size_t)c * n_kv;
+                const char  * src    = vh + (size_t)c*v->nb[0];
+                for (int j = j0; j < j1; j++)
+                    dstrow[j] = *(const ggml_fp16_t *)(src + (size_t)j*v->nb[1]);
+            }
         }
-    const char * mb = (const char *)m->data;   // mask F16 [n_kv, n_tokens] -> [n_tokens][n_kv]
+    }
+    // mask: [n_kv, n_tokens] -> [n_tokens][n_kv]. supports_op requires ggml_is_contiguous(m),
+    // so nb[0] is 2 for every op the scheduler places here and the whole row is one memcpy.
+    // The strided walk stays as the general case rather than becoming an assert: this
+    // handler is reachable directly, and degrading to a slower correct copy beats aborting
+    // the host process over a shape the gate would have refused.
+    const char * mb = (const char *)m->data;
+    const bool m_row_contig = (m->nb[0] == sizeof(ggml_fp16_t));
     for (int t = 0; t < n_tokens; t++) {
-        ggml_fp16_t * dstrow = Md.data() + (size_t)t * n_kv;
+        ggml_fp16_t * dstrow = Md + (size_t)t * n_kv;
         const char * src = mb + (size_t)t*m->nb[1];
+        if (m_row_contig) { memcpy(dstrow, src, (size_t)n_kv * sizeof(ggml_fp16_t)); continue; }
         for (int j = 0; j < n_kv; j++)
             dstrow[j] = *(const ggml_fp16_t *)(src + (size_t)j*m->nb[0]);
     }
@@ -4247,26 +4531,44 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     int rc = ctx->fa_ctx
         ? rocket_flash_attn_fp16_ctx(ctx->fa_ctx, n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
                                     scale, softcap,
-                                    reinterpret_cast<const _Float16 *>(Qd.data()),
-                                    reinterpret_cast<const _Float16 *>(Kd.data()),
-                                    reinterpret_cast<const _Float16 *>(Vd.data()),
-                                    reinterpret_cast<const _Float16 *>(Md.data()),
-                                    reinterpret_cast<_Float16 *>(Od.data()))
+                                    reinterpret_cast<const _Float16 *>(Qd),
+                                    reinterpret_cast<const _Float16 *>(Kd),
+                                    reinterpret_cast<const _Float16 *>(Vd),
+                                    reinterpret_cast<const _Float16 *>(Md),
+                                    reinterpret_cast<_Float16 *>(Od))
         : rocket_flash_attn_fp16_mt(use_fd, n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
                                     scale, softcap,
-                                    reinterpret_cast<const _Float16 *>(Qd.data()),
-                                    reinterpret_cast<const _Float16 *>(Kd.data()),
-                                    reinterpret_cast<const _Float16 *>(Vd.data()),
-                                    reinterpret_cast<const _Float16 *>(Md.data()),
-                                    reinterpret_cast<_Float16 *>(Od.data()), ctx->n_threads);
+                                    reinterpret_cast<const _Float16 *>(Qd),
+                                    reinterpret_cast<const _Float16 *>(Kd),
+                                    reinterpret_cast<const _Float16 *>(Vd),
+                                    reinterpret_cast<const _Float16 *>(Md),
+                                    reinterpret_cast<_Float16 *>(Od), ctx->n_threads);
+    // Degrade rather than abort, as the two sibling offloads do (MUL_MAT degrades the slice,
+    // MUL_MAT_ID the expert). A driver error here -- a cold-start fence-wait timeout, say --
+    // otherwise kills the whole inference, and only when it lands on attention. The operands
+    // are already gathered into exactly the dense fp16 tiles the host reference wants, and it
+    // is the same reference rocket_flash_attn_fp16_mt itself falls back to when it has no fd,
+    // so this is one slow-but-correct layer instead of a failed graph.
+    if (rc != 0) {
+        GGML_LOG_WARN("%s: NPU attention failed (rc=%d) at n_tokens=%d n_kv=%d -- this layer "
+                      "falls back to the host reference\n", __func__, rc, n_tokens, n_kv);
+        rocket_flash_attn_ref_fp16(n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
+                                   scale, softcap,
+                                   reinterpret_cast<const _Float16 *>(Qd),
+                                   reinterpret_cast<const _Float16 *>(Kd),
+                                   reinterpret_cast<const _Float16 *>(Vd),
+                                   reinterpret_cast<const _Float16 *>(Md),
+                                   reinterpret_cast<_Float16 *>(Od));
+    }
+    // After the fallback, so a degraded layer's host reference is charged to the COMPUTE
+    // bucket rather than to the scatter it precedes.
     const double t_c1 = fatiming ? rocket_now_ms() : 0.0;
-    if (rc != 0) return rc;
 
     // scatter Od [n_head][n_tokens][dv] -> dst F32 [dv, n_head, n_tokens]
     char * db = (char *)dst->data;
     for (int t = 0; t < n_tokens; t++)
         for (int h = 0; h < n_head; h++) {
-            const ggml_fp16_t * srcrow = Od.data() + ((size_t)h * n_tokens + t) * dv;
+            const ggml_fp16_t * srcrow = Od + ((size_t)h * n_tokens + t) * dv;
             char * dr = db + (size_t)h*dst->nb[1] + (size_t)t*dst->nb[2];
             for (int c = 0; c < dv; c++)
                 *(float *)(dr + (size_t)c*dst->nb[0]) = ggml_fp16_to_fp32(srcrow[c]);
@@ -4435,16 +4737,8 @@ static bool rk_moe_ingest_generic_row(const void * W_src, ggml_type wt, int64_t 
 
     int8_t * qrow = qB      + (size_t)n * K;
     float  * srow = b_scale + (size_t)n * nG;
-    for (int g = 0; g < nG; g++) {
-        const float * src = frow + (size_t)g * group;
-        float amax = 0.0f;
-        for (int k = 0; k < group; k++) { const float v = fabsf(src[k]); if (v > amax) amax = v; }
-        const float s   = (amax > 0.0f) ? amax / 127.0f : 1.0f;
-        const float inv = 1.0f / s;
-        int8_t * d = qrow + (size_t)g * group;
-        for (int k = 0; k < group; k++) d[k] = rocket_q8(src[k], inv);
-        srow[g] = s;
-    }
+    for (int g = 0; g < nG; g++)
+        srow[g] = rk_quant_row<127>(frow + (size_t)g * group, qrow + (size_t)g * group, group);
     return true;
 }
 
@@ -4493,39 +4787,11 @@ static bool rocket_moe_ingest_int8(const void * W_src, ggml_type wt, int64_t N, 
 //
 // This is the LAST host cost on the native-quant path: the weight ingest is one-time and
 // the per-K-group weight scale fuses into the readback loop the integer partials already
-// force (+0.6%, measured). Hence the NEON. The float pre-clamp to +/-127 makes the
-// saturating narrows exact and keeps this bit-identical to the scalar tail: values already
-// satisfy |x*inv| <= 127 by construction (inv = 127/amax), and vcvtnq_s32_f32 rounds
-// ties-to-even exactly as lrintf does under the default rounding mode.
+// force (+0.6%, measured). Hence the lane kernels -- a K-group is a contiguous run, so it
+// is the same max-abs -> scale -> quantize rk_quant_row does for a whole row.
 static inline void rk_quant_act_i8_group(const float * src, int8_t * dst, int group,
                                          float * pscale) {
-    float amax = 0.0f;
-    int k = 0;
-#ifdef ROCKET_NEON_F32
-    float32x4_t vmax = vdupq_n_f32(0.0f);
-    for (; k + 4 <= group; k += 4) vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(src + k)));
-    amax = vmaxvq_f32(vmax);
-#endif
-    for (; k < group; k++) { const float v = fabsf(src[k]); if (v > amax) amax = v; }
-
-    const float s   = (amax > 0.0f) ? amax / 127.0f : 1.0f;
-    const float inv = 1.0f / s;
-    *pscale = s;
-
-    k = 0;
-#ifdef ROCKET_NEON_F32
-    const float32x4_t vinv = vdupq_n_f32(inv);
-    const float32x4_t vhi  = vdupq_n_f32(127.0f), vlo = vdupq_n_f32(-127.0f);
-    auto q4 = [&](const float * p) {
-        return vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(p), vinv), vlo), vhi));
-    };
-    for (; k + 16 <= group; k += 16) {
-        const int16x8_t s0 = vcombine_s16(vqmovn_s32(q4(src + k     )), vqmovn_s32(q4(src + k +  4)));
-        const int16x8_t s1 = vcombine_s16(vqmovn_s32(q4(src + k +  8)), vqmovn_s32(q4(src + k + 12)));
-        vst1q_s8(dst + k, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
-    }
-#endif
-    for (; k < group; k++) dst[k] = rocket_q8(src[k], inv);
+    *pscale = rk_quant_row<127>(src, dst, group);   // a group is a contiguous run, like a row
 }
 
 // A[M,K] f32 -> int8 [M,K] + per-(row, K-group) scale a_scale[m*nG + g]. Rows are
@@ -4710,11 +4976,14 @@ static const rocket_moe_i8_expert * rocket_moe_expert_resident(
     if (it != ctx->moe_i8_cache.end()) {
         if (it->second.K == K && it->second.N == N && it->second.group == group)
             return &it->second;                        // reused across every M (M-independent)
-        rocket_i8_weights_free(ctx->i8_dev, it->second.w);   // genuine shape/group change
-        ctx->moe_i8_resident_bytes -= it->second.bytes;
-        ctx->moe_charged_bytes     -= it->second.charged;
+        // Genuine shape/group change. The expert cache charges a SECOND counter (the
+        // mmapped GGUF bytes that must stay resident beside the codes), so that one is
+        // uncharged here rather than inside the shared helper.
+        ctx->moe_charged_bytes -= it->second.charged;
         ctx->moe_n_resident--;
-        ctx->moe_i8_cache.erase(it);
+        rocket_i8_ctx * dev = ctx->i8_dev;
+        rk_cache_evict(ctx->moe_i8_cache, it, ctx->moe_i8_resident_bytes,
+                       [dev](rocket_moe_i8_expert & ent) { rocket_i8_weights_free(dev, ent.w); });
     }
     if (ctx->moe_i8_full) { ctx->moe_streamed_keys.insert(key); return nullptr; }
 
@@ -4928,17 +5197,8 @@ static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggm
     // scale) into each row's dst[:, slot, tok]. Shared by the NPU and fallback paths.
     auto scatter_fp16 = [&](const ggml_fp16_t * C16, int64_t r0, int64_t M_e) {
         for (int64_t r = 0; r < M_e; r++) {
-            const float s = ctx->moe_scales[r];
-            const ggml_fp16_t * srow = C16 + (size_t)r * N;
             float * drow = (float *)((char *)dst->data + tok[r0 + r] * nb_d_tok + slot[r0 + r] * nb_d_slot);
-            int64_t n = 0;
-#ifdef ROCKET_NEON_FP16
-            const float32x4_t vs = vdupq_n_f32(s);
-            const __fp16 * sh = (const __fp16 *)srow;
-            for (; n + 4 <= N; n += 4)
-                vst1q_f32(drow + n, vmulq_f32(vcvt_f32_f16(vld1_f16(sh + n)), vs));
-#endif
-            for (; n < N; n++) drow[n] = ggml_fp16_to_fp32(srow[n]) * s;
+            rk_unpack_row(C16 + (size_t)r * N, drow, N, ctx->moe_scales[r]);
         }
     };
     // Scatter a [M_e,N] f32 CPU-fallback result (no scale; computed from raw inputs).
@@ -5284,11 +5544,41 @@ static ggml_guid_t ggml_backend_rocket_guid(void) {
 static const char * ggml_backend_rocket_device_get_name(ggml_backend_dev_t dev) {
     (void)dev; return "ROCKET";
 }
+// The part is DETECTED, not compiled in -- rocket_hw_current() is what the matmul dispatch
+// branches on -- so this is where llama.cpp's device list learns which SoC it is actually
+// running on. Formatted once into a static: the return type is a borrowed pointer with no
+// lifetime, and the profile does not change under a running process.
 static const char * ggml_backend_rocket_device_get_description(ggml_backend_dev_t dev) {
-    (void)dev; return "RK3588 NPU (mainline rocket driver)";
+    (void)dev;
+    static char desc[64];
+    if (!desc[0]) {
+        const struct rocket_hw_profile * hw = rocket_hw_current();
+        char part[16] = "Rockchip";
+        if (hw && hw->name) {   // the profile spells it "rk3588"; the device list wants "RK3588"
+            size_t i = 0;
+            for (; i + 1 < sizeof(part) && hw->name[i]; i++) part[i] = (char)toupper((unsigned char)hw->name[i]);
+            part[i] = '\0';
+        }
+        snprintf(desc, sizeof(desc), "%s NPU (mainline rocket driver)", part);
+    }
+    return desc;
 }
+// The NPU has no private memory -- it computes out of system DRAM through mapped BOs.
+// Reporting 0/0 is not the neutral answer it looks like: llama.cpp's device auto-fit reads
+// memory_free, concludes nothing fits, and prints "failed to fit params to free device
+// memory ... abort" before falling back to the normal path and running correctly anyway.
+// Report what the device can actually use. MemAvailable counts the mmapped GGUF's
+// reclaimable pages as free, which is the right answer for a backend whose weights ARE
+// host pages. If /proc/meminfo is unreadable there is nothing honest to report, so the
+// zeroes stand.
 static void ggml_backend_rocket_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    (void)dev; *free = 0; *total = 0;   // NPU uses system DRAM; not separately tracked
+    (void)dev;
+    const char * fields[2] = { "MemTotal", "MemAvailable" };
+    size_t v[2];
+    rocket_meminfo_read(fields, v, 2);   // one pass over /proc/meminfo, not two
+    *total = v[0];
+    *free  = v[1];
+    if (*free > *total) *free = *total;   // MemAvailable is an estimate, not a subset by construction
 }
 static enum ggml_backend_dev_type ggml_backend_rocket_device_get_type(ggml_backend_dev_t dev) {
     (void)dev; return GGML_BACKEND_DEVICE_TYPE_ACCEL;
@@ -5297,6 +5587,7 @@ static void ggml_backend_rocket_device_get_props(ggml_backend_dev_t dev, ggml_ba
     props->name        = ggml_backend_rocket_device_get_name(dev);
     props->description  = ggml_backend_rocket_device_get_description(dev);
     props->type         = ggml_backend_rocket_device_get_type(dev);
+    props->device_id    = nullptr;   // no PCI/UUID identity to report; the caller may not have zeroed it
     ggml_backend_rocket_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ false,
@@ -5458,6 +5749,21 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             const ggml_tensor * v = op->src[2];
             const ggml_tensor * m = op->src[3];
             if (!rocket_flash_attn_on() || !q || !k || !v || !m) return false;
+            // NOT ON THE RK3576. Every compute path in the handler goes through
+            // rocket_flash_attn_fp16*, and every path in THAT goes through
+            // rocket_matmul_fp16, which refuses on any profile that is not rk3588 -- the
+            // attention primitive has no encoder for this part. Claiming the op would hand
+            // the scheduler something only the host reference can compute: correct, but
+            // single-threaded and slower than the CPU backend's own kernel, and the
+            // scheduler has nowhere else to put it once we have claimed it.
+            //
+            // This gate was ported to the RK3576 by not being touched. At a prompt of 512
+            // the n_kv floor kept it out of reach, which is why the whole W8A8 corpus ran;
+            // past ~1024 of context it fired, and llama.cpp returned `res = -3` with the
+            // explanation swallowed by llama-bench's no-op ggml log callback. Declining is
+            // what ROCKET_FLASH_ATTN=0 already did by hand, and it is the configuration
+            // every RK3576 number on that route was measured under.
+            if (rocket_rk3576_selected()) return false;
             // ATTENTION SINKS (src[4]) — DECLINE. A sink is a learned per-head logit that joins
             // the softmax denominator: softmax over [scale*QK^T + mask, sink] rather than over
             // the scores alone. The handler computes softmax(scale*QK^T + mask) and carries no
@@ -5673,20 +5979,52 @@ static bool rocket_parse_mb_budget(const char * e, size_t * out_bytes) {
 
 // Read one "Field: N kB" line from /proc/meminfo into bytes. 0 if unreadable / absent,
 // which the caller treats as "signal unavailable" (falls back to the fixed default budget).
-static size_t rocket_meminfo_bytes(const char * field) {
+// Read several "Field: N kB" lines in ONE pass. The resident-weight admission asks for
+// MemAvailable once per candidate weight while the resident set is filling, and the
+// auto-budget rule wants MemTotal and MemAvailable together -- so the two-field caller
+// reads the file once rather than twice, and neither re-scans it per field.
+// `out[i]` is left at 0 for a field the file does not carry.
+static void rocket_meminfo_read(const char * const * fields, size_t * out, int n) {
+    for (int i = 0; i < n; i++) out[i] = 0;
     FILE * f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
+    if (!f) return;
     char line[256];
-    size_t kb = 0;
-    const size_t flen = strlen(field);
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, field, flen) == 0 && line[flen] == ':') {
-            kb = strtoull(line + flen + 1, nullptr, 10);   // " <N> kB"
-            break;
+    int found = 0;
+    while (found < n && fgets(line, sizeof(line), f)) {
+        for (int i = 0; i < n; i++) {
+            if (out[i]) continue;
+            const size_t flen = strlen(fields[i]);
+            if (strncmp(line, fields[i], flen) == 0 && line[flen] == ':') {
+                out[i] = strtoull(line + flen + 1, nullptr, 10) << 10;   // " <N> kB"
+                found++;
+                break;
+            }
         }
     }
     fclose(f);
-    return kb << 10;
+}
+
+static size_t rocket_meminfo_bytes(const char * field) {
+    size_t out = 0;
+    rocket_meminfo_read(&field, &out, 1);
+    return out;
+}
+
+// The reserve the auto budget modes hold back: KV cache, activations, general headroom,
+// and -- for F16 residency -- the still-mapped GGUF the resident tiles duplicate. The
+// board has no swap, so an over-commit is a hard kill and the reserve is deliberately
+// generous. ONE rule, because the dense and MoE budgets are drawn from the same
+// MemAvailable: two copies of it that drift apart are a double-spend, not two policies.
+static size_t rocket_auto_budget_reserve(void) {
+    const char * fields[1] = { "MemTotal" };
+    size_t total = 0;
+    rocket_meminfo_read(fields, &total, 1);
+    size_t reserve = (size_t)6144 << 20;                       // 6 GiB floor
+    if (total / 10 * 3 > reserve) reserve = total / 10 * 3;    // or 30% of RAM
+    if (const char * r = getenv("ROCKET_QUANT_RESIDENT_RESERVE_MB")) {
+        size_t rb; if (rocket_parse_mb_budget(r, &rb)) reserve = rb;
+    }
+    return reserve;
 }
 
 ggml_backend_t ggml_backend_rocket_init(void) {
@@ -5725,12 +6063,7 @@ ggml_backend_t ggml_backend_rocket_init(void) {
     if (!rez) { rez = getenv("ROCKET_QUANT_RESIDENT"); rez_name = "ROCKET_QUANT_RESIDENT"; }
     if (rez) {
         if (!getenv("ROCKET_CACHE_MB")) {                 // explicit budget overrides
-            const size_t total = rocket_meminfo_bytes("MemTotal");
-            size_t reserve = (size_t)6144 << 20;              // 6 GiB floor
-            if (total / 10 * 3 > reserve) reserve = total / 10 * 3;   // or 30% of RAM
-            if (const char * r = getenv("ROCKET_QUANT_RESIDENT_RESERVE_MB")) {
-                size_t rb; if (rocket_parse_mb_budget(r, &rb)) reserve = rb;
-            }
+            const size_t reserve = rocket_auto_budget_reserve();
             if (strcmp(rez, "auto") == 0) {
                 const size_t avail = rocket_meminfo_bytes("MemAvailable");
                 const size_t budget = (avail > reserve) ? (avail - reserve)
@@ -5783,16 +6116,24 @@ ggml_backend_t ggml_backend_rocket_init(void) {
             ROCKET_LOGI("[rocket] ROCKET_MOE_CACHE_MB=%s -> resident expert budget %s\n",
                         e, b ? "set" : "unlimited");
         } else {
-            const size_t avail = rocket_meminfo_bytes("MemAvailable");
-            const size_t total = rocket_meminfo_bytes("MemTotal");
-            size_t reserve = (size_t)6144 << 20;             // 6 GiB floor
-            if (total / 10 * 3 > reserve) reserve = total / 10 * 3;   // or 30% of RAM
-            if (const char * r = getenv("ROCKET_QUANT_RESIDENT_RESERVE_MB")) {
-                size_t rb; if (rocket_parse_mb_budget(r, &rb)) reserve = rb;
-            }
+            const size_t avail   = rocket_meminfo_bytes("MemAvailable");
+            const size_t reserve = rocket_auto_budget_reserve();
             ctx->moe_cache_budget = (avail > reserve) ? (avail - reserve)
                                                       : ((size_t)256 << 20);   // minimal floor
             if (!avail) ctx->moe_cache_budget = (size_t)4096 << 20;   // no signal -> conservative
+        }
+    }
+    // ROCKET_BF16_CACHE_MB: host fp32 weight cache for the ROCKET_BF16 datapath, in MB.
+    // Default 0 = OFF, unlike every other cache here, because this one holds fp32 -- twice
+    // the bf16 weight it was derived from. What it buys is the per-micro-batch BF16/F16 ->
+    // fp32 conversion, which is that route's dominant host term; run ROCKET_MM_PROFILE and
+    // read the dequant bucket to decide whether the RAM is worth it on a given model.
+    if (const char * e = getenv("ROCKET_BF16_CACHE_MB")) {
+        size_t b;
+        if (rocket_parse_mb_budget(e, &b)) {
+            ctx->bf16_cache_budget = b ? b : (size_t)-1;   // an explicit 0 means unlimited here
+            ROCKET_LOGI("[rocket] ROCKET_BF16_CACHE_MB=%s -> bf16 fp32 weight cache %s\n",
+                        e, b ? "set" : "unlimited");
         }
     }
     ggml_backend_t backend = new ggml_backend {
@@ -5829,13 +6170,15 @@ void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, int n_threads) {
     if (v != n_threads)
         GGML_LOG_WARN("%s: n_threads=%d out of range, clamped to %d (valid 1..8)\n",
                       __func__, n_threads, v);
-    // Effective only BEFORE the first offload: dev/stream/i8_dev/i4_dev/bf16/fa contexts
-    // capture the worker count at lazy-create time, so a call after the first offload
-    // updates the field but not the live worker pools. This matches the header contract
-    // ("call before graph compute"); warn if the resources already exist so the no-op is
-    // not silent.
+    // Effective only BEFORE the first offload: every per-route context and fd captures the
+    // worker count at lazy-create time, so a call after the first offload updates the field
+    // but not the live worker pools. This matches the header contract ("call before graph
+    // compute"); warn if the resources already exist so the no-op is not silent. The probe
+    // must name EVERY lazily created resource -- one omitted is a route on which the warning
+    // does not fire and the no-op is silent again.
     const bool workers_live = ctx->dev || ctx->stream || ctx->i8_dev || ctx->i4_dev
         || ctx->int8_fd >= 0 || ctx->int4_fd >= 0 || ctx->bf16_fd >= 0
+        || ctx->bf16_stream || ctx->rk76_fd >= 0
         || ctx->fa_ctx || ctx->fa_fd >= 0;
     if (workers_live)
         GGML_LOG_WARN("%s: called after the first offload; worker pools already sized to "

@@ -7,8 +7,8 @@ With the exception of prior work this may build on, ggml-rocket was developed by
 ## About ggml-rocket
 
 A drop-in [ggml](https://github.com/ggml-org/ggml) backend for Rockchip NPUs (validated on
-the RK3588) that offloads LLM and Whisper prefill to the NPU through the mainline `rocket`
-DRM-accel driver.
+the RK3588, with the RK3576 as a second target) that offloads LLM and Whisper prefill to the
+NPU through the mainline `rocket` DRM-accel driver.
 
 It builds as a runtime-loadable `libggml-rocket.so` that drops into stock llama.cpp,
 whisper.cpp, and other ggml-based hosts (e.g. transcribe.cpp, a multi-model STT library): point
@@ -134,9 +134,27 @@ The envelope, all HW-validated on the RK3588 and PPL-faithful to the CPU backend
 
 The full per-op routing contract and per-dtype detail are in [API.md](API.md).
 
+## The RK3576
+
+The RK3576 is a second validated target, and it runs a **different route** — an int8 W8A8 matmul
+with a per-output-column requant, selected by the detected part rather than by a knob. It is the
+**only** matmul route on that SoC: the RK3588 generators refuse there by construction, so an op is
+claimed by the W8A8 handler or not at all. Three things to know before running it:
+
+- **`ROCKET_INT8=1` is mandatory.** Without it every `MUL_MAT` is declined and nothing offloads.
+- **Attention stays on the CPU**, automatically. The attention handler has not been ported to that
+  part, so `supports_op` declines `FLASH_ATTN_EXT` there and the CPU takes it on its own kernel.
+- **Build with `-DGGML_ROCKET_NATIVE_FP16=OFF`** — the default convert kernels target the RK3588's
+  `armv8.2-a+fp16` baseline.
+
+Measured on Qwen2.5-1.5B `pp512`: **2.01× the CPU on the same F16 GGUF, and a tie (1.02×) with
+ggml's Q8_0 kernel**, at 1.008×–1.020× wikitext-2 perplexity against fp32 over two models. The
+route, its twelve `ROCKET_RK3576_*` knobs, and what each is measured against are in
+[API.md](API.md#the-rk3576-second-target).
+
 ## Requirements
 
-- An RK3588 board on a mainline kernel carrying the `rocket` DRM-accel driver, with
+- An RK3588 (or RK3576) board on a mainline kernel carrying the `rocket` DRM-accel driver, with
   `/dev/accel/accel0` present (`lsmod | grep rocket`).
 - The sibling `rocket-userspace` driver library, cloned next to this repo or installed as a
   `rocketnpu` package.
@@ -164,8 +182,14 @@ The gates are all CTest-registered — run `ctest` from the build dir; the NPU g
 off-device, the pure-CPU ones run anywhere. They include `test-rocket-matmul` (rocket vs CPU backend
 on real ggml graphs), `test-rocket-moe` (the MoE handler, both the fp16 and the native-quant expert
 route, against the CPU backend under outlier-channel activations), `test-rocket-int4`,
-`test-rocket-bf16`, `test-rocket-placement` (the `supports_op` / `offload_op` contract), and the
-Hadamard construction tests.
+`test-rocket-bf16`, `test-rk3576-w8a8` (the RK3576 W8A8 route against the CPU backend; `Skipped`
+on any other part), `test-rocket-placement` (the `supports_op` / `offload_op` contract), and the
+Hadamard construction tests. The shared graph/compare scaffolding is `test-common.h`.
+
+`test-rk3576-sgemm-ab` is a **benchmark**, not a gate: an RK3576 NPU-vs-CPU GEMM A/B against ggml
+F32, ggml Q8_0 and OpenBLAS. It is out of the default build (`-DGGML_ROCKET_RK3576_BENCH=ON`, needs
+OpenBLAS) because its own header records that the first run took a board down hard enough to need a
+physical power cycle.
 
 > **If the driver is installed** (`find_package(rocketnpu)` resolves to a `cmake --install`d
 > package, e.g. `/usr/local`), ggml-rocket links that installed lib, not a sibling
@@ -185,7 +209,10 @@ Hadamard construction tests.
   available regardless.
 - `-DGGML_ROCKET_PORTABLE_GLIBC=ON` — internalize the five glibc 2.38 `__isoc23_*` symbols so the
   `.so` loads on an older-glibc runtime (floors it at glibc 2.34). Needed only when the build host's
-  glibc is newer than the deployment target's; a same-host build is byte-unchanged.
+  glibc is newer than the deployment target's; a same-host build is byte-unchanged. Takes effect in
+  DL mode only — a static standalone build has no loader to satisfy.
+- `-DGGML_ROCKET_RK3576_BENCH=ON` — build the RK3576 NPU-vs-CPU GEMM benchmark (needs OpenBLAS).
+  Off by default; see the gate list above.
 
 To run a real model you rebuild the `.so` against the host app's bundled ggml (so it links the same
 `libggml-base.so`) and point `GGML_BACKEND_PATH` at it — the two drop-in recipes below.
@@ -215,8 +242,8 @@ GGML_BACKEND_PATH=$PWD/build-dl/libggml-rocket.so \
 ```
 
 `sudo -E` because `/dev/accel/accel0` needs privilege and `-E` preserves the env var. The startup log
-lists a `ROCKET` / "RK3588 NPU" device; the `drm_mm "Memory manager not clean"` WARN at exit is a
-known-benign teardown race.
+lists a `ROCKET` device described by the detected part ("RK3588 NPU", "RK3576 NPU"); the
+`drm_mm "Memory manager not clean"` WARN at exit is a known-benign teardown race.
 
 ### Drop into transcribe.cpp (multi-model STT)
 

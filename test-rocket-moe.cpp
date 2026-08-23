@@ -48,11 +48,13 @@
  * bit-faithful to the reference within the int8 envelope, that one ingest serves every M);
  * the model-level accuracy gate is a greedy-match / differential-PPL run on a real model.
  */
-#include "ggml.h"
-#include "ggml-alloc.h"
-#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-rocket.h"
+#include "test-common.h"
+
+extern "C" {
+#include "rocket_npu.h"
+}
 
 #include <vector>
 #include <string>
@@ -185,24 +187,6 @@ static std::vector<float> make_input(const moe_case & c) {
     return Xf;
 }
 
-// Aggregate cosine + per-element abs/rel (an element is bad only if it misses BOTH
-// tolerances at once -- large abs alone = rounding of a big value; large rel alone = a
-// near-zero reference). Returns the cosine; *nbad counts the genuinely-wrong elements.
-static double compare(const std::vector<float> & ref, const std::vector<float> & got,
-                      float * max_abs, float * max_rel, long * nbad) {
-    double dot = 0, na = 0, nb = 0;
-    *max_abs = 0; *max_rel = 0; *nbad = 0;
-    for (size_t i = 0; i < ref.size(); i++) {
-        if (!std::isfinite(got[i])) { (*nbad)++; continue; }
-        dot += (double)ref[i]*got[i]; na += (double)ref[i]*ref[i]; nb += (double)got[i]*got[i];
-        const float ad = fabsf(got[i]-ref[i]);
-        const float rd = ad / (fabsf(ref[i]) + 1e-6f);
-        if (ad > *max_abs) *max_abs = ad;
-        if (rd > *max_rel) *max_rel = rd;
-        if (ad >= 0.5f && rd >= 0.05f) (*nbad)++;
-    }
-    return (na > 0 && nb > 0) ? dot / (sqrt(na)*sqrt(nb)) : 0.0;
-}
 
 int main() {
     // K picks the quant group (the largest divisor of K that is a multiple of 32 and that
@@ -233,7 +217,21 @@ int main() {
 
     ggml_backend_t cpu    = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "cpu backend init failed\n"); return 1; }
-    // No NPU -> the rocket backend won't init. SKIP (77) rather than FAIL under CTest.
+    // Probe the accel node BEFORE the backend, and SKIP (77) if it will not open.
+    // ggml_backend_rocket_init() opens nothing -- every fd is lazy -- so it succeeds on a
+    // machine with no usable NPU and the matmuls then degrade to the CPU fallback. The
+    // other gates read that as a pass (they only compare against the CPU), but this one
+    // additionally asserts that experts were INGESTED onto the device, so a missing or
+    // unreadable /dev/accel would report FAIL for what is an environment, not a defect.
+    {
+        const int probe = rocket_open();
+        if (probe < 0) {
+            fprintf(stderr, "cannot open the accel device (absent, or no permission -- "
+                            "run with sudo -E) -> SKIP\n");
+            return 77;
+        }
+        rocket_close(probe);
+    }
     ggml_backend_t rocket = ggml_backend_rocket_init();
     if (!rocket) { fprintf(stderr, "rocket backend unavailable (no NPU?) -> SKIP\n"); return 77; }
 
@@ -262,7 +260,7 @@ int main() {
         }
 
         float max_abs, max_rel; long nbad;
-        const double cos = compare(oc, orr, &max_abs, &max_rel, &nbad);
+        const double cos = rk_compare(oc, orr, &max_abs, &max_rel, &nbad);
 
         // Did the native route actually run? It declines to a CORRECT fp16 result, so the
         // numbers alone cannot tell -- without this the quant cases would pass vacuously.
@@ -315,7 +313,7 @@ int main() {
                 ok = false; break;
             }
             float max_abs, max_rel; long nbad;
-            const double cos = compare(oc, orr, &max_abs, &max_rel, &nbad);
+            const double cos = rk_compare(oc, orr, &max_abs, &max_rel, &nbad);
             if (nbad != 0 || cos < c.cos_min) {
                 printf("%s n_tokens=%3d cos=%.6f nbad=%ld -> FAIL\n", c.name, c.n_tokens, cos, nbad);
                 ok = false;

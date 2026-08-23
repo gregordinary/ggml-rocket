@@ -38,6 +38,15 @@ option(GGML_ROCKET_DL "Build libggml-rocket.so as a drop-in GGML_BACKEND_DL back
 # ROCKET_DEBUG trace lines are always available (cached-getenv, near-zero when unset).
 option(GGML_ROCKET_DIAGNOSTICS "Compile in the heavy per-op recompute/trace diagnostics (off in production)" OFF)
 
+# Portability: internalize the glibc 2.38 __isoc23_* symbols so libggml-rocket.so loads on
+# an older-glibc runtime (e.g. a Debian-bookworm container) even when built on a newer host.
+# Off by default -- a normal build is byte-unchanged. Declared here rather than inside the
+# DL branch so it appears in `cmake -LH` either way; it only has an EFFECT in DL mode,
+# because the shim exists for the shipped .so and a static standalone build has no loader
+# to satisfy. See glibc_compat.c.
+option(GGML_ROCKET_PORTABLE_GLIBC
+       "Link a shim so libggml-rocket.so loads on glibc < 2.38 (e.g. an older container). DL mode only" OFF)
+
 # --- the rk3588 driver library (dependency, both modes) ---
 # Prefer an installed rocketnpu CMake package (cmake --install of rocket-userspace, which
 # exports rocketnpu::rocketnpu); otherwise build it from a sibling checkout. Override
@@ -121,12 +130,8 @@ if(GGML_ROCKET_DL)
         target_link_libraries(ggml-rocket PRIVATE ${GGML_CPU_LIB})
     endif()
 
-    # Portability: internalize the glibc 2.38 __isoc23_* symbols so libggml-rocket.so
-    # loads on an older-glibc runtime (e.g. a Debian-bookworm container) even when built
-    # on a newer host. Off by default (normal builds are byte-unchanged); see
-    # glibc_compat.c. The shim must be C11 so its own strtol/scanf aren't redirected.
-    option(GGML_ROCKET_PORTABLE_GLIBC
-           "Link a shim so libggml-rocket.so loads on glibc < 2.38 (e.g. an older container)" OFF)
+    # The glibc shim itself (option declared at top level). It must be C11 so its own
+    # strtol/scanf aren't redirected back into the symbols it is replacing.
     if(GGML_ROCKET_PORTABLE_GLIBC)
         target_sources(ggml-rocket PRIVATE glibc_compat.c)
         set_source_files_properties(glibc_compat.c PROPERTIES COMPILE_OPTIONS "-std=gnu11")
@@ -208,6 +213,32 @@ else()
     target_compile_options(test-hadamard-neon PRIVATE -Wall -Wextra)
     add_test(NAME test-hadamard-neon COMMAND test-hadamard-neon)
     set_tests_properties(test-hadamard-neon PROPERTIES SKIP_RETURN_CODE 77)
+
+    # RK3576 W8A8 correctness gate: the route with the most bespoke arithmetic in the
+    # backend (the calibration bootstrap, the frozen per-column output scale, the host
+    # K-split) against the CPU backend. SKIPs off-device AND on any part that is not an
+    # RK3576, so it is safe to leave in the default ctest run on either board.
+    add_executable(test-rk3576-w8a8 test-rk3576-w8a8.cpp)
+    target_include_directories(test-rk3576-w8a8 PRIVATE ${GGML_DIR}/include)
+    target_link_libraries(test-rk3576-w8a8 PRIVATE ggml-rocket ggml ggml-cpu)
+    target_compile_options(test-rk3576-w8a8 PRIVATE -Wall -Wextra)
+    add_test(NAME test-rk3576-w8a8 COMMAND test-rk3576-w8a8)
+    set_tests_properties(test-rk3576-w8a8 PROPERTIES SKIP_RETURN_CODE 77)  # no NPU / not RK3576
+
+    # RK3576 NPU-vs-CPU GEMM BENCHMARK (not a correctness gate, and not in ctest):
+    # a throughput A/B against ggml F32, ggml Q8_0 and OpenBLAS. Off by default for two
+    # reasons -- it needs OpenBLAS, and its own header records that the first run took a
+    # board down hard enough to need a physical power cycle. Turn it on deliberately:
+    #   cmake -B build -DGGML_ROCKET_RK3576_BENCH=ON
+    option(GGML_ROCKET_RK3576_BENCH "Build the RK3576 NPU-vs-CPU GEMM benchmark (needs OpenBLAS)" OFF)
+    if(GGML_ROCKET_RK3576_BENCH)
+        find_library(OPENBLAS_LIB NAMES openblas REQUIRED)
+        add_executable(test-rk3576-sgemm-ab test-rk3576-sgemm-ab.cpp)
+        target_include_directories(test-rk3576-sgemm-ab PRIVATE ${GGML_DIR}/include)
+        target_link_libraries(test-rk3576-sgemm-ab PRIVATE ggml-rocket ggml ggml-cpu ${OPENBLAS_LIB})
+        target_compile_options(test-rk3576-sgemm-ab PRIVATE -Wall -Wextra)
+        message(STATUS "ggml-rocket: RK3576 GEMM benchmark ON (openblas=${OPENBLAS_LIB})")
+    endif()
 
     # Pure-CPU Hadamard W8A8 characterization gate (no ggml, no NPU — portable scalar
     # math that runs anywhere). README-advertised; wire it as a CTest target so the

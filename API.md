@@ -287,6 +287,105 @@ DeepSeek's Q4_K experts take the dequantize-once-requantize path rather than MXF
 shift, and its residency profile is its own question. Treat gpt-oss's 2.16× as measured and DeepSeek's
 expert offload as **unmeasured**, not as a predicted win.
 
+## The RK3576 (second target)
+
+Everything above describes the RK3588. The **RK3576** runs a different route, selected by the
+**detected part** (`rocket_hw_current()`) rather than by a knob, and it is the **only** matmul
+route on that SoC — the RK3588 fp16/int8/int4/bf16 generators refuse there by construction, and
+the RK3576 entries refuse on the RK3588. So an op this backend claims on that part is claimed by
+the W8A8 handler or not at all.
+
+**`ROCKET_INT8=1` is mandatory there.** `supports_op` declines every `MUL_MAT` without it, so a
+run left at the defaults offloads nothing and says nothing about why. Set it, and confirm with
+`ROCKET_LOG_STDERR=1`.
+
+**Build it with `-DGGML_ROCKET_NATIVE_FP16=OFF`** — the default convert kernels target the
+RK3588's `armv8.2-a+fp16` baseline.
+
+### The route
+
+The RK3588's int8 entry hands back a raw int32 accumulator and the host applies both scales. The
+RK3576's writes **int8**: on that part any output element wider than one byte poisons the *next*
+submit, across processes, so the int32 sibling is not a route a frontend can take. What the part
+offers instead is a per-output-**column** requant in the DPU epilogue, and the whole route hangs
+off supplying its scale. Four pieces, each load-bearing:
+
+1. **Rotate A and B by an orthonormal Hadamard along K.** Mandatory, not a knob — the unrotated
+   route is not merely less accurate, it is *chaotic* (a 2% per-column divisor change moved one
+   model's perplexity nine orders of magnitude). `ROCKET_INT8_HADAMARD` does **not** gate it here.
+2. **Quantize A per tensor and B per output channel.** Per-axis *input* scales are free at this
+   interface and better on every per-GEMM norm, and 38× worse end to end on one model of two — so
+   the per-tensor activation scale is the measured choice, not the lazy one (`ROCKET_RK3576_AROW`
+   is the A/B).
+3. **Per-column output requant**, its scale frozen from a short calibration pass and divided by a
+   safety factor (`ROCKET_RK3576_NCAL` / `CALSAFE` / `BOOTMARGIN`).
+4. **Host dequantize by the scale the entry was *asked* for**, not the gain its integer ramp
+   delivered. The two differ by the entry's `worst_rel_err`; de-quantizing by the achieved gain is
+   a measured wash and is deliberately not done.
+
+Composed, that measures **1.008× / 1.020× wikitext-2 perplexity against fp32** on Qwen2.5-1.5B and
+SmolLM2-1.7B — against 1.11× / 2.26× for the per-tensor output scale it replaces.
+[host arithmetic over two models, 2026-08-10]
+
+**Shape contract**, stricter than the RK3588's: `K%32`, `N%32` (not `N%16`), `K ≥ 64`, `N ≥ 32`,
+2D static weight, `M ≥ ROCKET_MIN_M`, and a chunking of `K` the entry will take (see
+`ROCKET_RK3576_KSPLIT`). **`M` carries no constraint** on this part — `M=1` computes — which is the
+opposite of the RK3588, where rows are the convolution's spatial height and a height below 4
+mis-computes. There is deliberately no `M%4` padding here.
+
+### Performance, and the denominator that matters
+
+Qwen2.5-1.5B `pp512` under stock llama.cpp, four threads pinned to the A72s, governor
+`performance`, attention on the CPU (see below): the port reads **11.78 ± 1.8 t/s** against
+**5.9 t/s** for the same F16 GGUF on the CPU (**2.01×**) and **11.5 t/s** for ggml's Q8_0 kernel
+(**1.02×**). Both numbers are real and they answer different questions — the 2.01× is what a
+drop-in user reads, because the port consumes an F16 GGUF; the 1.02× is against the strongest CPU
+arm on the same silicon. Quote them together.
+[HW, H96 MAX M9, 7.1.7 / `rocket` 1.6.0, llama.cpp b10356, 2026-08-11]
+
+Two operating notes from that arm: the governor is worth **16%**, and the NPU arm's run-to-run
+spread is **±1.8 t/s (15%)** against ±0.01 on both CPU arms — **one process is not a measurement**.
+
+### Attention stays on the CPU there
+
+`FLASH_ATTN_EXT` is **declined** on the RK3576. The handler's only compute call goes through
+`rocket_matmul_fp16`, which refuses on any profile that is not `rk3588` — the attention primitive
+has no encoder for this part — so claiming the op would hand the scheduler something only the
+single-threaded host reference can compute, slower than the CPU backend's own kernel. The gate
+declines instead, which is what `ROCKET_FLASH_ATTN=0` did by hand and is the configuration every
+number above was measured under. Nothing to set.
+
+This is worth knowing because of how it used to fail: the gate had no RK3576 branch, a prompt of
+512 kept `n_kv` under the offload floor so the whole W8A8 corpus ran, and anything longer returned
+`llama_decode ... res = -3` with the explanation swallowed by `llama-bench`'s no-op `ggml` log
+callback. Read a bare `res = -3` under a bench harness as "a message you are not being shown", and
+reach for `ROCKET_LOG_STDERR=1`.
+
+### RK3576 knobs
+
+All twelve are RK3576-only and no-ops elsewhere. The defaults are the shipping route; the rest are
+A/B and instrument knobs, and the last two of the accuracy group change what the model computes.
+
+| var | default | meaning |
+|---|---|---|
+| `ROCKET_RK3576_NCAL` | 2 | calibration forwards before the per-column output scale is frozen. Each is two device passes: pass one estimates the per-column accumulator maxima from an analytic bound, pass two refines at that scale and returns the surface. Clamped to ≥1 — a value below that would freeze an all-zero scale vector and divide by it |
+| `ROCKET_RK3576_CALSAFE` | 3.0 | divisor applied to the frozen column maximum. 3.0 rather than 2.0 because the frozen maximum is *bootstrapped*: a bootstrap's 0.3% per-column error costs SmolLM2-1.7B 0.018 of perplexity ratio at 2.0 against 0.0021 at 3.0, while the exactly-frozen arm moves only 0.0017 between them |
+| `ROCKET_RK3576_BOOTMARGIN` | 1.5 | slack on the calibration passes' own output scale. The returned surface is correct at a scale this much loose, which costs resolution and nothing else |
+| `ROCKET_RK3576_AROW` | 0 | per-**row** activation scale instead of the per-tensor one. Free at this interface (the row scale never crosses the ioctl; it is applied in the dequantize) and better on every per-GEMM norm — and **38× worse end to end on one model of two**, which is why it is off. `=1` everywhere, `=2` only on the weights the K-split cut. Measure a candidate model; do not read a norm |
+| `ROCKET_RK3576_KSPLIT` | **off** | cut a `K` past the library's `K ≥ 6176` refusal into chunks on the host, one whole W8A8 GEMM each, f32 partials summed. Fast and exact — and it costs Qwen2.5-1.5B **1.60×** wikitext-2 perplexity, because what it reaches is `ffn_down` and the route's per-tensor activation scale does not carry that input. More chunks is worse, not better (ten ways scores 18.22 against four ways' 15.84). Off, an FFN down-projection is declined and runs on the CPU |
+| `ROCKET_RK3576_KCHUNK` | auto | move the head of the chunk-size preference list (2304, 2048, 1536, 1024, 512, 256, 128, 64, 32) so a candidate depth can be validated without a rebuild. Only 2304 / 2048 / 1536 were measured clean; a model whose chunking lands elsewhere should have that chunk timed before its numbers are quoted |
+| `ROCKET_RK3576_FORCESPLIT` | off | cut a `K` the part would take whole. The arm that separates a defect in this code from a property of the route: at `K=1536` the rotation is bit-identical either way, so anything the output does under it is this code's doing. Use with `KCHUNK` |
+| `ROCKET_RK3576_WSA` | on | hand the entry this weight's cached per-column `sum_k|qB|` instead of letting it recompute the O(K·N) pass every call. Bit-identical by construction — a cost knob, not an accuracy one; `=0` prices the pass |
+| `ROCKET_RK3576_WDEV` | on | once a weight's calibration converges, pack it into a device BO and hand the entry that, then drop the host `qB`. The cube is the same bytes, so this is memory-neutral; it deletes the per-call cube memset, copy and weight-BO churn. `=0` restores the per-call pack for pricing. Latches off for the whole context if one create fails |
+| `ROCKET_RK3576_CALSCAN` | 2 | which form of the calibration column scan runs: `0` column-outer, `1` row-major with an `int` accumulator, `2` row-major with a byte one. Exists to price them — `2` is ~3.5× `0`, flat in `N`, because a byte lane processes 16 elements where an `int` lane processes 4 |
+| `ROCKET_RK3576_CALROWS` | 0 (all) | cap the row count of calibration pass **one**. An instrument, not a policy: pass one's estimate is a maximum over `M` accumulator rows, so cutting rows undershoots it. Pass two always runs at full `M` and its surface is what the call returns |
+| `ROCKET_RK3576_CALMAP` | off | write a per-column CSV readout of what the two calibration passes learn (`key,chunk,fwd,M,Kc,N,n,abound,est1,est2,sat,rmsA,rmsB`) — enough to score a host-side predictor of the column maximum offline. Costs an O(M·Kc + N·Kc) sweep per forward; keep it out of a timed arm |
+
+`ROCKET_MM_PROFILE` covers this route too, through a third accumulator: the library's
+`sumabs / packA / packB / coeff / gen / alloc / stamp / submit / wait / read` plus the terms outside
+the entry (`valloc / quant+rot / calibrate / entry / dequant`). Both sum to the **offloaded path**,
+not to the prefill wall — attention, the norms, rope and the scheduler are in neither.
+
 ## Why quantization does not speed prefill
 
 The dispatch floor. The fp16 prefill in the benchmarks is the product of a stack of
@@ -374,7 +473,10 @@ running once with `ROCKET_LOG_STDERR=1` (llama-bench otherwise prints no backend
 The backend reads a set of `ROCKET_*` env vars. `sudo` strips the environment — always use `sudo -E`.
 A set-but-empty var (e.g. `ROCKET_MIN_M=`, the shape a wrapper produces when it forwards an unset
 `$VAR`) is treated as **unset** and takes the default — it does not parse as `0` and collapse a
-routing threshold to its clamp floor.
+routing threshold to its clamp floor, or a knob whose default is non-zero to a different arithmetic.
+The one exception is the presence-only diagnostics (`ROCKET_DEBUG`, `ROCKET_MM_PROFILE`,
+`ROCKET_AB`, `ROCKET_DUMP`, `ROCKET_FA_TIMING`), which are documented as "set to anything to arm"
+and so are armed by an empty value; none of them changes a result.
 
 | var | default | meaning |
 |---|---|---|
@@ -385,7 +487,7 @@ routing threshold to its clamp floor.
 | `ROCKET_MIN_M` | 128 | min M to offload. Below the crossover the per-call dispatch + weight packing (a weight only goes resident at `max_tile`=256, so below that it re-packs every call) outweigh the NPU's per-row advantage and the offload **loses to the CPU**. Measured F16 ratio NPU/CPU — 0.8B: pp16 0.36 / pp64 0.83 / pp96 1.04 / pp128 1.15; 3B: pp64 1.03 / pp128 1.60; 8B: pp48 0.93 / pp64 1.24 / pp128 1.89. The crossover is nearly model-independent (the packB you pay and the compute you gain both scale with K·N, so it cancels); the residual drift — ~86 rows at 0.8B down to ~55 at 8B — is the dispatch term, which does *not* scale with K·N and so weighs more when the weights are small. **128 is at or above every measured crossover, so no model regresses below CPU**; bigger models cross earlier still. Also covers **batched** decode: whisper.cpp's default beam search presents M=5 per step, which the old floor of 4 wrongly offloaded (2.3× slower; a 1.40× net loss end-to-end). Do **not** set it to 256 — llama streams below 256 and still wins, so 256 costs pp128 −46% |
 | `ROCKET_MIN_M_QUANT` | 512 | min M to offload **quantized** weights (the dequant→fp16 path). Its per-microbatch dequant needs more rows than F16 to amortize — measured crossover ~360 on 9B/27B `Q4_K`, so short quant prefills below this stay on the CPU (avoids a net-loss offload). Floored at `ROCKET_MIN_M` |
 | **`ROCKET_QUANT_RESIDENT`** | off | dequant a quantized GGUF weight to fp16 **once** and hold it in resident NPU BOs (reuses the F16 prepacked path) instead of re-dequantizing **and** re-packing it every micro-batch — lifting quant prefill to F16 parity (closes the per-microbatch dequant tax, and the `-ub 512` / short-follow-up cases `-ub 2048`'s amortization can't) at the cost of the **full fp16 resident footprint**. Modes: `1` = blanket, bounded by `ROCKET_CACHE_MB` (default 2 GB); **`auto`** = size the budget from free RAM (MemAvailable − a swap-safe reserve `max(6 GiB, 30 % of RAM)`, override `ROCKET_QUANT_RESIDENT_RESERVE_MB`); `N` = an explicit N-MB budget. Prefer `auto` for the "quantized-for-download, RAM-to-spare" case: on a model **larger than the default budget**, blanket `1` residents only part of it and is a **net loss vs streaming** — `auto` reaches parity (Qwen3.5-9B-`Q4_K` pp2048: `auto` 25.8 ≈ F16 25.1 vs streaming 22.1 t/s [HW sweep, 600 MHz]). Over-budget / IOVA-full weights fall back to streaming |
-| **`ROCKET_FLASH_ATTN`** | on | offload the attention op (`FLASH_ATTN_EXT`) to the NPU: heads fanned across the worker fds + submit-chained (see `ROCKET_FA_CHAIN`), bit-faithful (PPL == CPU) **for the attention it implements** — `softmax(scale·QKᵀ + mask)·V`. An op carrying **attention sinks** (`src[4]`, a learned per-head logit in the softmax denominator — gpt-oss, `mimo2`, `deepseek4`) is **declined**: the handler has no sink term, so accepting it would compute a *different* attention, silently. **Parity at ≤1K, a growing win above — 1.07× at 4K, 1.50× at 8K, 1.25× at 16K** [HW sweep, `-r3`]. Context-gated (see `MIN_KV`); `=0` disables |
+| **`ROCKET_FLASH_ATTN`** | on | offload the attention op (`FLASH_ATTN_EXT`) to the NPU: heads fanned across the worker fds + submit-chained (see `ROCKET_FA_CHAIN`), bit-faithful (PPL == CPU) **for the attention it implements** — `softmax(scale·QKᵀ + mask)·V`. An op carrying **attention sinks** (`src[4]`, a learned per-head logit in the softmax denominator — gpt-oss, `mimo2`, `deepseek4`) is **declined**: the handler has no sink term, so accepting it would compute a *different* attention, silently. **Parity at ≤1K, a growing win above — 1.07× at 4K, 1.50× at 8K, 1.25× at 16K** [HW sweep, `-r3`]. Context-gated (see `MIN_KV`); `=0` disables. A driver failure degrades the layer to the host reference rather than failing the graph, as `MUL_MAT` and `MUL_MAT_ID` do — correct but slow, and it logs a warning saying so |
 | `ROCKET_FA_CHAIN` | on | batch each worker's per-head QK (and AV) submits into one NPU job through a resident batched-matmul context — the dispatch-floor lever that pulls the crossover in to ~2K; `=0` forces the per-head path. Bit-identical |
 | `ROCKET_FLASH_ATTN_MIN_KV` | 1024 | min `n_kv` (context length) to offload an attention op — 1024 ≈ the sliding-window length, so the windowed local layers offload while shorter prompts stay on CPU. Gates on `n_kv`, not `n_tokens` (every ubatch has `n_tokens≈512` regardless of total context) |
 | `ROCKET_FLASH_ATTN_MIN_T` | 16 | min prefill `n_tokens` to offload attention (single-token decode stays on CPU) |
@@ -396,8 +498,8 @@ routing threshold to its clamp floor.
 | `ROCKET_MOE_NATIVE` | **on** (within `ROCKET_MOE=1`) | route a **GGUF-quantized** expert through the resident int8 group-wise path: ingest its quant blocks **once** into int8 codes held in NPU BOs, then quantize only the activation per call. This is what removes the per-micro-batch host dequant that makes the fp16 expert route a loss. `=0` forces the fp16 dequant route (the A/B baseline). An **F16** expert always takes the fp16 route — it has no dequant to delete |
 | `ROCKET_MOE_CACHE_MB` | **auto** | resident native-quant **expert** budget in MB (`0` = unlimited). Auto = `MemAvailable` − reserve. Charged per expert as *int8 codes + the expert's GGUF source bytes*, because the GGUF is mmapped and cannot be reclaimed (MoE **decode** reads the active experts from it on the CPU every token), so both copies must coexist. Admission-only: an expert that does not fit streams on the fp16 route, correctly, and the split is logged at teardown (`ggml_backend_rocket_moe_stats`) |
 | `ROCKET_MOE_GROUP` | **auto** | the K-group the native-quant path quantizes on. Auto picks the largest divisor of `K` that is a multiple of 32 and that the CBUF can hold as one K-tile — the readback floor (gpt-oss `K=2880` → **576**, `nKt=5`). Readback scales as `K/group` and this path is readback-bound, so a finer group is more faithful and proportionally slower; the knob exists for that A/B |
-| `ROCKET_MOE_M_BUCKET` | 64 | granule the ragged per-expert row count `M_e` is rounded up to (a power of two; ≤12% padded rows at `M_e ≈ 256`). Not a tuning knob so much as a requirement: `M%4` is a hardware contract, and the driver caches its resident scratch per `(M,K,N,group)` in a fixed-size table that a distinct `M` per expert would exhaust mid-prefill. The granule self-coarsens if that table starts to fill |
-| `ROCKET_INT8` (+ `ROCKET_INT8_HADAMARD`) | off | W8A8 int8 path (coherent with Hadamard; net loss vs fp16+KACC) |
+| `ROCKET_MOE_M_BUCKET` | 64 | the FLOOR of the ladder the ragged per-expert row count `M_e` is rounded up onto (rounded up to a power of two). Not a tuning knob so much as a requirement: `M%4` is a hardware contract, and the driver caches its resident scratch per `(M,K,N,group)` in a fixed 32-slot table that a distinct `M` per expert would exhaust mid-prefill, after which every remaining expert degrades to the CPU. The ladder is FIXED — two rungs per octave from the granule (64, 96, 128, 192, 256, …) — so it bounds the distinct slot count by construction (~15 values) and caps padding at ~33% of `M_e` (~15% on average). It does **not** adapt: an earlier adaptive granule that coarsened as the table filled could not un-coarsen (the driver's scratch slots are permanent, so the headroom test never became true again), ratcheted to its 4096 ceiling on the first overflow, and left a 356-row expert computing 4096 rows — 88% padding, silently. Raise the granule only to trade padding for slots |
+| `ROCKET_INT8` (+ `ROCKET_INT8_HADAMARD`) | off | W8A8 int8 path (coherent with Hadamard; net loss vs fp16+KACC on the RK3588). **On the RK3576 this knob is mandatory, not optional** — the W8A8 route is the only matmul route there and `supports_op` declines every `MUL_MAT` without it, and the rotation is unconditional there rather than gated by `ROCKET_INT8_HADAMARD`. See [The RK3576](#the-rk3576-second-target) |
 | `ROCKET_INT8_RESIDENT` | off | resident int8 weights (on top of `ROCKET_INT8`) |
 | `ROCKET_INT8_CACHE_MB` | 4096 | resident rotated-int8 weight cache cap, measured against the actual resident NPU-BO tile footprint (over-budget weights fall back to fp16) |
 | **`ROCKET_INT4`** | off | native W4A4 int4 path (from an F16 GGUF); group-wise + Hadamard on by default. Char-identical to fp16; a RAM play, not faster |
@@ -405,10 +507,15 @@ routing threshold to its clamp floor.
 | `ROCKET_INT4_GROUP` | 128 | int4 K-group scale granularity (must divide K, %32; `0` = per-channel). Smaller = higher fidelity, more readback |
 | `ROCKET_INT4_HADAMARD` | 1 | int4 outlier rotation (near-mandatory: cos ~0.79 → ~0.98 with it). `0` disables |
 | `ROCKET_INT4_CACHE_MB` | 4096 | int4 weight budget in MB (caps the one-shot host cache AND the resident NPU-BO total; over-budget weights fall back). A full 12B's int4 resident BOs are ~6 GB, so raise this for full coverage |
+| `ROCKET_BF16` | off | the exact fp32-output bf16 datapath. bf16 carries fp32's exponent range, so activations need no per-row scale: A goes through unscaled and the fp32 result is written straight to `dst`. Without it a bf16 weight decodes to fp16 and takes the shared fp16 streaming route (fp16-faithful, similar speed) |
+| `ROCKET_BF16_CACHE_MB` | **0 (off)** | host fp32 weight cache for the `ROCKET_BF16` path, in MB (`0` here means off; pass a budget to enable, and see the note). Off by default where every other cache is on, because this one holds **fp32 — twice the bf16 weight it came from**, so a blanket cache of a 24 GB bf16 model asks for 48 GB. What it buys is the per-micro-batch BF16→fp32 conversion, which is that route's dominant host term; run `ROCKET_MM_PROFILE` and read the **dequant** bucket to decide whether the RAM is worth it on a given model. Over-budget weights convert per call, correctly |
 | `ROCKET_FORCE_PREPACK` / `ROCKET_NO_PREPACK` | — | force / disable the resident-weights path |
 | `ROCKET_PREPACK_MADVISE` | off | madvise the F16 source after packing (**prefill-only — breaks CPU decode**) |
 | `ROCKET_CACHE_MB` | — | resident-weight byte budget in MB (the lower-level knob `ROCKET_QUANT_RESIDENT=auto`/`N` set; an explicit value here wins over both) |
-| `ROCKET_NO_FUSE` | off | disable gate/up graph fusion |
+| `ROCKET_NO_FUSE` | off | disable QKV / gate-up graph fusion (per-node routing, for a clean A/B). Fusion also turns itself off under `ROCKET_NO_STREAM`, `ROCKET_FORCE_PREPACK`, `ROCKET_INT8` and `ROCKET_INT4`, because the fused path is fp16-only — leaving it on under a precision knob would run the fusable projections (QKV, gate/up) in fp16 and reach only `o_proj` / `ffn_down` / `lm_head` with the selected precision |
+| `ROCKET_NO_STREAM` | off | disable the persistent streaming matmul context (per-call `mt` path instead). Also turns fusion off, which needs it |
+| `ROCKET_MOE_COSINE` | off | with `ROCKET_MOE=1`, report a per-op NPU-vs-CPU cosine for each offloaded `MUL_MAT_ID`. Diagnostic |
+| `ROCKET_FLASH_ATTN_NO_CTX` | off | force attention onto the per-call `_mt` path (own fds, per-call scratch) instead of the persistent `rocket_fa_ctx`. The A/B for what the resident score-matrix scratch is worth |
 | `ROCKET_VERIFY` | off | per-op NPU-vs-CPU correctness gate (`max_abs` is the signal; ignore `max_rel`; very slow) — needs `-DGGML_ROCKET_DIAGNOSTICS=ON` |
 | `ROCKET_MM_PROFILE` | off | per-phase host+driver bucket breakdown at exit — includes the streaming **weight-dequant** (quant/bf16→fp16) bucket, the dominant host term of a quantized-GGUF prefill (adds noise → drop for headline t/s) |
 | `ROCKET_TRACE` / `ROCKET_DEBUG` / `ROCKET_DEBUG_GRAPH` | off | per-op weight/ptr/amax trace; fusion groups; split census (`ROCKET_TRACE` needs `-DGGML_ROCKET_DIAGNOSTICS=ON`) |
