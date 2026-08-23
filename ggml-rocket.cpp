@@ -1897,10 +1897,10 @@ static bool rk76_k_single_ok(int K) {
 // returns 3*2304 + 2048 for the shape this exists for — Qwen2.5-1.5B's ffn_down at
 // K=8960. 1536 is a real model's own K, clean on the same run. The rest are UNMEASURED and
 // are the tail of a general K: a model whose chunking lands on them should have that chunk
-// timed (automation/rk3576-ksplit-arm.c cost, one process a cell, read the profiler's redo
-// count) before its numbers are quoted, because the stall map's step leaves gaps a clean
-// sample says nothing about. ROCKET_RK3576_KCHUNK moves the head of this list so a
-// candidate can be validated without a rebuild.
+// timed (one process a cell, reading the profiler's redo count) before its numbers are
+// quoted, because the stall map's step leaves gaps a clean sample says nothing about.
+// ROCKET_RK3576_KCHUNK moves the head of this list so a candidate can be validated
+// without a rebuild.
 static const int RK76_KCHUNK_PREF[] = { 2304, 2048, 1536, 1024, 512, 256, 128, 64, 32 };
 static const size_t RK76_KCHUNK_MAX = 16;   // a runaway guard; K=8960 takes 4
 
