@@ -57,7 +57,16 @@ option(GGML_ROCKET_PORTABLE_GLIBC
 # the portable scalar paths. The NPU-touching tests SKIP (exit 77) without /dev/accel,
 # but the build + the metadata-only placement gate run anywhere -- so the backend stays
 # CI-checkable off-device.
-find_package(rocketnpu QUIET CONFIG)
+#
+# An EXPLICIT -DROCKETNPU_DIR wins over an installed package. Otherwise a machine with a
+# stale /usr/local install silently builds the backend against THAT driver while the
+# configure log names the source tree the user asked for -- and the resulting .so reports
+# on code that is not the code under test.
+if(DEFINED ROCKETNPU_DIR)
+    message(STATUS "ggml-rocket: ROCKETNPU_DIR set explicitly; ignoring any installed rocketnpu package")
+else()
+    find_package(rocketnpu QUIET CONFIG)
+endif()
 if(rocketnpu_FOUND)
     message(STATUS "ggml-rocket: using installed rocketnpu package")
 else()
