@@ -5550,7 +5550,7 @@ static const char * ggml_backend_rocket_device_get_name(ggml_backend_dev_t dev) 
 // lifetime, and the profile does not change under a running process.
 static const char * ggml_backend_rocket_device_get_description(ggml_backend_dev_t dev) {
     (void)dev;
-    static char desc[64];
+    static char desc[96];   // headroom: the driver name is a build-time string
     if (!desc[0]) {
         const struct rocket_hw_profile * hw = rocket_hw_current();
         char part[16] = "Rockchip";
@@ -5559,7 +5559,11 @@ static const char * ggml_backend_rocket_device_get_description(ggml_backend_dev_
             for (; i + 1 < sizeof(part) && hw->name[i]; i++) part[i] = (char)toupper((unsigned char)hw->name[i]);
             part[i] = '\0';
         }
-        snprintf(desc, sizeof(desc), "%s NPU (mainline rocket driver)", part);
+        // Name the driver this build actually reaches, not a literal: the same source
+        // runs over mainline `rocket` and over the vendor `rknpu` BSP driver through an
+        // external submit provider, and a device listing that names the wrong one is
+        // worst on the BSP boards, where which kernel path is live is the whole question.
+        snprintf(desc, sizeof(desc), "%s NPU (%s)", part, rocket_driver_name());
     }
     return desc;
 }
