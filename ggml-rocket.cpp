@@ -727,27 +727,54 @@ static int rocket_min_m_quant(void) {
     return m;
 }
 
-// MUL_MAT_ID (MoE routed-expert FFN) offload, OPT-IN via ROCKET_MOE=1 (default OFF).
-// The handler is correct and bit-faithful (test-rocket-moe cos=1.000000), but for the
-// QUANTIZED experts that every board-fitting MoE ships (gpt-oss MXFP4, DeepSeek Q4_K)
-// it is a net LOSS: each expert weight is dequantized to fp16 on the host EVERY
-// micro-batch (streaming), and MoE has ~n_expert times more distinct weights per layer
-// than a dense model, each amortized over only M_e ~= n_tokens*n_expert_used/n_expert
-// rows -- so the per-expert streaming dequant + dispatch dominates, where the CPU's
-// fused quantized kernel pays no dequant. Measured gpt-oss-20b (MXFP4) pp2048: NPU 5.33
-// vs CPU 12.56 t/s = 0.42x [HW sweep, 600 MHz]. So decode/dense-model behaviour is
-// unchanged by default; ROCKET_MOE=1 opts a MoE model's experts onto the NPU (faithful,
-// currently slower for quant). A win needs native-quant experts (no host dequant) or a
-// resident-expert cache -- deferred. Same root cause as the quant-fused-group lever:
-// quant prefill is dequant-bound.
-static bool rocket_moe_on(void) {
+// MUL_MAT_ID (MoE routed-expert FFN) offload. THREE states, because the route's two
+// regimes have opposite signs and one flag has to distinguish them:
+//
+//   ROCKET_MOE unset  -> AUTO (the default). Claim a MoE expert op only where the offload
+//                        is measured to WIN and can be guaranteed to stay in that regime:
+//                        a GGUF-quantized expert stack, on the RK3588, whose whole
+//                        [K,N,n_expert] stack the residency pre-flight can reserve before
+//                        the first ingest. That route runs the expert GEMMs as resident
+//                        int8 with no host dequant, and on gpt-oss-20b it is 1.71x the CPU
+//                        at pp512 and 2.11x at pp2048 [HW sweep 2026-08-27, 600 MHz, two
+//                        passes]. A stack that does not qualify is simply left on the CPU,
+//                        so the default is bounded below by CPU-only behaviour at any budget.
+//   ROCKET_MOE=1      -> FORCED. Claim every MUL_MAT_ID the handler can compute, including
+//                        the ones AUTO declines: an F16/F32/BF16 expert stack (no host
+//                        dequant to delete, so nothing to gain) and a stack too large for
+//                        the resident budget, which half-ingests and streams the rest. On a
+//                        board that nearly fits, that streaming is CHEAPER than AUTO's
+//                        CPU placement and this is the faster setting (+6-13% at pp512 and
+//                        +18-21% at pp2048 on gpt-oss, measured twice); on a board that does
+//                        not, it is the loss the
+//                        pre-flight exists to avoid (0.97x the experts-on-CPU baseline at
+//                        pp512 and 52% resident). It is the A/B arm and the configuration
+//                        every archived MoE measurement was taken under. Faster where it
+//                        fits, unsafe where it does not -- which is exactly why it is not
+//                        what an unset knob selects.
+//   ROCKET_MOE=0      -> OFF. Experts stay on the CPU whatever the shape.
+//
+// The fp16 streaming route is what made this opt-in in the first place: each expert weight
+// is dequantized to fp16 on the host EVERY micro-batch, and MoE has ~n_expert times more
+// distinct weights per layer than a dense model, each amortized over only
+// M_e ~= n_tokens*n_expert_used/n_expert rows -- so the dequant + dispatch dominates, where
+// the CPU's fused quantized kernel pays no dequant at all. Measured gpt-oss-20b (MXFP4)
+// pp2048 on that route: NPU 5.33 vs CPU 12.56 t/s = 0.42x [HW sweep, 600 MHz]. AUTO does
+// not take it; the native-quant route below is what replaced it.
+enum rocket_moe_mode_e { ROCKET_MOE_OFF = 0, ROCKET_MOE_AUTO = 1, ROCKET_MOE_FORCED = 2 };
+static int rocket_moe_mode(void) {
     static int v = -1;
-    if (v < 0) v = rocket_knob_on("ROCKET_MOE", false);
-    return v > 0;
+    if (v < 0) {
+        const char * e = getenv("ROCKET_MOE");
+        if (!e || !*e)          v = ROCKET_MOE_AUTO;      // unset -> the safe default
+        else if (atoi(e) > 0)   v = ROCKET_MOE_FORCED;    // explicit opt-in to every route
+        else                    v = ROCKET_MOE_OFF;
+    }
+    return v;
 }
 
-// Minimum n_tokens (the micro-batch's token count) for a MUL_MAT_ID op to offload when
-// ROCKET_MOE=1. A MoE op's per-expert row count is M_e ~= n_tokens * n_expert_used /
+// Minimum n_tokens (the micro-batch's token count) for a MUL_MAT_ID op to offload at all,
+// in every ROCKET_MOE state. A MoE op's per-expert row count is M_e ~= n_tokens * n_expert_used /
 // n_expert, so n_tokens is the direct handle on the per-expert GEMM size; the default
 // 512 keeps decode and tiny ubatches on the CPU. Tunable via ROCKET_MOE_MIN_TOKENS;
 // never below rocket_min_m().
@@ -761,13 +788,14 @@ static int rocket_moe_min_tokens(void) {
     return m;
 }
 
-// NATIVE-QUANT MoE experts: within ROCKET_MOE=1, route a GGUF-QUANTIZED expert weight
-// through the resident int8 group-wise path (ingest once -> int8 codes resident on the
-// NPU) instead of dequantizing it to fp16 on the host every micro-batch. ON by default
-// when ROCKET_MOE is on -- it is the reason the MoE offload can win at all on the models
-// that ship quantized. ROCKET_MOE_NATIVE=0 forces the fp16 dequant route, which is the
-// A/B baseline for the native path (and the only route for an F16 expert, which has no
-// dequant to delete).
+// NATIVE-QUANT MoE experts: route a GGUF-QUANTIZED expert weight through the resident int8
+// group-wise path (ingest once -> int8 codes resident on the NPU) instead of dequantizing it
+// to fp16 on the host every micro-batch. ON by default -- it is the reason the MoE offload
+// can win at all on the models that ship quantized, and under AUTO placement it is the only
+// MoE route claimed. ROCKET_MOE_NATIVE=0 forces the fp16 dequant route, which is the A/B
+// baseline for the native path (and the only route for an F16 expert, which has no dequant
+// to delete); AUTO then claims no MoE op at all, since the route it would fall to is the
+// one that loses.
 static bool rocket_moe_native_on(void) {
     static int v = -1;
     if (v < 0) v = rocket_knob_on("ROCKET_MOE_NATIVE", true);
@@ -789,12 +817,34 @@ static int rocket_moe_group_env(void) {
 // tuning knob, and for the ladder itself. Rounded up to a power of two: the ladder puts its
 // intermediate rung at 1.5x each power, so a power-of-two floor is what keeps every rung on the
 // M%4 hardware contract.
+// Cached like every other knob here, and now it matters: the placement gate reads this per
+// MoE node per graph split (the per-expert row floor), not just once per context at bucket
+// time, so an uncached getenv would sit on a path the scheduler walks every micro-batch.
 static int rocket_moe_m_bucket_env(void) {
-    int g = rocket_knob_int("ROCKET_MOE_M_BUCKET", 64);
-    if (g < 4) g = 4;
-    int p = 4;
-    while (p < g && p < (1 << 20)) p <<= 1;
+    static const int p = [] () -> int {
+        int g = rocket_knob_int("ROCKET_MOE_M_BUCKET", 64);
+        if (g < 4) g = 4;
+        int q = 4;
+        while (q < g && q < (1 << 20)) q <<= 1;
+        return q;
+    }();
     return p;
+}
+
+// ROCKET_MOE_MIN_WORK: the least work ONE expert dispatch must carry, in mega-MACs
+// (M_e * K * N / 1e6), for the offload to pay for its fixed cost. This is the placement gate's
+// SECOND floor, and it is the one that separates the architectures; the row floor above is a
+// tile-geometry requirement and cannot do this job. See the gate in supports_op for the
+// derivation and the map it is fitted to.
+//
+// Cached like the rest -- the gate reads it per MoE node per graph split.
+static int rocket_moe_min_work_mmac(void) {
+    static const int w = [] () -> int {
+        int v = rocket_knob_int("ROCKET_MOE_MIN_WORK", 340);
+        if (v < 0) v = 0;                    // 0 disables the floor
+        return v;
+    }();
+    return w;
 }
 
 // ROCKET_QUANT_RESIDENT=1: hold a quantized GGUF weight's DEQUANTIZED fp16 form
@@ -1668,6 +1718,9 @@ static int rocket_quant_int4_grouped(const float * srcf, const void * srcv, bool
 static std::string rocket_weight_key(const ggml_tensor * t);   // defined below (fp16 wcache)
 static size_t rocket_meminfo_bytes(const char * field);        // defined below (init); read in build_resident
 static void   rocket_meminfo_read(const char * const * fields, size_t * out, int n);
+static bool   rocket_parse_mb_budget(const char * e, size_t * out_bytes);   // defined below (init)
+static size_t rocket_auto_budget_reserve(void);                            // defined below (init)
+static void   rk_moe_preflight_close(void);                                // defined below (MoE pre-flight)
 
 // W8A8 int8 matmul for one plain 2D static-weight GEMM, via the one-shot tiled
 // int8 driver. Returns 0 (dst written) or <0 to fall through to the fp16 path.
@@ -4324,6 +4377,10 @@ static const char * ggml_backend_rocket_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_rocket_free(ggml_backend_t backend) {
     ggml_backend_rocket_context * ctx = (ggml_backend_rocket_context *)backend->context;
+    // Drop this backend's claim on the residency ledger first: the bytes it reserved are
+    // released below, and the next context (llama-bench builds one per row) must start from
+    // an empty ledger rather than inherit an exhausted one.
+    rk_moe_preflight_close();
     if (ctx->stream) rocket_stream_free(ctx->stream);
     if (ctx->int8_fd >= 0) rocket_close(ctx->int8_fd);
     if (ctx->int4_fd >= 0) rocket_close(ctx->int4_fd);
@@ -4362,11 +4419,21 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
         // measured on gpt-oss at pp512, 99% resident is 17.6 t/s and 82% resident is 12.2 --
         // below the 14.1 you get by simply leaving the experts on the CPU. Residency is not a
         // nice-to-have for this route; it IS the route.
-        if (res_pct < 95.0)
-            ROCKET_LOGW("[moe-int8] only %.0f%% resident -- below ~95%% this route is typically a "
-                        "net LOSS at short prefill (a streamed expert's dequant does not shrink "
-                        "with the row count). Raise ROCKET_MOE_CACHE_MB if the RAM is there, or "
-                        "set ROCKET_MOE=0 to leave the experts on the CPU.\n", res_pct);
+        // 80%, and the threshold is CONSERVATIVE rather than measured at its edge: 91%
+        // resident was the fastest arm on this board, 52% read below the experts-on-CPU
+        // baseline at pp512, and nothing has bracketed the crossover between them. So this
+        // warns over a range that includes configurations which are still a win -- the right
+        // direction for a warning whose subject is a silent 0.97x.
+        if (res_pct < 80.0)
+            ROCKET_LOGW("[moe-int8] only %.0f%% resident -- a streamed expert's dequant does not "
+                        "shrink with the row count, so a poorly-resident run can read BELOW "
+                        "leaving the experts on the CPU at short prefill (measured 0.97x at "
+                        "pp512 and 52%% resident). Under the default the pre-flight reserves a "
+                        "stack before claiming its op, so reaching here means either a limit it "
+                        "cannot see ahead -- an exhausted NPU IOVA window, raise ROCKET_N_THREADS "
+                        "-- or ROCKET_MOE=1, which claims the op without reserving anything. "
+                        "Raise ROCKET_MOE_CACHE_MB if the RAM is there, or set ROCKET_MOE=0 to "
+                        "leave the experts on the CPU.\n", res_pct);
         // What that residency cost, once: the price of admission to the route above. It is
         // paid inside the first prefill and it is minutes on a large MoE, so it is reported
         // next to the win rather than left to be discovered as a startup hang. It is also
@@ -4868,6 +4935,253 @@ static int rocket_moe_pick_group(int K, int N) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// MoE residency pre-flight — the check that makes the expert route a DEFAULT
+// ---------------------------------------------------------------------------
+//
+// The native-quant route's sign depends on how much of the expert stack it ingests stays
+// RESIDENT. A streamed expert keeps paying a weight dequant that is INDEPENDENT of its row
+// count (it decodes the whole [N,K] whatever the router gave it), while a resident one pays
+// a GEMM that shrinks with M -- so the streamed remainder's share of the wall clock GROWS as
+// the prefill shortens, and a badly-resident run can land BELOW simply leaving the experts on
+// the CPU. Measured on gpt-oss-20b at pp512, 600 MHz: at 52% resident the route reads
+// **13.63** against a **14.08** experts-on-CPU baseline -- a net loss [HW sweep 2026-08-27].
+//
+// A default whose sign depends on the host's RAM is not a default, which is why this route
+// shipped opt-in. The pre-flight removes the dependence instead of documenting it: an expert
+// stack's resident cost is knowable from its tensor alone -- [K, N, n_expert] plus the GGUF
+// source stride -- so the decision can be taken in supports_op, BEFORE the first ingest, and
+// a stack that will not fit is left on the CPU whole rather than half-ingested into a loss.
+//
+// WHAT THIS COSTS, because it is not free and the tempting summary is wrong. Reserving is
+// strictly more conservative than the lazy admission it front-runs: this reserves all
+// n_expert experts of a stack, while admission charges only the ones the router actually
+// exercises (~82% at pp512-2048). So on a board that NEARLY fits, the pre-flight claims fewer
+// stacks than ROCKET_MOE=1 holds, and CPU-placing a whole stack turns out to be dearer than
+// streaming a few experts: gpt-oss-20b on a 31 GiB board reads 20.8/24.8 (pp512/pp2048)
+// against 24.5/32.9 forced, which streams 9% [HW sweep 2026-08-27]. **"Any streaming is a
+// cliff" is too strong** -- 91% resident was the fastest arm measured. The crossover is
+// somewhere between 52% and 82%, and no run has bracketed it more tightly than that.
+//
+// The trade is therefore SIGN for PEAK, and it is the right one for a default: this is never
+// below the experts-on-CPU baseline at any budget (1.47-1.81x above it on a 31 GiB board,
+// 1.21-1.34x at an induced 12 GB one), where ROCKET_MOE=1 is 0.97x at pp512 on the latter.
+// A user with headroom to spare buys the peak back with ROCKET_MOE_CACHE_MB, which keeps the
+// zero-streamed property, rather than with ROCKET_MOE=1, which does not.
+//
+// THE GRAIN IS ONE WEIGHT STACK (one layer's ffn_gate_exps / ffn_up_exps / ffn_down_exps),
+// not the whole model, and that is the load-bearing choice. "Decline unless the entire
+// model fits" would decline gpt-oss-20b on the very 32 GB board its 2.16x was measured on:
+// 19.1 GiB of int8 codes plus the 11.3 GiB GGUF they are decoded from do not both fit, and
+// the winning run was 99% resident, not 100%. Per-stack admission keeps that win and still
+// has no cliff, because a DECLINED stack runs on the CPU rather than streaming -- the
+// M-independent dequant that makes partial residency lose is then never paid at all. What
+// is left is a blend of the 2.16x route and the CPU baseline, bounded below by the baseline
+// at every RAM size. That is what a default has to be.
+//
+// A declined stack costs nothing at the seam, either: this backend's buffer type IS the CPU
+// buffer type, so an op placed on the CPU beside an offloaded neighbour is a scheduler
+// bookkeeping entry and not a copy.
+//
+// TWO budgets, and the second is not RAM. Every BO on a worker fd must live in that fd's
+// low 4 GB IOVA window (the regcmd's address fields are 32-bit — rocket_op_iova_overflow),
+// and the resident weights are split across the fds, so the aggregate ceiling on resident
+// expert CODES is n_threads * 4 GB: 20 GB at the default 5 workers, which gpt-oss's 19.1 GiB
+// sits just under. Running that window out mid-model produces exactly the streamed remainder
+// the pre-flight exists to prevent, so it is a budget here and not a surprise at pack time.
+
+// The resident native-quant EXPERT budget in bytes (0 = unlimited): ROCKET_MOE_CACHE_MB, or
+// AUTO from MemAvailable minus the standard reserve.
+//
+// A much bigger appetite than the other weight caches, and it needs its own budget rather
+// than the dense path's fixed 4GB default: a real MoE's expert stack is the bulk of the
+// model (gpt-oss-20b: 19.1 GiB of int8 expert codes), and the GGUF it was ingested from must
+// stay mapped -- MoE DECODE reads the active experts from it on the CPU every token, so it
+// cannot be reclaimed. A blanket "unlimited" on a memory-tight board is a trap (these boards
+// have no swap); a fixed default would be wrong on every board but one.
+//
+// ONE number, computed ONCE for the process. The pre-flight decides before any ingest and
+// the runtime admission charges during it, and MemAvailable falls by exactly the bytes an
+// ingest commits -- so a budget re-read per context would shrink under its own success, and
+// the second llama_context of a llama-bench run would decline what the first admitted.
+// The headroom the MoE auto budget holds back: KV cache, activations, general headroom.
+// The 6 GiB floor of the shared rule, WITHOUT its 30%-of-RAM arm -- see rk_moe_ram_budget for
+// why that arm would double-count the GGUF this route already charges per expert. Honours the
+// same override knob, so a board that needs a different headroom sets it in one place.
+static size_t rocket_moe_budget_reserve(void) {
+    size_t reserve = (size_t)6144 << 20;
+    if (const char * r = getenv("ROCKET_QUANT_RESIDENT_RESERVE_MB")) {
+        size_t rb; if (rocket_parse_mb_budget(r, &rb)) reserve = rb;
+    }
+    return reserve;
+}
+
+static size_t rk_moe_ram_budget(void) {
+    static const size_t b = [] () -> size_t {
+        const char * e = getenv("ROCKET_MOE_CACHE_MB");
+        size_t v;
+        if (e && *e && rocket_parse_mb_budget(e, &v)) {
+            ROCKET_LOGI("[rocket] ROCKET_MOE_CACHE_MB=%s -> resident expert budget %s\n",
+                        e, v ? "set" : "unlimited");
+            return v;
+        }
+        const size_t avail = rocket_meminfo_bytes("MemAvailable");
+        if (!avail) return (size_t)4096 << 20;                  // no signal -> conservative
+        // NOT rocket_auto_budget_reserve(): that rule is max(6 GiB, 30% of RAM), and the 30%
+        // arm exists to cover a resident set that DUPLICATES a still-mapped GGUF (the dense
+        // F16/quant residency paths hold an anonymous copy of a weight the mmap still holds).
+        // This route charges that same GGUF EXPLICITLY, per expert, in the admission estimate
+        // -- so applying the 30% arm on top counts the mapping twice, and the double-count is
+        // the whole gap between what the pre-flight will reserve and what the route can
+        // actually hold. Measured on gpt-oss-20b, 31 GiB board: the shared rule gave a
+        // 21.2 GB budget and 54 of 72 stacks; the route ran comfortably at ~25 GB committed,
+        // and a 26 GB budget took 66 stacks with ZERO streaming and +19%/+22% (pp512/pp2048)
+        // [HW sweep 2026-08-27, 600 MHz].
+        //
+        // What is left is the reserve's OTHER job -- KV cache, activations, general headroom
+        // -- which is the 6 GiB floor, and that floor still binds on every board where the
+        // 30% arm was not the larger of the two (16 GiB and under). So this changes the
+        // budget only on the boards where the double-count was real.
+        const size_t reserve = rocket_moe_budget_reserve();
+        return (avail > reserve) ? (avail - reserve) : ((size_t)256 << 20);
+    }();
+    return b;
+}
+
+// The per-fd IOVA window the resident weight BOs must fit inside, less the slack left for
+// the shared per-shape scratch (in/out/regcmd BOs, one set per distinct (M,K,N,group) the
+// bucket ladder produces) that lives in the same window.
+#define RK_MOE_IOVA_PER_FD  ((size_t)4 << 30)
+#define RK_MOE_IOVA_SLACK   ((size_t)256 << 20)
+
+// The ledger. Process-wide because supports_op is a DEVICE method with no context handle --
+// which is also the honest accounting: two llama_contexts on one board compete for the same
+// RAM and the same fds, so a cumulative charge is right and a per-context one would
+// double-admit. It is cleared when the last rocket backend is freed, so the fresh context
+// llama-bench builds for every row starts from an empty ledger rather than from the
+// exhausted one the previous row left behind.
+struct rk_moe_preflight {
+    std::mutex mu;
+    bool   frozen    = false;   // budgets resolved (lazily, so n_threads is already known)
+    size_t ram       = 0;       // bytes; 0 = unlimited
+    size_t iova      = 0;       // bytes; aggregate resident-code ceiling across the fds
+    size_t ram_used  = 0;
+    size_t iova_used = 0;
+    int    n_workers = 0;       // published by the backend at init / set_n_threads
+    int    live      = 0;       // live rocket backends; the ledger clears when this hits 0
+    bool   announced = false;   // the "budget reached" line is printed once
+    std::unordered_map<std::string, bool> stacks;   // stack key -> admitted
+};
+static rk_moe_preflight g_moe_pf;
+
+// Reserve one expert stack. True iff the WHOLE stack fits both budgets, in which case it is
+// charged. The answer is memoized per stack name because supports_op is asked again for
+// every micro-batch, and an answer that drifted would move one op between backends between
+// two prefills -- re-ingesting the stack it had already placed.
+static bool rk_moe_preflight_admit(const std::string & key, int64_t K, int64_t N,
+                                   int64_t n_expert, int group, size_t src_bytes) {
+    // No stable name -> the resident cache has no key to hold this weight under and the
+    // runtime would stream it. Decline rather than admit something we cannot reserve.
+    if (key.empty() || n_expert <= 0 || group <= 0 || K <= 0 || N <= 0) return false;
+
+    std::lock_guard<std::mutex> lk(g_moe_pf.mu);
+    auto it = g_moe_pf.stacks.find(key);
+    if (it != g_moe_pf.stacks.end()) return it->second;
+
+    if (!g_moe_pf.frozen) {
+        g_moe_pf.ram = rk_moe_ram_budget();
+        int nw = g_moe_pf.n_workers;                 // what a live backend actually opened
+        if (nw <= 0) nw = rocket_knob_int("ROCKET_N_THREADS", 5);   // the ctx default
+        if (nw < 1) nw = 1;
+        if (nw > 8) nw = 8;
+        const size_t per_fd = RK_MOE_IOVA_PER_FD - RK_MOE_IOVA_SLACK;
+        g_moe_pf.iova   = (size_t)nw * per_fd;
+        g_moe_pf.frozen = true;
+        ROCKET_LOGI("[moe-int8] residency pre-flight: %zuMB RAM budget, %zuMB NPU IOVA "
+                    "across %d worker fds\n",
+                    g_moe_pf.ram >> 20, g_moe_pf.iova >> 20, nw);
+    }
+
+    // The SAME per-expert charge the runtime admission uses (rocket_moe_expert_resident),
+    // deliberately: the two must agree, and the runtime's own pre-check is skipped for a
+    // stack this function admitted. int8 codes + the per-(channel, K-group) scales + the
+    // expert's GGUF source bytes -- the source is charged because it is not reclaimable
+    // here, MoE decode reads the active experts from it on the CPU every token.
+    const size_t codes     = (size_t)N * (size_t)K;
+    const size_t scales    = (size_t)N * (size_t)(K / group) * sizeof(float);
+    const size_t ram_need  = (size_t)n_expert * (codes + scales + src_bytes);
+    const size_t iova_need = (size_t)n_expert * codes;
+
+    const bool fits_ram  = !g_moe_pf.ram || g_moe_pf.ram_used + ram_need <= g_moe_pf.ram;
+    const bool fits_iova = g_moe_pf.iova_used + iova_need <= g_moe_pf.iova;
+    const bool ok        = fits_ram && fits_iova;
+    if (ok) {
+        g_moe_pf.ram_used  += ram_need;
+        g_moe_pf.iova_used += iova_need;
+    } else if (!g_moe_pf.announced) {
+        g_moe_pf.announced = true;
+        // rocket_log, not GGML_LOG_*: llama-bench silences ggml's logger, and llama-bench is
+        // the tool this placement is measured with. Say WHICH budget bound it, because the
+        // two have different exits.
+        ROCKET_LOGI("[moe-int8] resident budget reached after %zu expert stacks (%zuMB RAM, "
+                    "%zuMB IOVA) -- the rest of the experts stay on the CPU, which is a "
+                    "partial offload and not a loss. %s\n",
+                    g_moe_pf.stacks.size(), g_moe_pf.ram_used >> 20, g_moe_pf.iova_used >> 20,
+                    fits_ram ? "Bound by NPU IOVA: raise ROCKET_N_THREADS for more per-fd "
+                               "window."
+                             : "Bound by RAM: raise ROCKET_MOE_CACHE_MB if it is there.");
+    }
+    g_moe_pf.stacks[key] = ok;
+    return ok;
+}
+
+// Has this stack already been decided? supports_op is asked again for every node of every
+// graph split, so the answer is looked up before the group probe that would otherwise be
+// re-run to produce it.
+static bool rk_moe_preflight_decided(const std::string & key, bool * admitted) {
+    if (key.empty()) return false;
+    std::lock_guard<std::mutex> lk(g_moe_pf.mu);
+    auto it = g_moe_pf.stacks.find(key);
+    if (it == g_moe_pf.stacks.end()) return false;
+    *admitted = it->second;
+    return true;
+}
+
+// Did the pre-flight reserve this stack? Read by the runtime admission, which must not
+// re-judge a decision that has already placed the op.
+static bool rk_moe_preflight_reserved(const std::string & key) {
+    if (key.empty()) return false;
+    std::lock_guard<std::mutex> lk(g_moe_pf.mu);
+    auto it = g_moe_pf.stacks.find(key);
+    return it != g_moe_pf.stacks.end() && it->second;
+}
+
+// Backend lifetime. The ledger tracks what is COMMITTED, so it is cleared when the last
+// backend that could be holding those bytes goes away -- otherwise llama-bench's second row
+// would inherit the first row's exhausted budget and place every expert on the CPU.
+static void rk_moe_preflight_open(int n_workers) {
+    std::lock_guard<std::mutex> lk(g_moe_pf.mu);
+    if (g_moe_pf.live == 0) {
+        g_moe_pf.stacks.clear();
+        g_moe_pf.ram_used = g_moe_pf.iova_used = 0;
+        g_moe_pf.frozen = g_moe_pf.announced = false;
+    }
+    if (n_workers > 0) g_moe_pf.n_workers = n_workers;
+    g_moe_pf.live++;
+}
+static void rk_moe_preflight_close(void) {
+    std::lock_guard<std::mutex> lk(g_moe_pf.mu);
+    if (g_moe_pf.live > 0) g_moe_pf.live--;
+}
+// A worker count set through the public API after init. No effect once the budgets are
+// frozen (the first supports_op), which is the same "call before graph compute" contract
+// ggml_backend_rocket_set_n_threads already documents for the worker pools themselves.
+static void rk_moe_preflight_set_workers(int n_workers) {
+    if (n_workers <= 0) return;
+    std::lock_guard<std::mutex> lk(g_moe_pf.mu);
+    g_moe_pf.n_workers = n_workers;
+}
+
 // Round an expert's ragged row count up to a coarse bucket. TWO hard constraints meet here,
 // and one bucket satisfies both:
 //
@@ -4951,8 +5265,16 @@ static int rocket_moe_bucket_m(ggml_backend_rocket_context * ctx, int M, int K, 
 // ADMISSION ONLY, no eviction, and that is the correct policy rather than a missing feature:
 // prefill touches EVERY expert EVERY micro-batch, so there is no hotness for an eviction
 // policy to exploit -- the only thing that decides how much of the dequant tax is removed
-// is the total resident bytes. A 60%-resident model removes 60% of the tax; the blend is a
-// win, not a cliff.
+// is the total resident bytes.
+//
+// Removing 60% of the tax is NOT worth 60% of the win, though. What a streamed expert keeps
+// paying is M-independent, so the remainder's share of the wall grows as the prefill
+// shortens and a partly-resident model can land BELOW leaving the experts on the CPU:
+// gpt-oss-20b at pp512 is 17.6 t/s at 99% resident and 12.2 at 82%, against 14.1 for the CPU
+// [HW sweep 2026-07-14]. That is why the placement decision is taken in supports_op, before
+// any of this runs -- see rk_moe_preflight_admit. This path is reached with the stack already
+// reserved under the default; the budget test below is the ROCKET_MOE=1 arm's, and the
+// fallbacks past it are the ones no pre-flight can predict.
 static const rocket_moe_i8_expert * rocket_moe_expert_resident(
         ggml_backend_rocket_context * ctx, const ggml_tensor * as, int64_t e,
         int K, int N, int group) {
@@ -5002,9 +5324,17 @@ static const rocket_moe_i8_expert * rocket_moe_expert_resident(
     // honest -- when every expert is resident the charge is exact. Charging the int8 bytes
     // alone is what turns "19.1 GiB of gpt-oss int8 experts fits a 31 GiB board" into a
     // thrash: it does fit, but only by evicting the 11 GiB GGUF it was made from.
+    //
+    // A stack the PRE-FLIGHT admitted is not re-judged here. It reserved the whole
+    // [K,N,n_expert] stack against the same formula before supports_op claimed the op, and
+    // the reservation is what makes the claim safe: half-ingesting an admitted stack -- some
+    // experts resident, the rest streaming an M-independent dequant -- is exactly the loss
+    // the pre-flight exists to prevent. Re-testing the same estimate here could only refuse
+    // on the rounding between an estimate and the true packed footprint.
     const int    nG  = (int)(K / group);
     const size_t est = (size_t)N * K + (size_t)N * nG * sizeof(float) + (size_t)as->nb[2];
-    if (ctx->moe_cache_budget != 0
+    if (!rk_moe_preflight_reserved(base)
+        && ctx->moe_cache_budget != 0
         && ctx->moe_charged_bytes + est > ctx->moe_cache_budget) {
         ctx->moe_i8_full = true;                       // latch: the rest streams on fp16
         ctx->moe_streamed_keys.insert(key);
@@ -5700,7 +6030,8 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             //   b   (src1) [K, ne11, n_tokens] F32          input activations
             //   ids (src2) [n_expert_used, n_tokens] I32    routing
             //   dst        [N, n_expert_used, n_tokens] F32
-            if (!rocket_moe_on()) return false;
+            const int moe_mode = rocket_moe_mode();
+            if (moe_mode == ROCKET_MOE_OFF) return false;
             const ggml_tensor * a  = op->src[0];
             const ggml_tensor * b  = op->src[1];
             const ggml_tensor * id = op->src[2];
@@ -5711,7 +6042,8 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             // Weight types mirror the dense MUL_MAT gate: F16 zero-copy, F32/BF16/
             // quantized (MXFP4/Q4_K/...) dequant->fp16 via rocket_weight_to_fp16.
             const bool a_quant = ggml_is_quantized(a->type);
-            return a->op == GGML_OP_NONE
+            const bool computable =
+                   a->op == GGML_OP_NONE
                 && (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32
                     || a->type == GGML_TYPE_BF16 || a_quant)
                 && b->type == GGML_TYPE_F32
@@ -5729,6 +6061,109 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
                 // Prefill-gate on the micro-batch token count (M_e ~ n_tokens *
                 // n_used / n_expert): short prefills and decode stay on the CPU.
                 && n_tokens >= rocket_moe_min_tokens();
+            if (!computable) return false;
+            // ROCKET_MOE=1 claims everything the handler can compute, which is the A/B arm
+            // and the configuration the archived MoE measurements were taken under.
+            if (moe_mode == ROCKET_MOE_FORCED) return true;
+
+            // AUTO (the default) narrows that to where the offload is MEASURED to win and
+            // can be held in that regime. Three conditions, each of which is a loss and not
+            // merely a wash when it fails:
+            //
+            //  - NOT ON THE RK3576. Every expert GEMM would reach the RK3588 geometry-
+            //    register generator, which refuses on that part by construction, degrade to
+            //    the fp16 route into the same refusal, and land on the single-threaded host
+            //    reference -- with the scheduler having nowhere else to put the op once we
+            //    have claimed it. The same reasoning as the FLASH_ATTN_EXT gate below.
+            //  - A GGUF-QUANTIZED stack. Deleting the per-micro-batch host dequant IS the
+            //    win; an F16/F32/BF16 stack has no dequant to delete, so what is left is the
+            //    streaming route that measured 0.42-0.90x. It stays reachable via ROCKET_MOE=1.
+            //  - THE WHOLE STACK RESERVED, before the first ingest. See rk_moe_preflight_admit
+            //    for why partial residency is a cliff rather than a proportional win, and why
+            //    the grain is one weight stack.
+            if (rocket_rk3576_selected()) return false;
+            if (!a_quant || !rocket_moe_native_on()) return false;
+            if ((K % 32) || (N % 32)) return false;   // int8 weight k-group AND N-group
+            // TWO FLOORS, AND THEY ARE DIFFERENT QUESTIONS. n_tokens answers neither, and
+            // rocket_moe_min_tokens() is the wrong gate to rely on alone, because the rows an
+            // expert actually receives are M_e = n_tokens * n_used / n_expert -- a property of
+            // the ARCHITECTURE, not of the prompt. gpt-oss routes 4 of 32, so 512 tokens give
+            // each expert ~64 rows; DeepSeek-V2-Lite routes 6 of 64, so the same 512 tokens
+            // give ~48.
+            //
+            // FLOOR 1, THE TILE GRANULE. An expert GEMM smaller than the smallest tile the
+            // resident path can run is mostly padding -- M_e is rounded up onto the bucket
+            // ladder and the pad rows are computed and read back in full (rocket_moe_bucket_m).
+            // This is a geometry requirement, and the granule is the number that already
+            // encodes this machine's row quantum.
+            //
+            // FLOOR 2, THE WORK ONE DISPATCH CARRIES, and this is the one that separates the
+            // architectures. The cost floor 1 exists to amortise is paid PER DISPATCH -- one
+            // gather, one per-(row,K-group) activation quantize, one submit, one fence, one
+            // scatter, per (op, expert-with-rows) -- while the work a dispatch carries is
+            // M_e * K * N. The NPU beats the CPU on that expert when
+            //
+            //     fixed_dispatch  <  M_e * K * N * (1/rate_cpu - 1/rate_npu)
+            //
+            // so the crossover is a threshold on M_e * K * N, and M_e is a proxy for it only
+            // while K * N is held constant. It is not: gpt-oss's expert GEMM is 2880x2880 and
+            // DeepSeek-V2-Lite's is 2048x1408, 2.88x smaller at the SAME row count.
+            //
+            // A row floor alone therefore cannot be right, and this is measured rather than
+            // argued. Mapping M_e -> (default / experts-on-CPU) over -p 512..2048 on both
+            // models, 100% resident and 0 streamed throughout [HW sweep 2026-08-27, RK1,
+            // 600 MHz pinned, governor performance]:
+            //
+            //     DeepSeek  M_e= 72  0.94x     gpt-oss  M_e= 64  1.64x
+            //               M_e= 96  1.03-1.06x         M_e= 96  1.77x
+            //               M_e=144  1.22x              M_e=128  1.91x
+            //               M_e=192  1.31x              M_e=192  2.05x
+            //
+            // (DeepSeek's cells are means of FOUR adjacent pairs -- that arm varies ~15% run to
+            // run there and these ratios sit within a few percent of 1.00; gpt-oss's are single
+            // pairs, whose margins are an order of magnitude outside the same spread.)
+            //
+            // gpt-oss WINS at M_e=64 while DeepSeek LOSES at M_e=72, so any row floor low enough
+            // to admit the first admits the second: no value of a row floor separates them. Work per
+            // dispatch does, and the cells sort by it with no overlap on both architectures at once:
+            // the one clear loser at 2.08e8 MACs, a MARGINAL 1.049x boundary cell at 2.77e8 (eight
+            // pairs, 0.94-1.08), every materially winning cell at or over 4.15e8. The threshold below
+            // is the geometric midpoint of that last gap.
+            //
+            // AND THE BAR IS MATERIALITY, NOT > 1.00, because the one-time expert ingest is charged
+            // ONLY IF THIS GATE ACCEPTS -- so the gate is the one place it can be avoided. An offload
+            // at ratio r saves 1 - 1/r of prefill wall against a fixed ~32 s, so the 1.049x cell does
+            // not repay its own admission until ~16600 tokens of prefill at that micro-batch size,
+            // against ~4800 at 1.22x and ~2100 at gpt-oss's 1.64x. A workload that really does prefill
+            // that much at 768-1250 tokens a micro-batch sets ROCKET_MOE_MIN_WORK=240 and takes it.
+            //
+            // The FORM is derived; the NUMBER is fitted on two architectures, and it is where a
+            // third one gets tested. What the form does not carry is rate_cpu: gpt-oss at
+            // 5.31e8 wins 1.64x where DeepSeek at 5.54e8 wins 1.31x -- same work per dispatch,
+            // different margin, because their CPU kernels differ (MXFP4 against Q4_K). So treat
+            // the threshold as a measured boundary between two points, not as a bound.
+            //
+            // WHICH FLOOR BINDS IS PER ARCHITECTURE, and on gpt-oss floor 2 never does: at the
+            // smallest micro-batch that offloads at all (n_tokens=512, rocket_moe_min_tokens)
+            // it is already at M_e=64 and 531 MMAC, and floor 2 would first bind at M_e=41 --
+            // which floor 1 has excluded. So adding floor 2 leaves gpt-oss placement untouched
+            // by construction, not only by measurement. On DeepSeek-V2-Lite it binds from
+            // M_e >= 118, i.e. past ~1250 tokens in a micro-batch.
+            const int64_t moe_n_used   = id->ne[0];
+            const int64_t moe_n_expert = a->ne[2];
+            if (moe_n_expert <= 0) return false;
+            const int64_t moe_m_e = n_tokens * moe_n_used / moe_n_expert;
+            if (moe_m_e < rocket_moe_m_bucket_env()) return false;
+            // M_e <= n_tokens * n_used (a few thousand) and K * N <= ~1e7, so the product is
+            // comfortably inside int64 for any shape a real MoE produces.
+            if (moe_m_e * K * N < (int64_t)rocket_moe_min_work_mmac() * 1000000) return false;
+            const std::string moe_key = rocket_weight_key(a);
+            bool moe_admitted = false;
+            if (rk_moe_preflight_decided(moe_key, &moe_admitted)) return moe_admitted;
+            const int moe_group = rocket_moe_pick_group((int)K, (int)N);
+            if (moe_group <= 0) return false;         // no legal K-group -> fp16 route only
+            return rk_moe_preflight_admit(moe_key, K, N, a->ne[2],
+                                          moe_group, (size_t)a->nb[2]);
         }
         case GGML_OP_FLASH_ATTN_EXT: {
             // Offload the fused attention op (LLM prefill). Gate exactly what the handler
@@ -6099,34 +6534,13 @@ ggml_backend_t ggml_backend_rocket_init(void) {
     if (const char * e = getenv("ROCKET_INT4_CACHE_MB")) {
         size_t b; if (rocket_parse_mb_budget(e, &b)) ctx->int4_cache_budget = b;
     }
-    // ROCKET_MOE_CACHE_MB: the resident native-quant EXPERT budget in MB (0 = unlimited).
-    //
-    // This is a much bigger appetite than the other caches and needs its own budget rather
-    // than the dense path's fixed 4GB default: a real MoE's expert stack is the bulk of the
-    // model (gpt-oss-20b: 19.1 GiB of int8 expert codes), and the GGUF it was ingested from
-    // must stay mapped -- MoE DECODE reads the active experts from it on the CPU every
-    // token, so it cannot be reclaimed. Full residency therefore does NOT fit a 32GB board
-    // for gpt-oss, and partial residency is the design, not a failure mode.
-    //
-    // So the default is AUTO: size the budget from MemAvailable minus a reserve, exactly as
-    // ROCKET_QUANT_RESIDENT=auto does, and let admission fill it and then degrade. A blanket
-    // "unlimited" on a memory-tight board is a trap (the board has no swap); a fixed default
-    // would be wrong on every board but one.
-    {
-        const char * e = getenv("ROCKET_MOE_CACHE_MB");
-        size_t b;
-        if (e && rocket_parse_mb_budget(e, &b)) {
-            ctx->moe_cache_budget = b;                      // explicit (0 = unlimited)
-            ROCKET_LOGI("[rocket] ROCKET_MOE_CACHE_MB=%s -> resident expert budget %s\n",
-                        e, b ? "set" : "unlimited");
-        } else {
-            const size_t avail   = rocket_meminfo_bytes("MemAvailable");
-            const size_t reserve = rocket_auto_budget_reserve();
-            ctx->moe_cache_budget = (avail > reserve) ? (avail - reserve)
-                                                      : ((size_t)256 << 20);   // minimal floor
-            if (!avail) ctx->moe_cache_budget = (size_t)4096 << 20;   // no signal -> conservative
-        }
-    }
+    // The resident native-quant EXPERT budget (ROCKET_MOE_CACHE_MB, or auto from
+    // MemAvailable). Read from the one process-wide helper the residency PRE-FLIGHT also
+    // reads, so the decision taken in supports_op and the charge taken here are against the
+    // same number -- see rk_moe_ram_budget. Register this backend with the pre-flight ledger
+    // at the same time, which is what tells it how many worker fds (hence how much IOVA
+    // window) the experts will actually be spread over.
+    ctx->moe_cache_budget = rk_moe_ram_budget();
     // ROCKET_BF16_CACHE_MB: host fp32 weight cache for the ROCKET_BF16 datapath, in MB.
     // Default 0 = OFF, unlike every other cache here, because this one holds fp32 -- twice
     // the bf16 weight it was derived from. What it buys is the per-micro-batch BF16/F16 ->
@@ -6140,6 +6554,7 @@ ggml_backend_t ggml_backend_rocket_init(void) {
                         e, b ? "set" : "unlimited");
         }
     }
+    const int backend_n_threads = ctx->n_threads;   // ctx is released to the backend below
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_rocket_guid(),
         /* .iface   = */ rocket_backend_i,
@@ -6147,6 +6562,11 @@ ggml_backend_t ggml_backend_rocket_init(void) {
         /* .context = */ ctx.get(),
     };
     ctx.release();   // ownership transferred to backend->context; freed in ggml_backend_rocket_free
+    // Register with the MoE residency ledger only once the backend exists, so the claim is
+    // paired with the ggml_backend_rocket_free that releases it. It also tells the pre-flight
+    // how many worker fds the resident experts will be spread over -- the 4 GB IOVA window is
+    // per fd, so that count is half of the ceiling it reserves against.
+    rk_moe_preflight_open(backend_n_threads);
     return backend;
 }
 
@@ -6189,6 +6609,10 @@ void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, int n_threads) {
                       "%d -> the new value (%d) does not reconfigure them\n",
                       __func__, ctx->n_threads, v);
     ctx->n_threads = v;
+    // The MoE residency pre-flight sizes its IOVA budget from the worker count (the 4 GB
+    // window is per fd), and it resolves that budget lazily at the first supports_op --
+    // which is after this call in every host that uses it. Keep it told.
+    rk_moe_preflight_set_workers(v);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_rocket_reg)

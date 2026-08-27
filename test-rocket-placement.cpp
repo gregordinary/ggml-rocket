@@ -27,6 +27,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>      // fork/_exit — one child per cached-getenv MoE mode
+#include <sys/wait.h>
 
 // supports_op for a 2D mul_mat: W[K,N] (type wt, leaf) x X[K,M] (f32) -> f32 [N,M].
 static bool mm_supported(ggml_backend_dev_t dev, int K, int N, int M, ggml_type wt) {
@@ -101,8 +103,180 @@ static bool fa_supported(ggml_backend_dev_t dev, int head_dim, int n_tokens, int
     return ok;
 }
 
+// supports_op for a MoE routed-expert op: As[K,N,n_expert] x B[K,1,n_tokens] with
+// Ids[n_used,n_tokens] -> [N,n_used,n_tokens]. `name` is load-bearing, not decoration: the
+// residency pre-flight keys its ledger on the weight's name, and an unnamed stack has no
+// identity the resident expert cache could hold it under.
+static bool moe_supported(ggml_backend_dev_t dev, int K, int N, int n_expert, int n_tokens,
+                          ggml_type wt, const char * name, int n_used_in = 4) {
+    const int n_used = n_used_in;
+    ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * as  = ggml_new_tensor_3d(ctx, wt, K, N, n_expert);
+    if (name) ggml_set_name(as, name);
+    ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_tensor * dst = ggml_mul_mat_id(ctx, as, b, ids);
+    bool ok = ggml_backend_dev_supports_op(dev, dst);
+    ggml_free(ctx);
+    return ok;
+}
+
 #define CHECK(cond, msg) do { bool _c = (cond); \
     printf("  [%s] %s\n", _c ? "PASS" : "FAIL", msg); if (!_c) fails++; } while (0)
+
+// ---------------------------------------------------------------------------
+// MoE expert placement (MUL_MAT_ID) — the residency pre-flight
+// ---------------------------------------------------------------------------
+// ROCKET_MOE's three states and the pre-flight's budget are read ONCE per process (cached
+// getenv, and the budget is deliberately frozen so it cannot shrink under its own ingest),
+// so each mode gets its own forked child rather than a setenv the running process would
+// not see. Each child returns its own failure count.
+//
+// The pre-flight's ledger is also cumulative across the stacks a child asks about, which is
+// the point of it -- so a child asserts at most one "does not fit" case, and asks about the
+// fitting stacks first.
+static int moe_child(const char * moe, const char * budget_mb) {
+    if (moe)       setenv("ROCKET_MOE", moe, 1); else unsetenv("ROCKET_MOE");
+    if (budget_mb) setenv("ROCKET_MOE_CACHE_MB", budget_mb, 1);
+
+    ggml_backend_reg_t reg = ggml_backend_rocket_reg();
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+    const bool rk76 = rk_is_rk3576();
+    int fails = 0;
+
+    // K/N are the int8 route's contract (K%32, N%32, K>=64, N>=64) and K picks a legal
+    // quant K-group; n_tokens clears the prefill floor (ROCKET_MOE_MIN_TOKENS, 512).
+    //
+    // These are gpt-oss-20b's REAL expert dimensions, not a token 256x256, because the
+    // placement gate now has a per-dispatch WORK floor (M_e * K * N) and a toy shape sits
+    // three orders of magnitude under it -- every "should offload" case would pass for the
+    // wrong reason, or rather fail for one. The DeepSeek-V2-Lite cases below use that
+    // model's real 2048x1408 for the same reason: the whole point of those cells is that
+    // K * N differs 2.88x between the two architectures.
+    const int EK = 2880, EN = 2880, NE = 8, NT = 512;
+    const int DK = 2048, DN = 1408;                  // DeepSeek-V2-Lite's expert GEMM
+
+    if (!moe) {   // AUTO — the default
+        printf("  -- ROCKET_MOE unset (AUTO) --\n");
+        // A quantized expert stack that fits: the native-quant route, which is the only MoE
+        // route measured to WIN. RK3576 declines it -- there is no encoder for this
+        // datapath on that part, so claiming it would hand the scheduler host-reference work.
+        CHECK( moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_Q8_0, "blk.0.ffn_gate_exps.weight") == !rk76,
+               rk76 ? "MoE: Q8_0 experts, fits budget  -> CPU (no expert encoder on rk3576)"
+                    : "MoE: Q8_0 experts, fits budget  -> offload (native-quant, reserved)" );
+        // An F16/BF16/F32 stack has no per-micro-batch host dequant to delete, so the only
+        // route left for it is the streaming one that measured 0.42-0.90x. Not a default.
+        CHECK( !moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_F16, "blk.1.ffn_gate_exps.weight"),
+               "MoE: F16 experts                -> CPU (no dequant to delete)" );
+        // No stable name -> nothing the resident cache could key the ingest on, so the
+        // pre-flight cannot reserve it and the runtime would stream it.
+        CHECK( !moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_Q8_0, nullptr),
+               "MoE: unnamed expert stack       -> CPU (nothing to reserve)" );
+        // Decode and short micro-batches: M_e ~ n_tokens*n_used/n_expert is too small.
+        CHECK( !moe_supported(dev, EK, EN, NE, 1, GGML_TYPE_Q8_0, "blk.2.ffn_gate_exps.weight"),
+               "MoE: n_tokens=1 (decode)        -> CPU" );
+        // The shape contract, same int8 k-group/N-group the dense W8A8 route uses.
+        CHECK( !moe_supported(dev, 80, EN, NE, NT, GGML_TYPE_Q8_0, "blk.3.ffn_gate_exps.weight"),
+               "MoE: K%32!=0 (K=80)             -> CPU" );
+        // THE PER-EXPERT ROW FLOOR, which is an architecture property and not a prompt one.
+        // Both cases below clear the n_tokens gate; what separates them is n_used/n_expert.
+        // gpt-oss's 4-of-32 gives 512 tokens -> 64 rows an expert, at the granule, and it
+        // wins. DeepSeek-V2-Lite's 6-of-64 gives 48 -- under the granule its GEMM is padded
+        // up to -- and it measured 19.09 t/s against 26.04 with the experts on the CPU, a 27%
+        // regression at 100% residency. Declining it is what keeps the default safe on a
+        // model nobody re-benched before flipping the flag.
+        CHECK( moe_supported(dev, EK, EN, 32, 512, GGML_TYPE_Q8_0,
+                             "blk.4.ffn_gate_exps.weight", 4) == !rk76,
+               rk76 ? "MoE: 4-of-32, M_e=64 (at granule) -> CPU (no expert encoder on rk3576)"
+                    : "MoE: 4-of-32, M_e=64 (at granule) -> offload" );
+        CHECK( !moe_supported(dev, DK, DN, 64, 512, GGML_TYPE_Q8_0,
+                              "blk.5.ffn_gate_exps.weight", 6),
+               "MoE: 6-of-64, M_e=48 (under granule) -> CPU (the GEMM would be padding)" );
+        CHECK( moe_supported(dev, DK, DN, 64, 2048, GGML_TYPE_Q8_0,
+                             "blk.6.ffn_gate_exps.weight", 6) == !rk76,
+               rk76 ? "MoE: 6-of-64, M_e=192 at pp2048      -> CPU (rk3576)"
+                    : "MoE: 6-of-64, M_e=192 at pp2048      -> offload (same model, longer prefill)" );
+
+        // THE PER-DISPATCH WORK FLOOR, which is the floor the row floor cannot be. These
+        // three cells are the measurement that put it there: the SAME per-expert row count
+        // is a win on one architecture and a loss on the other, because the work a dispatch
+        // carries is M_e * K * N and gpt-oss's expert GEMM is 2.88x DeepSeek-V2-Lite's.
+        // Measured 2026-08-27 (default / experts-on-CPU, 100% resident, 0 streamed):
+        // gpt-oss M_e=96 reads 1.77x, DeepSeek M_e=96 reads 0.94x, DeepSeek M_e=144 1.25x.
+        // A row floor has no value that separates the first two. See supports_op.
+        CHECK( moe_supported(dev, EK, EN, 32, 768, GGML_TYPE_Q8_0,
+                             "blk.7.ffn_gate_exps.weight", 4) == !rk76,
+               rk76 ? "MoE: 4-of-32 M_e=96, 796 MMAC/dispatch -> CPU (rk3576)"
+                    : "MoE: 4-of-32 M_e=96, 796 MMAC/dispatch -> offload" );
+        // M_e=72 is the measured LOSER and the cell that proves a row floor cannot work: it
+        // clears the granule (72 >= 64) and still reads 0.94x over four adjacent pairs, none
+        // above 0.970, while gpt-oss at a LOWER row count (64) reads 1.64x.
+        CHECK( !moe_supported(dev, DK, DN, 64, 768, GGML_TYPE_Q8_0,
+                              "blk.10.ffn_gate_exps.weight", 6),
+               "MoE: 6-of-64 M_e=72, 208 MMAC/dispatch -> CPU (over the granule, under the work floor)" );
+        CHECK( !moe_supported(dev, DK, DN, 64, 1024, GGML_TYPE_Q8_0,
+                              "blk.8.ffn_gate_exps.weight", 6),
+               "MoE: 6-of-64 M_e=96, 277 MMAC/dispatch -> CPU (the boundary cell)" );
+        CHECK( moe_supported(dev, DK, DN, 64, 1536, GGML_TYPE_Q8_0,
+                             "blk.9.ffn_gate_exps.weight", 6) == !rk76,
+               rk76 ? "MoE: 6-of-64 M_e=144, 415 MMAC/dispatch -> CPU (rk3576)"
+                    : "MoE: 6-of-64 M_e=144, 415 MMAC/dispatch -> offload (over the floor)" );
+        return fails;
+    }
+    if (moe[0] == '0') {
+        printf("  -- ROCKET_MOE=0 (OFF) --\n");
+        CHECK( !moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_Q8_0, "blk.0.ffn_gate_exps.weight"),
+               "MoE: Q8_0 experts, ROCKET_MOE=0 -> CPU" );
+        return fails;
+    }
+    printf("  -- ROCKET_MOE=1 (FORCED) --\n");
+    // FORCED claims everything the handler can compute, which is what the archived MoE
+    // measurements were taken under: the fp16 streaming route included, and with no
+    // residency reservation. It is the A/B arm, not the recommended setting.
+    CHECK( moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_F16, "blk.0.ffn_gate_exps.weight") == !rk76,
+           rk76 ? "MoE: F16 experts, ROCKET_MOE=1  -> CPU (rk3576 has no MoE route at all)"
+                : "MoE: F16 experts, ROCKET_MOE=1  -> offload (the streaming A/B arm)" );
+    CHECK( !moe_supported(dev, EK, EN, NE, 1, GGML_TYPE_Q8_0, "blk.1.ffn_gate_exps.weight"),
+           "MoE: n_tokens=1, ROCKET_MOE=1   -> CPU (the prefill floor still holds)" );
+    return fails;
+}
+
+// The budget-exhaustion case gets its own child: it needs a budget small enough that a
+// stack cannot fit, and the budget is frozen for the life of the process.
+static int moe_budget_child(void) {
+    setenv("ROCKET_MOE_CACHE_MB", "1", 1);   // 1 MB: smaller than any real expert stack
+    unsetenv("ROCKET_MOE");
+    ggml_backend_reg_t reg = ggml_backend_rocket_reg();
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+    int fails = 0;
+    printf("  -- ROCKET_MOE unset (AUTO), ROCKET_MOE_CACHE_MB=1 --\n");
+    // The whole point of the pre-flight: a stack that will not fit is declined OUTRIGHT,
+    // before any ingest, so the experts run on the CPU instead of half-ingesting into the
+    // streamed-remainder loss that partial residency is.
+    // Real expert dimensions, deliberately: a toy 256x256 stack is declined by the
+    // per-dispatch work floor long before the budget is consulted, so the case would pass
+    // while testing nothing about the pre-flight.
+    CHECK( !moe_supported(dev, 2880, 2880, 8, 512, GGML_TYPE_Q8_0, "blk.0.ffn_gate_exps.weight"),
+           "MoE: stack over the RAM budget  -> CPU (pre-flight declines, no half-ingest)" );
+    return fails;
+}
+
+// Run one child's cases in a forked process and return its failure count. The knobs the
+// child sets are cached-getenv statics; a fork is what keeps them independent.
+static int run_moe_child(int (*fn)(void)) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0) { printf("  [FAIL] fork() for the MoE placement cases\n"); return 1; }
+    if (pid == 0) { int f = fn(); fflush(stdout); _exit(f > 100 ? 100 : f); }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st)) { printf("  [FAIL] MoE placement child did not exit cleanly\n"); return 1; }
+    return WEXITSTATUS(st);
+}
+static int moe_auto_child(void)   { return moe_child(nullptr, nullptr); }
+static int moe_off_child(void)    { return moe_child("0", nullptr); }
+static int moe_forced_child(void) { return moe_child("1", nullptr); }
 
 int main() {
     // The RK3576's only matmul route is the W8A8 one, and ROCKET_INT8 selects it. Set it
@@ -199,6 +373,12 @@ int main() {
             "FA: K/V not F16                           -> CPU" );
     CHECK( !fa_supported(dev, HD, 256, NH, 1024, NKVH, GGML_TYPE_F16, 8.0f),
             "FA: ALiBi (max_bias>0)                    -> CPU" );
+
+    // MoE routed-expert placement. Each mode is a forked child (see run_moe_child).
+    fails += run_moe_child(moe_auto_child);
+    fails += run_moe_child(moe_budget_child);
+    fails += run_moe_child(moe_off_child);
+    fails += run_moe_child(moe_forced_child);
 
     printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL PASS");
     return fails ? 1 : 0;

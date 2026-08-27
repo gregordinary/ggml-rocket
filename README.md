@@ -104,9 +104,13 @@ The backend offloads the ops that dominate prefill and leaves the rest on the CP
   offload, dequantized to fp16 on the fly. Decode (`M=1` GEMV) is forced to the CPU.
 - **`FLASH_ATTN_EXT`** — prefill attention, on the NPU by default when `n_kv ≥ 1024`. Bit-faithful
   and submit-chained: 1.07× at 4K, 1.50× at 8K, 1.25× at 16K, parity below. [HW sweep, F16, 600 MHz]
-- **Opt-in datapaths** — native int8 (`ROCKET_INT8=1`), int4 (`ROCKET_INT4=1`), bf16
-  (`ROCKET_BF16=1`), and MoE routed experts (`ROCKET_MOE=1`). Each is numerically faithful; see the
-  [knob table](API.md#runtime-knobs).
+- **`MUL_MAT_ID`** — MoE routed experts, on the NPU by default for a **quantized** expert stack
+  whose whole `[K, N, n_expert]` stack a residency pre-flight can reserve up front and whose
+  per-expert GEMM is big enough to pay for its own dispatch. Worth **~2.4× the CPU** at pp2048
+  (gpt-oss-20b). A stack that does not qualify is left on the CPU rather than half-ingested, so the
+  default stays above the experts-on-CPU baseline at every board size.
+- **Opt-in datapaths** — native int8 (`ROCKET_INT8=1`), int4 (`ROCKET_INT4=1`), and bf16
+  (`ROCKET_BF16=1`). Each is numerically faithful; see the [knob table](API.md#runtime-knobs).
 - **Everything else** — norms, rope, the conv front-end, decode — stays on the CPU. The
   `rocket-userspace` driver composes the offloaded matmuls into a full Whisper/transformer encoder
   block on the NPU (cos = 1.000000 vs an fp64 oracle); this backend wires the attention sublayer of
@@ -120,15 +124,17 @@ The envelope, all HW-validated on the RK3588 and PPL-faithful to the CPU backend
   is ~460 GOP/s across precisions (DMA/dispatch-bound, not MAC-bound). A quantized GGUF wants
   `-b 2048 -ub 2048`. Bottleneck-conditional, not a permanent property — see
   [API.md](API.md#why-quantization-does-not-speed-prefill).
-- **MoE routed experts run on the CPU by default; `ROCKET_MOE=1` puts them on the NPU and is worth
-  **2.16× the CPU** at pp2048** (gpt-oss-20b, MXFP4, `-b 2048 -ub 2048`; 1.34× at pp512 — it wins at
-  every prefill length). The lever is **residency, not quantization**: a quantized expert on the
-  naive route is dequantized on the host *every micro-batch*, and that decode does not shrink with
-  the row count, so it costs ~119 s of a prefill before any arithmetic. The native-quant route
-  ingests each expert **once** into int8 codes that stay resident in NPU BOs and deletes it. Opt-in
-  because the win is conditional on nearly the whole expert stack fitting RAM (99% resident wins;
-  82% resident *loses* at short prefill), and because it costs a one-time ~70 s ingest at the first
-  prefill. See [API.md](API.md#native-quant-experts).
+- **MoE routed experts are worth ~2.4× the CPU at pp2048** (gpt-oss-20b, MXFP4, `-b 2048 -ub 2048`;
+  ~1.8× at pp512 — it wins at every prefill length, and ~1.6×/1.7× over experts-on-CPU at the
+  llama.cpp default `-ub 512`). The lever is **residency, not quantization**: a quantized expert on
+  the naive route is dequantized on the host *every micro-batch*, and that decode does not shrink with
+  the row count, so it costs ~119 s of a prefill before any arithmetic. The native-quant route ingests
+  each expert **once** into int8 codes that stay resident in NPU BOs and deletes it. Because the win
+  is conditional on that residency, the placement gate reserves a whole expert stack before claiming
+  that stack's op and leaves on the CPU what it cannot reserve — which keeps the default above the
+  experts-on-CPU baseline on a board too small to hold the stack, where claiming it unreserved reads
+  *below* it. It costs a one-time ingest at the first prefill, per `llama_context` — **~36 s** on gpt-oss-20b, **~32 s** on DeepSeek-V2-Lite. The dominant term is the NPU-BO pack, and it is bytes-bound at ~500–545 MB/s rather than per expert, so it tracks how much of the stack goes resident, not how many experts there are.
+  See [API.md](API.md#native-quant-experts).
 - **bf16 weights prefill ~0.55–0.6× native fp16** (re-decoded per micro-batch); convert to fp16 for
   full speed, or set `ROCKET_BF16=1` for the exact fp32-output bf16 datapath.
 

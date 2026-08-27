@@ -176,13 +176,98 @@ model on raw text is not meaningful).
 
 ## MoE and MLA models
 
-The opt-in `MUL_MAT_ID` expert path (gpt-oss-20b, DeepSeek-V2-Lite).
+The `MUL_MAT_ID` expert path (gpt-oss-20b, DeepSeek-V2-Lite).
 
 Mixture-of-experts models route the expert FFNs through `GGML_OP_MUL_MAT_ID`. This backend has a
 `MUL_MAT_ID` handler — it buckets the routed `(slot,token)` rows by expert and runs each active
-expert's GEMM on the NPU, bit-faithfully. With `ROCKET_MOE=1` it is worth **2.16× the CPU** at pp2048
-on gpt-oss-20b, and it wins at every prefill length (table below). It stays **opt-in** because the win
-is conditional on how much RAM the host has, not because it is slow — see **Residency is the route**.
+expert's GEMM on the NPU, bit-faithfully. It is worth **~2.4× the CPU** at pp2048 on gpt-oss-20b, and
+it wins at every prefill length there (table below) — but eligibility is per architecture, not universal:
+see the DeepSeek-V2-Lite section for a MoE whose routing puts it under the per-dispatch work floor at short
+prefill.
+
+**`ROCKET_MOE` has three states**, because the route's two regimes have opposite signs:
+
+| `ROCKET_MOE` | placement |
+|---|---|
+| unset (**default**) | Claim an expert op only where the offload is measured to win: a **GGUF-quantized** stack, on the RK3588, whose whole `[K, N, n_expert]` stack the residency pre-flight can reserve before the first ingest, **and** whose per-expert GEMM clears both size floors — the tile granule (`ROCKET_MOE_M_BUCKET`) and the per-dispatch work floor (`ROCKET_MOE_MIN_WORK`). Anything else stays on the CPU. |
+| `1` | Claim every `MUL_MAT_ID` the handler can compute — the fp16 streaming route included, with no reservation. The A/B arm; not the recommended setting. |
+| `0` | Experts stay on the CPU whatever the shape. |
+
+**The pre-flight is what makes the default safe.** An expert stack's resident cost is knowable from
+its tensor alone — `[K, N, n_expert]` plus the GGUF source stride — so the decision is taken in
+`supports_op`, *before* the first ingest, against both the RAM budget and the aggregate NPU IOVA
+window (`n_threads × 4 GB`; the window is per fd). A stack that will not fit is left on the CPU
+**whole**, rather than half-ingested into the partial-residency loss described under **Residency is
+the route**.
+
+**The budget is read once per process, and it moves.** `ROCKET_MOE_CACHE_MB`'s auto value is
+`MemAvailable − 6 GiB`, resolved at the **first** `supports_op` and then frozen (a re-read per
+context would shrink under its own success — the ingest it authorises is what lowers
+`MemAvailable`). Frozen per process still leaves it varying *between* processes: measured on one
+board in one session, the same DeepSeek-V2-Lite run saw **24.6 GB** early and **20.7 GB** after
+several hours of multi-GB allocation churn, which is the difference between admitting all 78 of its
+expert stacks and 70. So a long-lived server that builds a fresh `llama_context` late in its life
+can place fewer stacks on the NPU than the same process would have at startup. Nothing warns about
+it — the teardown line from `ggml_backend_rocket_moe_stats` is the only place it shows. Pin
+`ROCKET_MOE_CACHE_MB` explicitly if you need the placement to be reproducible.
+
+**Two size floors are the second half of it, and residency implies neither.** The rows an expert
+actually receives are `M_e = n_tokens · n_used / n_expert`, which is a property of the
+**architecture**, not of the prompt: gpt-oss routes 4-of-32, so 512 tokens give each expert ~64 rows;
+DeepSeek-V2-Lite routes 6-of-64, so the same 512 tokens give ~48. At **100% residency** DeepSeek at
+pp512 reads **19.09 t/s against 26.04 with the experts left on the CPU** — a 27% regression that
+residency cannot see.
+
+- **The tile granule** (`ROCKET_MOE_M_BUCKET`, 64 rows). `M_e` is rounded up onto a fixed bucket
+  ladder and the pad rows are computed and read back in full, so an expert GEMM smaller than the
+  smallest tile the resident path can run is mostly padding. This one is tile geometry.
+- **The work one dispatch carries** (`ROCKET_MOE_MIN_WORK`, 340 mega-MACs of `M_e · K · N`). The
+  per-expert cost the granule exists to amortise — one gather, one activation quantize, one submit,
+  one fence, one scatter — is paid **per dispatch**, while the work a dispatch carries is
+  `M_e · K · N`. So the crossover is a threshold on that product, and `M_e` is a proxy for it only
+  while `K · N` is constant. It is not: gpt-oss's expert GEMM is 2880×2880 and DeepSeek-V2-Lite's is
+  2048×1408, **2.88× smaller at the same row count**.
+
+Mapping `M_e` → (default ÷ experts-on-CPU) over `-p 512…2048` on both models, 100% resident and
+0 streamed throughout [HW sweep 2026-08-27, 600 MHz pinned, governor `performance`]:
+
+| `M_e` | 64 | 72 | 96 | 128 | 144 | 192 | 256 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| gpt-oss (2880×2880) | 1.64× | — | **1.77×** | 1.91× | — | 2.05× | 2.08× |
+| DeepSeek (2048×1408) | — | **0.948×** | 1.049× | — | 1.225× | 1.313× | — |
+
+**gpt-oss wins 1.64× at `M_e` = 64 while DeepSeek loses 5–6% at `M_e` = 72** — so any row floor low
+enough to admit the first admits the second, and no row floor separates them. Work per dispatch does:
+the cells sort by it with no overlap, across both architectures at once. (DeepSeek's cells are means
+of four adjacent pairs; its offloaded arm varies ~15% run to run, so a single pair cannot decide a
+cell this close to 1.00 — `M_e` = 72 and 144 are four pairs, `M_e` = 96 is eight, `M_e` = 192 is
+two. gpt-oss's margins are an order of magnitude outside that spread, so one pair each suffices.)
+
+**Which floor binds is per architecture.** On gpt-oss it is always the granule — the work floor would
+first bind at `M_e` = 41, which the granule already excludes — so adding it left gpt-oss's placement
+unchanged by construction, not only by measurement. On DeepSeek-V2-Lite the work floor binds at
+`M_e` ≥ 118, i.e. past ~1250 tokens in a micro-batch.
+
+The **form** is derived; the **number** is fitted on two architectures — a third is where it gets
+tested, and it changes placement there: a 128-expert/8-used model with a 2048×768 expert would be
+declined at `M_e` = 128 (201 MMAC) where the row floor alone accepted it.
+
+**The floor is a MATERIALITY bar, not `> 1.00`, and the ingest is why.** The one-time expert ingest
+(~32 s per `llama_context` on DeepSeek, ~36 s on gpt-oss) is charged **only if the gate accepts**, so
+the gate is the one place it can be avoided. An offload at ratio `r` saves `1 − 1/r` of prefill wall,
+so the ingest breaks even after **~16 300 tokens** of prefill at a 1.05× cell, **~4 800** at 1.22×,
+and **~2 100** at gpt-oss's 1.64×. A cell a few percent above parity costs a short session more than
+it saves, which is what makes a bar above 1.00 the correct default rather than a cautious one.
+
+The grain is **one weight stack** (one layer's `ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`), not
+the whole model. "Decline unless the entire model fits" would decline gpt-oss-20b on the very 32 GB
+board its win was measured on — 19.1 GiB of int8 codes plus the 11.3 GiB GGUF they are decoded from
+do not both fit, and the winning run was 99% resident, not 100%. Per-stack admission keeps that win
+and still has no cliff, because a **declined** stack runs on the CPU rather than streaming: the
+M-independent dequant is then never paid at all. What is left is a blend of the offloaded route and the
+CPU baseline, bounded below by the baseline at every RAM size. A declined stack costs nothing at the
+seam either — this backend's buffer type *is* the CPU buffer type, so a CPU-placed op beside an
+offloaded neighbour is a scheduler bookkeeping entry, not a copy.
 
 **How an expert reaches the NPU decides everything.** There are two routes, and only one of them wins:
 
@@ -192,10 +277,11 @@ is conditional on how much RAM the host has, not because it is slow — see **Re
   than the GEMM saves, where the CPU's fused quantized kernel pays no dequant at all. Measured on
   gpt-oss-20b: **4.59 t/s at pp512, 10.18 at pp2048** — *worse than leaving the experts on the CPU*.
   This is the route the handler originally shipped with, and why it was originally off by default.
-- **The native-quant route** (`ROCKET_MOE_NATIVE`, **on by default** within `ROCKET_MOE=1`) ingests a
+- **The native-quant route** (`ROCKET_MOE_NATIVE`, **on by default**, and the only route the default
+  placement claims) ingests a
   **GGUF-quantized** expert **once** into int8 codes that stay resident in NPU BOs, and each call
   quantizes only the activation, per `(row, K-group)`. That deletes the per-micro-batch dequant
-  entirely, and it is what turns the loss into the 2.16×. An **F16** expert always takes the fp16
+  entirely, and it is what turns the loss into the win. An **F16** expert always takes the fp16
   route — it has no dequant to delete.
 
 ### Native-quant experts
@@ -241,13 +327,32 @@ it once.
 The route is gated bit-faithful against the CPU backend at the primitive level (`test-rocket-moe`, with
 outlier-channel activations: MXFP4 cosine 0.9999, Q4_K 0.9999, Q8_0 0.9999).
 
-**Measured end to end — gpt-oss-20b (MXFP4), `-b 2048 -ub 2048`, 600 MHz, clock pinned:**
+**Measured end to end — gpt-oss-20b (MXFP4), `-b 2048 -ub 2048`, 600 MHz, clock pinned, governor
+`performance`, one board and one `.so` throughout:**
 
-| test | CPU | NPU, experts on CPU | NPU, native-quant experts |
-|---|---:|---:|---:|
-| pp512  | 13.09 | 14.11 | **17.57 (1.34× CPU)** |
-| pp1024 | 12.99 | 14.29 | **24.38 (1.88×)** |
-| pp2048 | 12.40 | 13.89 | **26.78 (2.16×)** |
+| test | CPU | NPU, `ROCKET_MOE=0` | **NPU, default** | NPU, `ROCKET_MOE=1` |
+|---|---:|---:|---:|---:|
+| pp512  | 12.17 | 14.08 | **22.0 (1.81× CPU)** | 24.81 (2.04×) |
+| pp2048 | 11.80 | 13.62 | **28.1 (2.38×)** | 34.01 (2.88×) |
+
+The default column is the **mean of six runs** spanning 20.5–22.8 (pp512) and 26.9–28.7 (pp2048),
+at identical placement each time — 63 of 72 expert stacks, 1656 experts, **0 streamed**. It is quoted
+as a mean because a single run of this arm landed at the bottom of that spread and briefly read as a
+regression; the `ROCKET_MOE=0` control was stable to ±0.05 across the same rebuilds, which is what
+identified the spread as this arm's own and not the board's.
+
+At the llama.cpp **default `-ub 512`** the default reads **22.2 (21.7–22.7) / 22.5 (22.4–22.8)** against
+14.13 / 13.53 with the experts on the CPU — about **1.6× / 1.7×**. The route does *not* collapse at a small
+micro-batch: that tax belonged to the fp16 streaming route's per-micro-batch dequant, and
+native-quant has none to multiply. It does give up ~20% at pp2048 versus `-ub 2048`, so
+`-b 2048 -ub 2048` is still the setting to run it at.
+
+**The default is deliberately not the peak.** The pre-flight reserves all `n_expert` experts of a
+stack, where the lazy admission it front-runs charges only the ~82% the router actually exercises — so
+the default takes 63 of 72 stacks (100% resident, **0 streamed**) and `ROCKET_MOE=1` takes all 72,
+which is worth 8% at pp512 and 16% at pp2048. The trade is **sign for peak**, and on a board with RAM
+to spare the peak comes back through `ROCKET_MOE_CACHE_MB` — which keeps the zero-streamed property —
+rather than through `ROCKET_MOE=1`, which does not.
 
 **Residency is the route.** The win is conditional on nearly the whole expert stack fitting: at 99%
 resident the numbers above hold, but at **82%** resident the same route reads 12.19 at pp512 — *below*
@@ -255,19 +360,30 @@ the 14.11 you get by leaving the experts on the CPU. That is a cliff, not a grad
 the cost structure: a streamed expert keeps paying a weight dequant that is **independent of its row
 count**, while a resident one pays a GEMM that shrinks with `M` — so the streamed remainder's share of
 the wall clock *grows as the prefill shortens* (12% of pp2048, 43% of pp512). **A residency percentage
-is not a cost percentage.** The backend warns when residency lands under ~95%; raise
-`ROCKET_MOE_CACHE_MB` if the RAM is there, or set `ROCKET_MOE=0`.
+is not a cost percentage.**
 
-`ROCKET_MOE` stays **opt-in** for exactly that reason: whether it helps depends on how much RAM the
-machine has, and a default that silently regresses on a smaller board is not a default.
+**But "any streaming is a cliff" is too strong**, and it was the premise the pre-flight was designed
+against. Measured on this board, `ROCKET_MOE=1` at **91% resident was the fastest arm of all** — at
+high residency, streaming a few experts is *cheaper* than CPU-placing whole stacks. The crossover sits
+between **52% and 82%**: at an induced 12 GB budget the same forced arm falls to 52% resident and
+reads **13.63 at pp512 against a 14.08 experts-on-CPU baseline**, a net loss, where the default's 30
+fully-resident stacks read **17.02 (1.21×)**. That is what the pre-flight buys, and it is the whole
+reason the default is bounded below at every budget.
+
+Under the default a stack is reserved before its op is claimed, so the streamed remainder does not
+arise at all. Reaching a low residency under the default therefore means a limit no pre-flight can see
+ahead of the ingest — most likely an exhausted NPU IOVA window, for which the exit is
+`ROCKET_N_THREADS` (more fds, more per-fd window) rather than more RAM. The backend warns below 80%
+and names which budget bound it; that threshold is conservative, not measured at its edge.
 
 **DeepSeek-V2-Lite** is a **Multi-head Latent Attention (MLA) + MoE** model — it has both an asymmetric
 attention (DK=192 ≠ DV=128) and routed experts. The FA gate accepts DK≠DV (bit-faithful primitive),
 so MLA is *engageable* with `-fa`, but it is dispatch-bound and pp-neutral at these lengths, so by default
-it stays on the CPU; the routed experts have a handler too (`ROCKET_MOE=1`), whose **fp16 route** loses
-here (below). So by default the NPU takes the large MLA projections, the 2 always-on shared experts, and
-`lm_head` (ordinary `MUL_MAT`) — enough for a **modest but real** win, *larger* than pure-MoE gpt-oss
-because those dense projections are substantial (Q4_K_M, 15.71 B / ~2.4 B active, RK3588 @ 600 MHz, warm):
+it stays on the CPU. The routed experts take the native-quant route by default **at long prefill only**
+(see below — this is the model that showed both size floors). Below them the NPU takes the
+large MLA projections, the 2 always-on shared experts, and `lm_head` (ordinary `MUL_MAT`) — a **modest
+but real** win, *larger* than pure-MoE gpt-oss's dense-only case because those projections are
+substantial (Q4_K_M, 15.71 B / ~2.4 B active, RK3588 @ 600 MHz, warm):
 
 | | pp512 | pp1024 | pp2048 | tg64 |
 |---|---|---|---|---|
@@ -280,12 +396,29 @@ CPU (differential wikitext PPL Δ −0.26%, a base model so the absolute ~8.2 is
 On the **fp16 expert route** the handler drops prefill to **0.25×→0.59×** the CPU (5.05 / 7.82 / 11.30 at
 `-ub 2048`) — a *bigger* loss than gpt-oss's, since DeepSeek's faster CPU and already-winning default NPU
 leave more to give up, and its experts are smaller (`K=2048, N=1408`) and more numerous (64), so the
-per-expert dequant and dispatch are a larger share of each one. **The native-quant route has not been
-measured on DeepSeek** — it is the route `ROCKET_MOE=1` now selects for a quantized expert, and the
-mechanism that makes it win on gpt-oss (deleting the per-micro-batch dequant) applies here too, but
-DeepSeek's Q4_K experts take the dequantize-once-requantize path rather than MXFP4's exact integer
-shift, and its residency profile is its own question. Treat gpt-oss's 2.16× as measured and DeepSeek's
-expert offload as **unmeasured**, not as a predicted win.
+per-expert dequant and dispatch are a larger share of each one. That route is never taken by default.
+
+**The native-quant route on DeepSeek — now measured, and it is the reason the row floor exists.**
+[HW sweep 2026-08-27, 600 MHz, governor `performance`.]
+
+| test | CPU | NPU, `ROCKET_MOE=0` | NPU, experts on the NPU |
+|---|---:|---:|---:|
+| pp512  | 19.54 | **26.04** | 19.09 — **0.73×**, a regression |
+| pp2048 | 18.50 | 21.63 | **27.9 (1.29×)** |
+
+The pp512 row is a 27% regression at **100% residency, 0 streamed** — so it is not the
+partial-residency mechanism, and a residency check alone would never have caught it. DeepSeek routes
+**6 of 64** experts, so 512 tokens give each one ~48 rows, below the 64-row granule its GEMM is padded
+up to; gpt-oss routes 4 of 32 and gets 64 rows at the same token count. With the granule in place
+DeepSeek's pp512 returns to **25.9** — the experts-on-CPU number — and pp2048 keeps its win. Same
+model, offloaded at long prefill and declined at short.
+
+**And the granule alone was not enough.** Mapping the whole range showed the default still reading
+**0.96× at `M_e` = 72 and 0.94× at `M_e` = 96** — cells it accepted — while gpt-oss reads 1.77× at
+that same `M_e` = 96. What separates them is the work per dispatch, not the row count, because
+DeepSeek's expert GEMM is 2.88× smaller; see **Two size floors** above. **Do not read gpt-oss's ratio
+across to another MoE architecture**: `n_used / n_expert` *and* `K · N` both decide whether the
+offload is eligible, and the second one is the easy one to forget.
 
 ## The RK3576 (second target)
 
@@ -461,7 +594,7 @@ budget does not fit, so it is safe to request.
 | Agentic / RAG / long prompts | quantized GGUF | `-b 2048 -ub 2048` | A quant GGUF re-dequantizes per micro-batch; `-ub 2048` ~doubles prefill over the `-ub 512` default |
 | Agentic / RAG, repeated prefill | quantized GGUF, fp16 fits RAM | `+ ROCKET_QUANT_RESIDENT=auto` | Dequant + pack once → fp16 prefill parity (~1.5×). Needs ~the fp16 model size free |
 | Agentic / RAG, repeated prefill | F16, fits ~2× RAM | `+ ROCKET_F16_RESIDENT=auto` | Pack weights once across turns; single-digit-percent gain |
-| Any | MoE (gpt-oss, …), experts fit RAM | `-b 2048 -ub 2048 + ROCKET_MOE=1` | Routed experts resident as int8: up to 2.16× at pp2048. A loss if the stack does not fit — leave off otherwise |
+| Any | MoE (gpt-oss, …) | `-b 2048 -ub 2048` | Routed experts resident as int8, on by default: ~2.4× at pp2048 on gpt-oss. A stack that will not fit the resident budget, or whose per-expert row count is under the tile granule, is left on the CPU by the placement gate — so nothing to set. `ROCKET_MOE=1` is 13-18% faster where the stack nearly fits and *below* the experts-on-CPU baseline where it does not |
 | Model too big at F16 | — | a `Q4_K_M` GGUF, or `ROCKET_INT4=1` from an F16 GGUF | Footprint, not speed — quantization does not speed prefill here |
 
 `ROCKET_INT8` / `ROCKET_INT4` / `ROCKET_BF16` are numerically faithful but tie the prefill throughput of
@@ -493,12 +626,13 @@ and so are armed by an empty value; none of them changes a result.
 | `ROCKET_FLASH_ATTN_MIN_T` | 16 | min prefill `n_tokens` to offload attention (single-token decode stays on CPU) |
 | `ROCKET_ATTN_HOST_SOFTMAX` | host (FA) | attention softmax placement; `=0` forces the on-NPU softmax (default host — scores are already host-side for the additive mask) |
 | `ROCKET_FA_TIMING` | off | print the FA handler's host split at exit — gather / on-NPU compute / scatter ms (the `FLASH_ATTN_EXT` outer gather is host glue the driver's `ROCKET_MM_PROFILE` does not see). Diagnostic only; near-zero when off |
-| `ROCKET_MOE` | **off (opt-in)** | `=1` offloads MoE routed-expert FFNs (`MUL_MAT_ID`) to the NPU: bucket the `(slot,token)` rows by expert id, run each active expert's `[M_e,K]×[N,K]ᵀ` GEMM fanned across the worker fds, scatter the rows back. A **quantized** expert takes the native-quant route by default (`ROCKET_MOE_NATIVE`), which holds it resident as int8 and is worth **2.16× the CPU** at pp2048 on gpt-oss-20b MXFP4 (1.34× at pp512 — it wins at every length). Run it at **`-b 2048 -ub 2048`** — not because the experts re-dequantize (native-quant is what stops that) but because the **dense** quantized weights still do, and because a smaller micro-batch gives each expert proportionally fewer rows (`n_tokens · n_used / n_expert` — 64 at `-ub 512` vs 256 at `-ub 2048`) while the per-expert dispatch/gather/scatter/padding stays flat; not measured at `-ub 512`. Opt-in **not** because it is slow but because the win is conditional on nearly the whole expert stack fitting RAM — 99% resident wins, 82% resident *loses* at pp512 — so its sign depends on the machine, and a default whose sign depends on the machine is not a default. Also costs a one-time ~70 s expert ingest per `llama_context`. See the MoE note above |
-| `ROCKET_MOE_MIN_TOKENS` | 512 | with `ROCKET_MOE=1`, the min micro-batch `n_tokens` for a `MUL_MAT_ID` op to offload — `M_e ≈ n_tokens · n_expert_used / n_expert` sets the per-expert GEMM size; short prefills and decode stay on the CPU. Floored at `ROCKET_MIN_M` |
-| `ROCKET_MOE_NATIVE` | **on** (within `ROCKET_MOE=1`) | route a **GGUF-quantized** expert through the resident int8 group-wise path: ingest its quant blocks **once** into int8 codes held in NPU BOs, then quantize only the activation per call. This is what removes the per-micro-batch host dequant that makes the fp16 expert route a loss. `=0` forces the fp16 dequant route (the A/B baseline). An **F16** expert always takes the fp16 route — it has no dequant to delete |
-| `ROCKET_MOE_CACHE_MB` | **auto** | resident native-quant **expert** budget in MB (`0` = unlimited). Auto = `MemAvailable` − reserve. Charged per expert as *int8 codes + the expert's GGUF source bytes*, because the GGUF is mmapped and cannot be reclaimed (MoE **decode** reads the active experts from it on the CPU every token), so both copies must coexist. Admission-only: an expert that does not fit streams on the fp16 route, correctly, and the split is logged at teardown (`ggml_backend_rocket_moe_stats`) |
+| `ROCKET_MOE` | **auto (on)** | MoE routed-expert FFNs (`MUL_MAT_ID`): bucket the `(slot,token)` rows by expert id, run each active expert's `[M_e,K]×[N,K]ᵀ` GEMM fanned across the worker fds, scatter the rows back. **Three states.** *Unset* = auto: claim the op only for a **GGUF-quantized** stack, on the RK3588, whose whole `[K, N, n_expert]` stack the residency pre-flight can reserve before the first ingest **and** whose per-expert GEMM clears both the tile granule (`ROCKET_MOE_M_BUCKET`) and the per-dispatch work floor (`ROCKET_MOE_MIN_WORK`) — that is the native-quant route (`ROCKET_MOE_NATIVE`), which holds each expert resident as int8 and is worth **~2.4× the CPU** at pp2048 on gpt-oss-20b MXFP4 (~1.8× at pp512). *`=1`* = forced: claim every `MUL_MAT_ID` the handler can compute, reserving nothing and ignoring both size floors — that includes the fp16 streaming route (an F16 stack, or a stack too large to hold resident), which measured 0.42–0.90×. Forced is **6–13% faster at pp512 and 18–21% at pp2048 where the stack nearly fits** (measured twice; the pp512 half is inside that arm's own spread) and **below the experts-on-CPU baseline where it does not** (0.97× at pp512 on an induced 12 GB budget) — and `ROCKET_MOE_CACHE_MB=28000` buys back 79% of the pp2048 gap on a 31 GiB board while keeping the sign guarantee forced gives up; it is the A/B arm and the configuration the archived MoE measurements were taken under. *`=0`* = off. Run at **`-b 2048 -ub 2048`** — not because the experts re-dequantize (native-quant is what stops that) but because the **dense** quantized weights still do, and because a smaller micro-batch gives each expert proportionally fewer rows (64 at `-ub 512` vs 256 at `-ub 2048`) while the per-expert dispatch/gather/scatter/padding stays flat. Measured at `-ub 512`: ~1.6×/1.7× over experts-on-CPU, i.e. **no collapse** — that tax belonged to the fp16 route. Costs a one-time expert ingest per `llama_context` (~36 s on gpt-oss-20b, ~32 s on DeepSeek-V2-Lite; the dominant NPU-BO pack term is bytes-bound at ~500–545 MB/s, not per expert). See the MoE note above |
+| `ROCKET_MOE_MIN_TOKENS` | 512 | in every `ROCKET_MOE` state, the min micro-batch `n_tokens` for a `MUL_MAT_ID` op to offload — `M_e ≈ n_tokens · n_expert_used / n_expert` sets the per-expert GEMM size; short prefills and decode stay on the CPU. Floored at `ROCKET_MIN_M` |
+| `ROCKET_MOE_NATIVE` | **on** | route a **GGUF-quantized** expert through the resident int8 group-wise path: ingest its quant blocks **once** into int8 codes held in NPU BOs, then quantize only the activation per call. This is what removes the per-micro-batch host dequant that makes the fp16 expert route a loss, and it is the only route the default placement claims — `=0` forces the fp16 dequant route (the A/B baseline) and leaves auto placement with nothing to claim, so it takes effect under `ROCKET_MOE=1`. An **F16** expert always takes the fp16 route — it has no dequant to delete |
+| `ROCKET_MOE_CACHE_MB` | **auto** | resident native-quant **expert** budget in MB (`0` = unlimited). Auto = `MemAvailable` − reserve. **This is the knob that buys back what the pre-flight's conservatism costs**, and unlike `ROCKET_MOE=1` it keeps both the zero-streamed property and the sign guarantee. Measured ladder, gpt-oss-20b on a 31 GiB board, every arm 0 streamed [HW sweep 2026-08-27]: auto (24672 MB) takes 63 of 72 stacks; **26000 takes 66 (+4.3% / +5.1% at pp512 / pp2048); 28000 takes 71 (+8.3% / +14.1%)**, which is 79% of the `ROCKET_MOE=1` ceiling and above it at pp512. 28000 leaves only ~2.8 GB of the headroom the 6 GiB auto reserve exists for, so it is a setting for a **known working set**, not a new default; pin it explicitly if you also need placement to be reproducible across processes. Charged per expert as *int8 codes + the expert's GGUF source bytes*, because the GGUF is mmapped and cannot be reclaimed (MoE **decode** reads the active experts from it on the CPU every token), so both copies must coexist. Read by the placement pre-flight as well as by admission, so the decision to claim an op and the charge taken when its experts are ingested are against the same number. Admission-only: an expert that does not fit streams on the fp16 route, correctly, and the split is logged at teardown (`ggml_backend_rocket_moe_stats`) — under the default that split should read 100% resident, because an unreservable stack was never claimed |
 | `ROCKET_MOE_GROUP` | **auto** | the K-group the native-quant path quantizes on. Auto picks the largest divisor of `K` that is a multiple of 32 and that the CBUF can hold as one K-tile — the readback floor (gpt-oss `K=2880` → **576**, `nKt=5`). Readback scales as `K/group` and this path is readback-bound, so a finer group is more faithful and proportionally slower; the knob exists for that A/B |
 | `ROCKET_MOE_M_BUCKET` | 64 | the FLOOR of the ladder the ragged per-expert row count `M_e` is rounded up onto (rounded up to a power of two). Not a tuning knob so much as a requirement: `M%4` is a hardware contract, and the driver caches its resident scratch per `(M,K,N,group)` in a fixed 32-slot table that a distinct `M` per expert would exhaust mid-prefill, after which every remaining expert degrades to the CPU. The ladder is FIXED — two rungs per octave from the granule (64, 96, 128, 192, 256, …) — so it bounds the distinct slot count by construction (~15 values) and caps padding at ~33% of `M_e` (~15% on average). It does **not** adapt: an earlier adaptive granule that coarsened as the table filled could not un-coarsen (the driver's scratch slots are permanent, so the headroom test never became true again), ratcheted to its 4096 ceiling on the first overflow, and left a 356-row expert computing 4096 rows — 88% padding, silently. Raise the granule only to trade padding for slots |
+| `ROCKET_MOE_MIN_WORK` | 340 | the least work ONE expert dispatch must carry, in **mega-MACs** of `M_e · K · N`, for the offload to pay its fixed cost (`0` disables the floor). This is the floor that separates the architectures, and the row floor above cannot do its job: the per-expert cost is paid **per dispatch** while the work a dispatch carries is `M_e · K · N`, so `M_e` is a proxy for it only while `K · N` is constant — and gpt-oss's expert GEMM is 2880×2880 against DeepSeek-V2-Lite's 2048×1408, **2.88× larger at the same row count**. Measured over `-p 512…2048` on both models at 100% residency: `M_e` = 64 reads **1.64×** on gpt-oss while `M_e` = 72 reads **0.94×** on DeepSeek, so no row floor separates them; against work per dispatch the measured cells separate with no overlap. The default is the geometric midpoint of the gap between the marginal boundary cell (2.77e8, 1.049x over eight pairs — it does not repay its own ~32 s ingest until ~16 600 tokens of prefill at that shape) and the first materially winning one (4.15e8, 1.22x). Set it to **240** to take that boundary cell on a workload that really does prefill that much. The form is derived, the number is **fitted on two architectures** — treat it as a measured boundary, not a bound, and expect a third model to move it |
 | `ROCKET_INT8` (+ `ROCKET_INT8_HADAMARD`) | off | W8A8 int8 path (coherent with Hadamard; net loss vs fp16+KACC on the RK3588). **On the RK3576 this knob is mandatory, not optional** — the W8A8 route is the only matmul route there and `supports_op` declines every `MUL_MAT` without it, and the rotation is unconditional there rather than gated by `ROCKET_INT8_HADAMARD`. See [The RK3576](#the-rk3576-second-target) |
 | `ROCKET_INT8_RESIDENT` | off | resident int8 weights (on top of `ROCKET_INT8`) |
 | `ROCKET_INT8_CACHE_MB` | 4096 | resident rotated-int8 weight cache cap, measured against the actual resident NPU-BO tile footprint (over-budget weights fall back to fp16) |
@@ -514,7 +648,7 @@ and so are armed by an empty value; none of them changes a result.
 | `ROCKET_CACHE_MB` | — | resident-weight byte budget in MB (the lower-level knob `ROCKET_QUANT_RESIDENT=auto`/`N` set; an explicit value here wins over both) |
 | `ROCKET_NO_FUSE` | off | disable QKV / gate-up graph fusion (per-node routing, for a clean A/B). Fusion also turns itself off under `ROCKET_NO_STREAM`, `ROCKET_FORCE_PREPACK`, `ROCKET_INT8` and `ROCKET_INT4`, because the fused path is fp16-only — leaving it on under a precision knob would run the fusable projections (QKV, gate/up) in fp16 and reach only `o_proj` / `ffn_down` / `lm_head` with the selected precision |
 | `ROCKET_NO_STREAM` | off | disable the persistent streaming matmul context (per-call `mt` path instead). Also turns fusion off, which needs it |
-| `ROCKET_MOE_COSINE` | off | with `ROCKET_MOE=1`, report a per-op NPU-vs-CPU cosine for each offloaded `MUL_MAT_ID`. Diagnostic |
+| `ROCKET_MOE_COSINE` | off | report a per-op NPU-vs-CPU cosine for each offloaded `MUL_MAT_ID`. Diagnostic |
 | `ROCKET_FLASH_ATTN_NO_CTX` | off | force attention onto the per-call `_mt` path (own fds, per-call scratch) instead of the persistent `rocket_fa_ctx`. The A/B for what the resident score-matrix scratch is worth |
 | `ROCKET_VERIFY` | off | per-op NPU-vs-CPU correctness gate (`max_abs` is the signal; ignore `max_rel`; very slow) — needs `-DGGML_ROCKET_DIAGNOSTICS=ON` |
 | `ROCKET_MM_PROFILE` | off | per-phase host+driver bucket breakdown at exit — includes the streaming **weight-dequant** (quant/bf16→fp16) bucket, the dominant host term of a quantized-GGUF prefill (adds noise → drop for headline t/s) |
