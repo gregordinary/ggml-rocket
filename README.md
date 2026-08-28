@@ -153,9 +153,14 @@ claimed by the W8A8 handler or not at all. Three things to know before running i
 - **Build with `-DGGML_ROCKET_NATIVE_FP16=OFF`.** The default convert kernels target the RK3588's
   `armv8.2-a+fp16` baseline.
 
-Measured on Qwen2.5-1.5B `pp512`: **2.01x the CPU on the same F16 GGUF, and a tie (1.02x) with
-ggml's Q8_0 kernel**, at 1.008x-1.020x wikitext-2 perplexity against fp32 over two models. The
-route, its twelve `ROCKET_RK3576_*` knobs, and what each is measured against are in
+Measured on Qwen2.5-1.5B at `pp2048`, `-ub` 512, four threads on the A72s, governor
+`performance`: **13.36 t/s, which is 1.31x ggml's Q8_0 kernel and 2.37x the same F16 GGUF on the
+CPU** [HW sweep]. Quote both or neither: the 2.37x is what a drop-in reader gets, because the
+backend consumes an F16 GGUF, and the 1.31x is what a reader who already quantizes gets. Accuracy
+taken off the device is **1.011x wikitext-2 perplexity** against that same F16 CPU arm, over eight
+chunks whose own error bar is +-0.59 [HW sweep]. **Read a `pp512` figure on this part as a
+calibration measurement**, not as the route: at that length every call is still a calibration
+forward. The route, its twelve `ROCKET_RK3576_*` knobs, and what each is measured against are in
 [API.md](API.md#the-rk3576-second-target).
 
 ## Requirements

@@ -466,6 +466,14 @@ Composed, that measures **1.008x / 1.020x wikitext-2 perplexity against fp32** o
 SmolLM2-1.7B, against 1.11x / 2.26x for the per-tensor output scale it replaces.
 [host arithmetic over two models, 2026-08-10]
 
+Taken off the device inside a model, the composed route reads **1.011x** on Qwen2.5-1.5B: 9.8969
+against the F16 CPU arm's 9.7872 over eight wikitext-2 chunks. **That is not the same quantity as
+the 1.008x above and the two must not be diffed** -- the simulator figure is against fp32 with an
+exactly frozen colmax, this one against the same GGUF's F16 CPU arm with the shipped bootstrap at
+`CALSAFE`=3.0, and the eight chunks carry their own +-0.59 error bar. What it settles is that
+nothing on the composed device route costs a model an order of magnitude.
+[HW sweep, H96 MAX M9, llama.cpp b10356, Qwen2.5-1.5B F16, 2026-08-11]
+
 **Shape contract**, stricter than the RK3588's: `K%32`, `N%32` (not `N%16`), `K >= 64`, `N >= 32`,
 2D static weight, `M >= ROCKET_MIN_M`, and a chunking of `K` the entry will take (see
 `ROCKET_RK3576_KSPLIT`). **`M` carries no constraint** on this part, and `M=1` computes, which is the
@@ -474,16 +482,25 @@ mis-computes. There is deliberately no `M%4` padding here.
 
 ### Performance, and the denominator that matters
 
-Qwen2.5-1.5B `pp512` under stock llama.cpp, four threads pinned to the A72s, governor
-`performance`, attention on the CPU (see below): the port reads **11.78 ± 1.8 t/s** against
-**5.9 t/s** for the same F16 GGUF on the CPU (**2.01x**) and **11.5 t/s** for ggml's Q8_0 kernel
-(**1.02x**). Both numbers are real and they answer different questions: the 2.01x is what a
-drop-in user reads, because the port consumes an F16 GGUF; the 1.02x is against the strongest CPU
-arm on the same silicon. Quote them together.
-[HW, H96 MAX M9, 7.1.7 / `rocket` 1.6.0, llama.cpp b10356, 2026-08-11]
+Qwen2.5-1.5B at `pp2048` under stock llama.cpp, `-ub` 512, four threads pinned to the A72s,
+governor `performance`, attention on the CPU (see below), three processes an arm interleaved in
+one boot: the port reads **13.36 t/s** against **10.18 t/s** for ggml's Q8_0 kernel (**1.31x**)
+and **5.64 t/s** for the same F16 GGUF on the CPU (**2.37x**). Both numbers are real and they
+answer different questions: the 2.37x is what a drop-in user reads, because the port consumes an
+F16 GGUF; the 1.31x is against the strongest CPU arm on the same silicon. Quote them together.
+Per-pair ratios are 1.30 / 1.34 / 1.30.
+[HW sweep, H96 MAX M9, 7.1.7 / `rocket` 1.6.0, llama.cpp b10558, 2026-08-23]
 
-Two operating notes from that arm: the governor is worth **16%**, and the NPU arm's run-to-run
-spread is **±1.8 t/s (15%)** against ±0.01 on both CPU arms, so **one process is not a measurement**.
+**A `pp512` figure on this part prices the calibration path, not the route.** At that length the
+route has not converged: a `pp512 -r 1` run reports 332 of 332 calls as calibration forwards. The
+11.78 t/s it gives, and the 2.01x / 1.02x pair that follows from it, are a calibration-regime
+measurement and are not the route's speed.
+[HW sweep, H96 MAX M9, llama.cpp b10356, 2026-08-11]
+
+Two operating notes. The governor is worth **16%**. And run-to-run spread is a function of prompt
+length rather than a property of the route: at `pp2048` it is **±0.02 t/s within a process and 3.5%
+across processes**, so one process is a measurement; at `pp512` the NPU arm spreads **±1.8 t/s
+(15%)** against ±0.01 on both CPU arms, and one process is not.
 
 ### Attention stays on the CPU there
 
