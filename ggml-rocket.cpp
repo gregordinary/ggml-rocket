@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstdint>
+#include <cstdarg>      // rk_f16_stop formats its reason where the numbers are
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -319,6 +320,27 @@ struct ggml_backend_rocket_context {
     // the not-yet-faulted GGUF pages as free); the byte budget alone can over-commit a model
     // that does not fit ~2x. The board has no swap, so an over-commit is a hard kill.
     size_t resident_floor_bytes = 0;
+
+    // Outcome of the fp16 residency admission above, reported at teardown. The BUDGET is
+    // visible from the init line; the OUTCOME is not, and without it a run whose cache filled
+    // (over cache_budget, the MemAvailable floor latch, or an exhausted IOVA window) streams
+    // the remainder and reads EXACTLY like a run that placed everything and gained nothing --
+    // both are a 1.00x row. Counted by weight, and a fused group's members count individually
+    // so the number means the same thing with fusion on and off. f16_streamed_keys holds the
+    // names that reached the residency route and did NOT end up resident; a name is erased
+    // from it when the weight later goes resident (a weight streams at a small one-shot M and
+    // becomes resident on its first M >= max_tile), so at teardown the set is the outcome and
+    // not a history. A weight resident INSIDE a composite is not streamed -- it is placed, and
+    // only its per-node second pack was declined -- so that route touches neither counter.
+    long   f16_n_resident      = 0;
+    std::unordered_set<std::string> f16_streamed_keys;
+    long   f16_nokey_calls     = 0;    // offloaded calls whose weight has no stable identity
+    // Why residency stopped, latched at the first decline that was not per-call, formatted
+    // with its numbers where it happened. Named rather than inferred: over-budget, the RAM
+    // floor and a full IOVA window take three different fixes, and the line that says only
+    // "partly resident" sends the reader to guess between them.
+    std::string f16_stop_why;
+    size_t      f16_stop_resident = 0;   // resident bytes at that moment
 
     // Total source bytes reclaimed by ROCKET_PREPACK_MADVISE (the prefill-only
     // resident-weight reclaim; see rocket_prepack_madvise_on).
@@ -629,6 +651,32 @@ static inline void rk_cache_evict(Map & cache, typename Map::iterator it,
     charged -= it->second.bytes;
     release(it->second);
     cache.erase(it);
+}
+
+// The fp16 residency ledger (see f16_streamed_keys). Every route that can place or decline an
+// fp16 resident weight goes through these three, so the two counters cannot drift apart and a
+// decline reason cannot be recorded in one place and read in another.
+static inline void rk_f16_mark_streamed(ggml_backend_rocket_context * ctx, const std::string & key) {
+    ctx->f16_streamed_keys.insert(key);
+}
+static inline void rk_f16_mark_resident(ggml_backend_rocket_context * ctx, const std::string & key) {
+    ctx->f16_n_resident++;
+    ctx->f16_streamed_keys.erase(key);   // it may have streamed at an earlier, smaller M
+}
+static inline void rk_f16_mark_evicted(ggml_backend_rocket_context * ctx, long n) {
+    ctx->f16_n_resident -= n;            // a shape drift re-packs; without this it counts twice
+}
+// First non-per-call decline wins: the later ones are its consequences (the latch makes every
+// subsequent weight decline for the same reason), so the first is the one that names the fix.
+static inline void rk_f16_stop(ggml_backend_rocket_context * ctx, const char * fmt, ...) {
+    if (!ctx->f16_stop_why.empty()) return;
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ctx->f16_stop_why      = buf;
+    ctx->f16_stop_resident = ctx->resident_bytes;
 }
 
 // The three knobs each integer route reads from BOTH its one-shot and its resident entry.
@@ -3628,7 +3676,7 @@ static int ggml_backend_rocket_mul_mat_prepacked(
     const int Mp = rocket_pad_m(M);
 
     const std::string key = rocket_weight_key(src0);
-    if (key.empty()) return -1;               // no stable identity -> mt path
+    if (key.empty()) { ctx->f16_nokey_calls++; return -1; }   // no stable identity -> mt path
     // Already resident inside a fused group's composite entry -> stream. Packing it again
     // under its own name would hold the same weight twice, permanently (see
     // wcache_fused_members); the streaming fallback is correct and costs only a per-call packB.
@@ -3644,8 +3692,11 @@ static int ggml_backend_rocket_mul_mat_prepacked(
     auto build_resident = [&](int pack_m, const ggml_fp16_t * b_src) -> rocket_weights * {
         if (ctx->dev_resident_full) return nullptr;
         const size_t est = (size_t)N * K * sizeof(ggml_fp16_t);   // resident weight bytes (M-independent)
-        if (ctx->cache_budget && ctx->resident_bytes + est > ctx->cache_budget)
+        if (ctx->cache_budget && ctx->resident_bytes + est > ctx->cache_budget) {
+            rk_f16_stop(ctx, "the %zuMB resident-weight budget would not hold the next %zuMB weight",
+                        ctx->cache_budget >> 20, est >> 20);
             return nullptr;                   // over budget -> per-call mt path (frees per call)
+        }
         // Runtime OOM guard (no swap): if free RAM has fallen to the reserve floor, stop making
         // weights resident and stream the rest. The static byte budget is sized from init-time
         // MemAvailable, which counts the not-yet-faulted (reclaimable) GGUF pages as free -- but an
@@ -3655,6 +3706,8 @@ static int ggml_backend_rocket_mul_mat_prepacked(
             const size_t avail = rocket_meminfo_bytes("MemAvailable");
             if (avail && avail < ctx->resident_floor_bytes) {
                 ctx->dev_resident_full = true;   // latch: the rest streams (per-call mt)
+                rk_f16_stop(ctx, "MemAvailable %zuMB fell below the %zuMB reserve floor",
+                            avail >> 20, ctx->resident_floor_bytes >> 20);
                 if (rocket_debug_on())
                     GGML_LOG_DEBUG("[prepack] MemAvailable %zuMB < floor %zuMB at resident=%zuMB"
                             " -> streaming remaining weights\n",
@@ -3666,6 +3719,7 @@ static int ggml_backend_rocket_mul_mat_prepacked(
                                 reinterpret_cast<const _Float16 *>(b_src));
         if (!nw) {                            // IOVA/alloc exhausted: latch + stream the rest
             ctx->dev_resident_full = true;
+            rk_f16_stop(ctx, "the NPU IOVA window filled (raise ROCKET_N_THREADS for more fds)");
             if (rocket_debug_on())
                 GGML_LOG_DEBUG("[prepack] IOVA window full at resident=%zuMB -> streaming remaining weights\n",
                         ctx->resident_bytes >> 20);
@@ -3677,6 +3731,7 @@ static int ggml_backend_rocket_mul_mat_prepacked(
         ctx->wcache[key] = { nw, pack_m, K, N, est };
         nw_guard.dismiss();
         ctx->resident_bytes += est;
+        rk_f16_mark_resident(ctx, key);
 
         // The tiled copy is now resident, so reclaim the row-major source.
         // PREFILL-ONLY -- breaks CPU decode (see rocket_prepack_madvise_on). The compute
@@ -3710,10 +3765,15 @@ static int ggml_backend_rocket_mul_mat_prepacked(
             rocket_ctx * dev = ctx->dev;
             rk_cache_evict(ctx->wcache, it, ctx->resident_bytes,
                            [dev](rocket_weight_entry & e) { rocket_weights_free(dev, e.w); });
+            rk_f16_mark_evicted(ctx, 1);
         }
     }
     if (!w) {
-        if (Mp < max_tile) return -1;                     // small one-shot M -> mt path (no resident pack)
+        // Streamed, whatever the reason: this weight is not resident, and the ledger's job is
+        // to say so. A small one-shot M is the one reason that is not a capacity decline, so it
+        // does not latch a stop reason -- and if the weight is later seen at M >= max_tile it
+        // goes resident and leaves the streamed set.
+        if (Mp < max_tile) { rk_f16_mark_streamed(ctx, key); return -1; }   // no resident pack
         const ggml_fp16_t * b_src;
         std::vector<ggml_fp16_t> b_dq;                    // transient dequant buffer (quant only)
         if (ggml_is_quantized(src0->type)) {
@@ -3722,13 +3782,18 @@ static int ggml_backend_rocket_mul_mat_prepacked(
             // freed -- so prefill pays neither the per-call dequant nor the per-call packB the
             // streaming path pays every micro-batch.
             b_dq.resize((size_t)N * K);
-            if (!rocket_weight_to_fp16(src0->data, src0->type, N, K, b_dq.data()))
+            if (!rocket_weight_to_fp16(src0->data, src0->type, N, K, b_dq.data())) {
+                rk_f16_mark_streamed(ctx, key);
                 return -1;                                // undecodable type -> caller falls back
+            }
             b_src = b_dq.data();
         } else {
             b_src = (const ggml_fp16_t *)src0->data;      // F16 zero-copy (the original path)
         }
-        if (!(w = build_resident(Mp, b_src))) return -1;  // window full / over budget -> mt path
+        if (!(w = build_resident(Mp, b_src))) {          // window full / over budget -> mt path
+            rk_f16_mark_streamed(ctx, key);
+            return -1;
+        }
     }
 
     // Reused context scratch (see rk_scratch); A16's pad rows are cleared by the packer.
@@ -4305,19 +4370,36 @@ static int ggml_backend_rocket_mul_mat_group_resident(
             rk_cache_evict(ctx->wcache, it, ctx->resident_bytes,
                            [dev](rocket_weight_entry & e) { rocket_weights_free(dev, e.w); });
             for (const std::string & mk : member_keys) ctx->wcache_fused_members.erase(mk);
+            rk_f16_mark_evicted(ctx, (long)member_keys.size());
         }
     }
     if (!w) {
         // Small one-shot M streams via the caller's streaming-fused fallback (no wasted
         // resident pack); mirrors the single-weight prepacked path's max_tile pivot.
-        if (Mp < rocket_hw_current()->max_tile) return -1;
+        // Every decline below leaves the group's members STREAMED (the caller runs them through
+        // the streaming-fused path, which never reaches the per-node resident route), so the
+        // ledger is written here or those weights are invisible to it. Same three reasons and
+        // the same names as build_resident, because it is the same policy.
+        auto stream_members = [&]() {
+            for (const std::string & mk : member_keys) rk_f16_mark_streamed(ctx, mk);
+        };
+        if (Mp < rocket_hw_current()->max_tile) { stream_members(); return -1; }
         // Budget / OOM-floor admission -- identical policy to build_resident (single path).
-        if (ctx->dev_resident_full) return -1;
+        if (ctx->dev_resident_full) { stream_members(); return -1; }
         const size_t est = (size_t)Ntot * K * sizeof(ggml_fp16_t);
-        if (ctx->cache_budget && ctx->resident_bytes + est > ctx->cache_budget) return -1;
+        if (ctx->cache_budget && ctx->resident_bytes + est > ctx->cache_budget) {
+            rk_f16_stop(ctx, "the %zuMB resident-weight budget would not hold the next %zuMB group",
+                        ctx->cache_budget >> 20, est >> 20);
+            stream_members(); return -1;
+        }
         if (ctx->resident_floor_bytes) {
             const size_t avail = rocket_meminfo_bytes("MemAvailable");
-            if (avail && avail < ctx->resident_floor_bytes) { ctx->dev_resident_full = true; return -1; }
+            if (avail && avail < ctx->resident_floor_bytes) {
+                ctx->dev_resident_full = true;
+                rk_f16_stop(ctx, "MemAvailable %zuMB fell below the %zuMB reserve floor",
+                            avail >> 20, ctx->resident_floor_bytes >> 20);
+                stream_members(); return -1;
+            }
         }
         // The driver scatters each member straight into its global-N slice of the resident
         // weight BO, so there is NO host [Ntot,K] concat buffer -- which at a gate|up group
@@ -4331,7 +4413,11 @@ static int ggml_backend_rocket_mul_mat_group_resident(
             Ns[i] = (int)nodes[i]->src[0]->ne[1];
         }
         w = rocket_weights_pack_seg(ctx->dev, Mp, (int)K, (int)Ntot, Bs, Ns, ng);
-        if (!w) { ctx->dev_resident_full = true; return -1; }  // IOVA/alloc full -> stream the rest
+        if (!w) {                                             // IOVA/alloc full -> stream the rest
+            ctx->dev_resident_full = true;
+            rk_f16_stop(ctx, "the NPU IOVA window filled (raise ROCKET_N_THREADS for more fds)");
+            stream_members(); return -1;
+        }
         rocketraii::scope_guard w_guard([&] { rocket_weights_free(ctx->dev, w); });
         ctx->wcache[key] = { w, Mp, (int)K, (int)Ntot, est };
         w_guard.dismiss();
@@ -4339,6 +4425,7 @@ static int ggml_backend_rocket_mul_mat_group_resident(
         // Claim the members: each is now resident inside this composite, so the per-node
         // prepacked path must not pack it a second time under its own name.
         for (const std::string & mk : member_keys) ctx->wcache_fused_members.insert(mk);
+        for (const std::string & mk : member_keys) rk_f16_mark_resident(ctx, mk);
     }
 
     // One shared activation pack (per-row scaled fp16, pad rows cleared) + one combined
@@ -4448,6 +4535,51 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
                         ctx->moe_n_resident
                             ? (ctx->moe_ingest_ms + ctx->moe_pack_ms) / (double)ctx->moe_n_resident
                             : 0.0);
+    }
+    // The resident/streamed split of the fp16 residency route (ROCKET_F16_RESIDENT and its
+    // quantized sibling ROCKET_QUANT_RESIDENT), on the same teardown path and at the same level
+    // as the [moe-int8] line above and for the same reason. The route reports its BUDGET at
+    // init and, until this line, nothing reported its OUTCOME: when the cache fills the
+    // remaining weights stream, so a run that placed a tenth of its weights reads exactly like
+    // a run that placed all of them and gained nothing -- both are a 1.00x row, and the
+    // difference between them is the difference between "residency does not pay on this model"
+    // and "residency did not happen". A benchmark row cannot tell those apart from the outside.
+    //
+    // The denominator is the weights OFFERED to the route, not the model's tensor count: a
+    // matmul the backend never claimed (wrong type, below rocket_min_m, a shape the offload
+    // refuses) was never a residency candidate and belongs in neither column.
+    if (ctx->f16_n_resident || !ctx->f16_streamed_keys.empty()) {
+        const long streamed = (long)ctx->f16_streamed_keys.size();
+        const long total    = ctx->f16_n_resident + streamed;
+        const double res_pct = total ? 100.0 * (double)ctx->f16_n_resident / (double)total : 0.0;
+        // rocket_log, not GGML_LOG_*: llama-bench silences ggml without -v, which is what made
+        // the existing GGML_LOG_DEBUG report unreadable from a bench row in the first place.
+        ROCKET_LOGI("[f16-resident] weights offered to the resident route: %ld resident on the "
+                    "NPU (%zuMB), %ld streamed via the per-call pack -- %.0f%% resident\n",
+                    ctx->f16_n_resident, ctx->resident_bytes >> 20, streamed, res_pct);
+        // Which of the three admission limits turned a weight away FIRST, with its numbers.
+        // Each takes a different fix -- a larger budget, more free RAM, more worker fds -- and
+        // the split above does not say which, so a partial run cannot be acted on without it.
+        // "first declined", not "stopped": only the RAM floor and a full IOVA window latch. The
+        // byte budget does not, so a smaller weight can still be admitted after it, which is why
+        // the resident total above can exceed the figure here.
+        if (!ctx->f16_stop_why.empty())
+            ROCKET_LOGI("[f16-resident] admission first declined at %zuMB resident: %s\n",
+                        ctx->f16_stop_resident >> 20, ctx->f16_stop_why.c_str());
+        // A streamed weight is re-packed into NPU tiles on EVERY call (and a quantized one is
+        // re-dequantized too), which is the whole cost residency exists to remove, so a
+        // majority-streamed run is not a small shortfall -- it is most of the route missing.
+        if (res_pct < 80.0)
+            ROCKET_LOGW("[f16-resident] only %.0f%% resident -- a streamed weight pays a full "
+                        "per-call pack (and a per-micro-batch dequant if the GGUF is quantized), "
+                        "so this run measures the streaming path with a residency label on it. "
+                        "Raise the budget (ROCKET_F16_RESIDENT / ROCKET_QUANT_RESIDENT take MB, "
+                        "or 'auto') if the RAM is there.\n", res_pct);
+        // Reported as CALLS, not weights: a weight with no stable name cannot be counted once,
+        // which is the same reason it can never be cached. Silent unless it happened.
+        if (ctx->f16_nokey_calls)
+            ROCKET_LOGI("[f16-resident] %ld offloaded calls had no stable weight name and could "
+                        "not be resident under any budget\n", ctx->f16_nokey_calls);
     }
     if (ctx->i8_dev) {   // resident int8 weights hold BOs on the ctx fds -> free first
         for (auto & kv : ctx->i8_rwcache)   rocket_i8_weights_free(ctx->i8_dev, kv.second.w);
@@ -5042,6 +5174,15 @@ static size_t rk_moe_ram_budget(void) {
         // -- which is the 6 GiB floor, and that floor still binds on every board where the
         // 30% arm was not the larger of the two (16 GiB and under). So this changes the
         // budget only on the boards where the double-count was real.
+        //
+        // FLAT IS ALSO WHAT MAKES auto CONSERVATIVE ON A SMALL BOARD, so do not "fix" this
+        // into a proportional reserve. A constant 6 GiB is 19% of a 32 GB board, 37.5% of
+        // 16 GB and 75% of 8 GB: the smaller the board, the larger the fraction withheld,
+        // until at 8 GB the budget is small enough that the pre-flight admits nothing and
+        // the route effectively turns itself off. That is the direction to fail in, and it
+        // is why the flatness is not an oversight to be tidied. All of the boards this has
+        // run on are 31 GiB, so the small-board behaviour is arithmetic from this rule and
+        // the measured charge, not a measurement [expected].
         const size_t reserve = rocket_moe_budget_reserve();
         return (avail > reserve) ? (avail - reserve) : ((size_t)256 << 20);
     }();
