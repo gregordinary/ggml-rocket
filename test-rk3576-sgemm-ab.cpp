@@ -287,6 +287,7 @@ int main(int argc, char **argv)
 
     std::vector<row> rows;
 
+    int any_wrong = 0;
     for (int si = 0; si < N_SHAPES; si++) {
         if (only >= 0 && si != only) continue;
         const shape s = SHAPES[si];
@@ -311,15 +312,35 @@ int main(int argc, char **argv)
 
         std::vector<double> v_npu, v_g32, v_gq8, v_bl;
 
+        /* The reference once, untimed: every rep reads the same operands, so the exact float
+         * sum is the same for all of them. */
+        std::vector<float> Cref((size_t)s.M * s.N);
+        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                    s.M, s.N, s.K, 1.0f, Af.data(), s.K, Wf.data(), s.K,
+                    0.0f, Cref.data(), s.N);
+        /* EVERY rep is stamped and scored. With one input for all of them, a rep that wrote
+         * nothing would leave the last rep's right answer in Ci, which scoring only the last
+         * rep reads as correct. 0x5A is 90, and this scale keeps every output within about
+         * ten counts of zero, so a stamp that survives is a write that never landed. */
+        long bad_all = 0, worst_all = 0, stale_all = 0;
+
         for (int r = 0; r <= reps; r++) {          /* r == 0 is the discarded rep */
             double t;
 
+            std::fill(Ci.begin(), Ci.end(), (int8_t)0x5A);
             t = now_ms();
             int rc = rocket_matmul_int8_rk3576(fd, s.M, s.K, s.N, Ai.data(), Wi.data(),
                                                nullptr, scale, Ci.data());
             t = now_ms() - t;
             if (r) { if (rc == ROCKET_OK) v_npu.push_back(t); }
             out.npu_rc = rc;
+            if (rc == ROCKET_OK) {
+                long b = 0, w = 0;
+                score_int8(s, Cref, scale, Ci, &b, &w);
+                bad_all += b;
+                if (w > worst_all) worst_all = w;
+                for (int8_t v : Ci) stale_all += (v == (int8_t)0x5A);
+            }
 
             if (have32) { t = g32.run(Af); if (r) v_g32.push_back(t); }
             if (haveq8) { t = gq8.run(Af); if (r) v_gq8.push_back(t); }
@@ -332,8 +353,7 @@ int main(int argc, char **argv)
             if (r) v_bl.push_back(t);
         }
 
-        /* Cf holds the last BLAS result, which is the exact float sum for this shape. */
-        if (out.npu_rc == ROCKET_OK) score_int8(s, Cf, scale, Ci, &out.bad, &out.worst);
+        out.bad = bad_all; out.worst = worst_all;
 
         out.npu     = median(v_npu);
         out.npu_ran = !v_npu.empty();
@@ -351,9 +371,9 @@ int main(int argc, char **argv)
                t_before, zone_temp("npu-thermal"), tb_big, zone_temp("bigcore-thermal"));
         fflush(stdout);
 
-        printf("      correctness vs the exact float sum requantized: %ld of %zu elements "
-               "off by more than one count, worst %ld\n",
-               out.bad, (size_t)s.M * s.N, out.worst);
+        printf("      correctness vs the exact float sum requantized, over all %d reps: %ld of "
+               "%zu elements off by more than one count, worst %ld, %ld still stamped\n",
+               reps + 1, out.bad, (size_t)s.M * s.N * (size_t)(reps + 1), out.worst, stale_all);
         fflush(stdout);
 
         char line[360];
@@ -362,14 +382,20 @@ int main(int argc, char **argv)
                  "bad %ld of %zu worst %ld npuC %.1f bigC %.1f\n",
                  si, s.M, s.K, s.N, out.npu_ran ? out.npu : -1.0,
                  out.gf32, out.gq8, out.blas, out.npu_rc,
-                 out.bad, (size_t)s.M * s.N, out.worst,
+                 out.bad, (size_t)s.M * s.N * (size_t)(reps + 1), out.worst,
                  zone_temp("npu-thermal"), zone_temp("bigcore-thermal"));
         record(line);
+        if (out.npu_ran && (out.bad || stale_all)) any_wrong++;
     }
 
     /* ---- the verdict ----------------------------------------------------------
      * Only meaningful over the whole list; per-shape runs are aggregated from the log. */
-    if (rows.size() < 2) { ggml_backend_free(be); rocket_close(fd); return 0; }
+    /* A timing over a surface that is wrong is not a result, so a wrong or stale rep fails
+     * the run whatever the ratios below say. */
+    if (any_wrong)
+        printf("\n%d shape(s) returned a surface off by more than one count, or a rep that "
+               "never wrote -> FAIL\n", any_wrong);
+    if (rows.size() < 2) { ggml_backend_free(be); rocket_close(fd); return any_wrong ? 1 : 0; }
     printf("\n== the ratio, against the FASTEST CPU arm at each shape ==\n");
     printf("  %-26s %-20s %10s %10s %8s %s\n",
            "shape", "M / K / N", "NPU ms", "bestCPU", "ratio", "which CPU arm");
@@ -423,5 +449,5 @@ int main(int argc, char **argv)
 
     ggml_backend_free(be);
     rocket_close(fd);
-    return 0;
+    return any_wrong ? 1 : 0;
 }

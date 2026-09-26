@@ -52,9 +52,6 @@
 #include "ggml-rocket.h"
 #include "test-common.h"
 
-extern "C" {
-#include "rocket_npu.h"
-}
 
 #include <vector>
 #include <string>
@@ -85,16 +82,16 @@ struct moe_case {
 
 // Deterministic expert weights. `range == WIDE` scales each 32-element K-block by a power
 // of two spanning ~9 octaves, so a merged K-group's blocks cannot share one exponent
-// exactly. The pattern is a fixed function of (e, block), not random, so CPU and NPU see
-// byte-identical tensors.
+// exactly. The base is a period-free hash of (e, index), so CPU and NPU see byte-identical
+// tensors and no two weight rows or experts share values. A period-13 pattern made rows n
+// and n+13 of an expert identical, and expert e+1 its neighbour shifted three rows.
 static void fill_weights(std::vector<float> & w, int e, int K, int N, wrange range) {
-    for (size_t i = 0; i < w.size(); i++) {
-        float v = ((int)((i + e * 131) * 7) % 13 - 6) * 0.05f;
-        if (range == WIDE) {
+    rk_fill(w, 1000u + (uint64_t)e, 0.3f);
+    if (range == WIDE) {
+        for (size_t i = 0; i < w.size(); i++) {
             const int blk = (int)((i % (size_t)K) / 32);       // K-block index within the row
-            v *= ldexpf(1.0f, -(blk % 10));                    // 1 .. 1/512
+            w[i] *= ldexpf(1.0f, -(blk % 10));                 // 1 .. 1/512
         }
-        w[i] = v;
     }
     (void)N;
 }
@@ -176,10 +173,14 @@ static std::vector<int32_t> make_ids(const moe_case & c) {
 // activation is quantized per (row, K-GROUP), so an outlier only degrades the group it
 // sits in, not the whole row. That is the property this gate exists to pin -- a flat input
 // would pass just as happily against a per-ROW scale and prove nothing.
+//
+// The base is period-free. A period-11 pattern gave tokens t and t+11 the same input, and
+// the routing sends some such pairs to one expert, where a swap of their rows reads right.
 static std::vector<float> make_input(const moe_case & c) {
     std::vector<float> Xf((size_t)c.K * c.ne11 * c.n_tokens);
+    rk_fill(Xf, 2000u + (uint64_t)c.K, 0.25f);
     for (size_t i = 0; i < Xf.size(); i++) {
-        float v = ((int)(i*5)%11 - 5) * 0.05f;
+        float v = Xf[i];
         const size_t k = i % (size_t)c.K;                 // channel index within the row
         if (k % 97 == 13) v *= 20.0f;                     // ~1% of channels, 20x
         Xf[i] = v;
@@ -223,15 +224,7 @@ int main() {
     // other gates read that as a pass (they only compare against the CPU), but this one
     // additionally asserts that experts were INGESTED onto the device, so a missing or
     // unreadable /dev/accel would report FAIL for what is an environment, not a defect.
-    {
-        const int probe = rocket_open();
-        if (probe < 0) {
-            fprintf(stderr, "cannot open the accel device (absent, or no permission -- "
-                            "run with sudo -E) -> SKIP\n");
-            return 77;
-        }
-        rocket_close(probe);
-    }
+    if (!rk_device_opens()) return 77;
     ggml_backend_t rocket = ggml_backend_rocket_init();
     if (!rocket) { fprintf(stderr, "rocket backend unavailable (no NPU?) -> SKIP\n"); return 77; }
 
@@ -255,9 +248,16 @@ int main() {
         ggml_backend_rocket_moe_stats(rocket, &res_before, nullptr);
 
         std::vector<float> oc, orr;
-        if (!run(cpu, c, wname, Wf, Xf, ids, oc) || !run(rocket, c, wname, Wf, Xf, ids, orr)) {
+        if (!run(cpu, c, wname, Wf, Xf, ids, oc)) {
             fprintf(stderr, "%s: backend run failed\n", c.name); fails++; continue;
         }
+        // The expert handler took the op, and no expert fell back to the CPU: a fallback
+        // expert matches the CPU backend exactly, so the cosine alone cannot see one.
+        const rk_route_mark mk = rk_route_mark_take(rocket, "moe");
+        if (!run(rocket, c, wname, Wf, Xf, ids, orr)) {
+            fprintf(stderr, "%s: backend run failed\n", c.name); fails++; continue;
+        }
+        if (!rk_route_check(rocket, "moe", mk, c.name)) fails++;
 
         float max_abs, max_rel; long nbad;
         const double cos = rk_compare(oc, orr, &max_abs, &max_rel, &nbad);
@@ -270,11 +270,23 @@ int main() {
         const bool route_ok = c.native ? (ingested > 0) : (ingested == 0);
         if (c.native) n_native_cases++;
 
-        const bool pass = (nbad == 0) && (cos >= c.cos_min) && route_ok;
+        // The aggregate averages one wrong routed row, or one wrong output column, into the
+        // rest. Each is gated on its own at ten times the aggregate floor's error power: a
+        // row or column that is wrong whole reads near 0, and quantization noise is spread.
+        const int R = c.n_used * c.n_tokens;               // dst is [N, n_used, n_tokens]
+        const double part_min = 1.0 - 10.0 * (1.0 - c.cos_min);
+        int wrow = -1, wcol = -1;
+        const double rcos = rk_worst_row_cosine(oc, orr, R, c.N, &wrow);
+        const double ccos = rk_worst_col_cosine(oc, orr, R, c.N, &wcol);
+
+        const bool pass = (nbad == 0) && (cos >= c.cos_min) && route_ok
+                       && rcos >= part_min && ccos >= part_min;
         printf("%s cos=%.6f max_abs=%.4f max_rel=%.4f nbad=%3ld ingested=%2ld -> %s%s\n",
                c.name, cos, max_abs, max_rel, nbad, ingested, pass ? "PASS" : "FAIL",
                route_ok ? "" : (c.native ? "  (native route did NOT run)"
                                          : "  (fp16 case took the native route)"));
+        printf("      worst row %d cos=%.6f, worst column %d cos=%.6f (floor %.4f)\n",
+               wrow, rcos, wcol, ccos, part_min);
         if (!pass) fails++;
     }
 
@@ -307,14 +319,22 @@ int main() {
             const std::vector<float>   Xf  = make_input(c);
             const std::vector<int32_t> ids = make_ids(c);
             std::vector<float> oc, orr;
+            const rk_route_mark mk = rk_route_mark_take(rocket, "moe");
             if (!run(cpu, c, "blk.99.ffn_up_exps.weight", Wf, Xf, ids, oc) ||
                 !run(rocket, c, "blk.99.ffn_up_exps.weight", Wf, Xf, ids, orr)) {
                 fprintf(stderr, "cross-M: backend run failed at n_tokens=%d\n", c.n_tokens);
                 ok = false; break;
             }
+            if (!rk_route_check(rocket, "moe", mk, "cross-M")) ok = false;
             float max_abs, max_rel; long nbad;
             const double cos = rk_compare(oc, orr, &max_abs, &max_rel, &nbad);
-            if (nbad != 0 || cos < c.cos_min) {
+            const int R = c.n_used * c.n_tokens;
+            const double part_min = 1.0 - 10.0 * (1.0 - c.cos_min);
+            const double rcos = rk_worst_row_cosine(oc, orr, R, c.N);
+            const double ccos = rk_worst_col_cosine(oc, orr, R, c.N);
+            printf("      n_tokens=%3d worst row cos=%.6f, worst column cos=%.6f (floor %.4f)\n",
+                   c.n_tokens, rcos, ccos, part_min);
+            if (nbad != 0 || cos < c.cos_min || rcos < part_min || ccos < part_min) {
                 printf("%s n_tokens=%3d cos=%.6f nbad=%ld -> FAIL\n", c.name, c.n_tokens, cos, nbad);
                 ok = false;
             }

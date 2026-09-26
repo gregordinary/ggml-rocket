@@ -23,6 +23,11 @@
  * arithmetic below still has to agree — it just agrees via that fallback rather than on
  * the NPU — so case 2 is asserted identically on both parts and only the placement
  * expectation in case 1 forks.
+ *
+ * Case 2 also reads the backend's route counters, because the CPU fallback computes the
+ * golden answer's own arithmetic and the numbers alone cannot say where it ran. On the
+ * RK3588 an NPU route must finish the op with no fallback; on the RK3576 the fallback must
+ * be what computed it.
  */
 #include "ggml-cpu.h"
 #include "ggml-rocket.h"
@@ -49,8 +54,9 @@ int main() {
     setenv("ROCKET_BF16", "0", 1);   // default route: decode bf16 -> fp16 streaming
 
     ggml_backend_t cpu    = ggml_backend_cpu_init();
-    ggml_backend_t rocket = ggml_backend_rocket_init();
     if (!cpu) { fprintf(stderr, "cpu backend init failed\n"); return 1; }
+    if (!rk_device_opens()) return 77;
+    ggml_backend_t rocket = ggml_backend_rocket_init();
     if (!rocket) { fprintf(stderr, "rocket backend unavailable (no NPU?) -> SKIP\n"); return 77; }
 
     int fails = 0;
@@ -81,12 +87,25 @@ int main() {
     for (int B : {1, 3}) {
         const int K = 256, N = 128, M = 64;
         std::vector<float> Wf((size_t)K*N), Xf((size_t)K*M*B), oc, orr;
-        for (size_t i = 0; i < Wf.size(); i++) Wf[i] = ((int)(i*7)%13-6)*0.05f;
-        for (size_t i = 0; i < Xf.size(); i++) Xf[i] = ((int)(i*5)%11-5)*0.05f;
+        // Period-free, and sized so the outputs sit near 10: the element bar below ignores
+        // an error under 0.5, so outputs below it would let a zeroed element through.
+        rk_fill(Wf, 11u + (uint64_t)B, 1.0f);
+        rk_fill(Xf, 22u + (uint64_t)B, rk_amp_for(K, 1.0f));
 
-        bool ok = rk_run_mul_mat(cpu,    GGML_TYPE_BF16, K, N, M, B, Wf, Xf, oc)
-               && rk_run_mul_mat(rocket, GGML_TYPE_BF16, K, N, M, B, Wf, Xf, orr);
+        bool ok = rk_run_mul_mat(cpu, GGML_TYPE_BF16, K, N, M, B, Wf, Xf, oc);
+        const rk_route_mark mk = rk_route_mark_take(rocket, nullptr);
+        ok = ok && rk_run_mul_mat(rocket, GGML_TYPE_BF16, K, N, M, B, Wf, Xf, orr);
         if (!ok) { fprintf(stderr, "bf16 B=%d: backend run failed\n", B); fails++; continue; }
+        if (rk_is_rk3576()) {
+            // No bf16 route on this part: the op reaches the CPU fallback by design, and the
+            // count says it did rather than leaving the numbers to imply it.
+            const long fb = ggml_backend_rocket_cpu_fallbacks(rocket) - mk.fallbacks;
+            printf("  rk3576: %ld CPU fallback(s), as a part with no bf16 route computes -> %s\n",
+                   fb, fb > 0 ? "PASS" : "FAIL");
+            if (fb <= 0) fails++;
+        } else if (!rk_route_check(rocket, nullptr, mk, "on the NPU")) {
+            fails++;
+        }
 
         float max_abs = 0, max_rel = 0; long nbad = 0;
         for (size_t i = 0; i < oc.size(); i++) {

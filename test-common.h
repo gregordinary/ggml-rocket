@@ -17,6 +17,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "rocket_hw_profile.h"   // rocket_hw_current(): which part the driver selected
+#include "rocket_npu.h"          // rocket_open(): whether the accel node opens at all
+#include "ggml-rocket.h"        // the route and fallback counters
+
+#include <cstdint>
 
 #include <cstdio>
 #include <cmath>
@@ -131,6 +135,110 @@ static inline double rk_cosine(const std::vector<float> & a, const std::vector<f
     for (size_t i = 0; i < a.size(); i++)
         if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return -2.0;
     return rk_compare(a, b);
+}
+
+// ---- is the device there, and did it compute? -------------------------------------------
+//
+// ggml_backend_rocket_init() opens nothing -- every fd is lazy -- so it succeeds on a machine
+// with no usable NPU, and each matmul then degrades to the backend's CPU fallback. That
+// fallback computes in fp64, as the CPU backend computes a gate's golden answer, so the
+// numbers alone pass on a device that computed nothing. Two checks close it: probe the node
+// before the backend, and assert after a run which route computed.
+
+// True when the accel node opens. Otherwise says why, and the gate SKIPs (77).
+static inline bool rk_device_opens(void) {
+    const int fd = rocket_open();
+    if (fd < 0) {
+        fprintf(stderr, "cannot open the accel device (absent, or no permission -- run with "
+                        "sudo -E) -> SKIP\n");
+        return false;
+    }
+    rocket_close(fd);
+    return true;
+}
+
+// The backend's counters at one point, so a gate can assert over the ops it then ran.
+struct rk_route_mark { long ops; long fallbacks; };
+
+static inline rk_route_mark rk_route_mark_take(ggml_backend_t b, const char * route) {
+    return { ggml_backend_rocket_route_ops(b, route), ggml_backend_rocket_cpu_fallbacks(b) };
+}
+
+// Since `m`: at least one op finished on `route` (NULL: any route) and nothing fell back to
+// the CPU. Prints both counts either way, so a failing run says which half failed.
+static inline bool rk_route_check(ggml_backend_t b, const char * route, const rk_route_mark & m,
+                                  const char * what) {
+    const long ops = ggml_backend_rocket_route_ops(b, route) - m.ops;
+    const long fb  = ggml_backend_rocket_cpu_fallbacks(b) - m.fallbacks;
+    const bool ok  = ops > 0 && fb == 0;
+    printf("  %s: %ld op(s) on route %s, %ld CPU fallback(s) -> %s\n", what, ops,
+           route ? route : "(any)", fb, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---- fills and comparisons ----------------------------------------------------------------
+
+// A period-free fill, uniform in [-amp, amp]: splitmix64 over (seed, index). A fill with a
+// period that divides a row or a tile gives a transposed or shifted surface the same values
+// as the right one, which is what the ((i*7)%13) patterns these gates used could do.
+static inline uint64_t rk_hash(uint64_t seed, uint64_t i) {
+    uint64_t z = seed * 0x9E3779B97F4A7C15ull + i + 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+static inline void rk_fill(std::vector<float> & v, uint64_t seed, float amp) {
+    for (size_t i = 0; i < v.size(); i++)
+        v[i] = amp * (float)((double)(rk_hash(seed, i) >> 11) * (2.0 / 9007199254740992.0) - 1.0);
+}
+
+// The amplitude that puts a K-deep dot of two uniform fills near `target` rms, given the
+// other operand's amplitude: rms = sqrt(K) * a * b / 3. The fp16 gates' element bar ignores
+// an error under 0.5, so outputs near 10 are what make a zeroed element visible to it.
+static inline float rk_amp_for(int K, float other_amp, float target = 10.0f) {
+    return 3.0f * target / (sqrtf((float)K) * other_amp);
+}
+
+// The worst per-output-column cosine over a [M rows, N columns] result laid out out[m*N+n].
+// A whole-tensor cosine averages one wrong column into thousands of right ones; this is the
+// number a single bad column moves. `worst_col` (may be null) receives the column. A column
+// whose reference is all zero is skipped, and a non-finite element returns -2.0.
+static inline double rk_worst_col_cosine(const std::vector<float> & ref, const std::vector<float> & got,
+                                         int M, int N, int * worst_col = nullptr) {
+    double worst = 2.0; int wc = -1;
+    for (int n = 0; n < N; n++) {
+        double dot = 0, na = 0, nb = 0;
+        for (int m = 0; m < M; m++) {
+            const size_t i = (size_t)m * N + n;
+            if (!std::isfinite(got[i]) || !std::isfinite(ref[i])) { if (worst_col) *worst_col = n; return -2.0; }
+            dot += (double)ref[i] * got[i]; na += (double)ref[i] * ref[i]; nb += (double)got[i] * got[i];
+        }
+        if (na <= 0) continue;
+        const double c = nb > 0 ? dot / (sqrt(na) * sqrt(nb)) : 0.0;
+        if (c < worst) { worst = c; wc = n; }
+    }
+    if (worst_col) *worst_col = wc;
+    return worst > 1.5 ? 1.0 : worst;
+}
+
+// The worst per-row cosine over the same layout: one row is one output vector over N, the
+// unit a mis-routed or mis-scattered row replaces whole. Same conventions as the column form.
+static inline double rk_worst_row_cosine(const std::vector<float> & ref, const std::vector<float> & got,
+                                         int M, int N, int * worst_row = nullptr) {
+    double worst = 2.0; int wr = -1;
+    for (int m = 0; m < M; m++) {
+        double dot = 0, na = 0, nb = 0;
+        for (int n = 0; n < N; n++) {
+            const size_t i = (size_t)m * N + n;
+            if (!std::isfinite(got[i]) || !std::isfinite(ref[i])) { if (worst_row) *worst_row = m; return -2.0; }
+            dot += (double)ref[i] * got[i]; na += (double)ref[i] * ref[i]; nb += (double)got[i] * got[i];
+        }
+        if (na <= 0) continue;
+        const double c = nb > 0 ? dot / (sqrt(na) * sqrt(nb)) : 0.0;
+        if (c < worst) { worst = c; wr = m; }
+    }
+    if (worst_row) *worst_row = wr;
+    return worst > 1.5 ? 1.0 : worst;
 }
 
 #endif // GGML_ROCKET_TEST_COMMON_H

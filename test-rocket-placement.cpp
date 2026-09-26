@@ -262,6 +262,78 @@ static int moe_budget_child(void) {
     return fails;
 }
 
+// ROCKET_MOE_CHARGE_ALL_SOURCE, the corrected admission charge. Two children at the SAME
+// budget over the SAME four stacks in ONE mmap-shaped weight buffer: the default admits
+// more of them than the knob does, and the difference is exactly the source bytes of the
+// stacks that are never placed.
+//
+// The buffer is real here, and it has to be. The knob charges `a->buffer`'s size, which
+// stands in for llama.cpp's mmapped weight buffer, and every other case in this file builds
+// its tensors with `no_alloc` so that pointer is null. It also has to hold MORE THAN ONE
+// stack: with one stack per buffer the two accountings charge the same bytes and the case
+// would pass while testing nothing.
+//
+// Real gpt-oss expert dimensions, with n_expert cut to 4 to keep the allocation near
+// 141 MB. M_e is 512*4/4 = 512, over both the tile granule and the per-dispatch work floor,
+// so the stacks are declined on the budget and not on a shape rule.
+#define RK_MOE_SRC_STACKS 4
+static int moe_src_charge_cases(bool all_src) {
+    if (all_src) setenv("ROCKET_MOE_CHARGE_ALL_SOURCE", "1", 1);
+    else         unsetenv("ROCKET_MOE_CHARGE_ALL_SOURCE");
+    unsetenv("ROCKET_MOE");
+
+    ggml_backend_reg_t reg = ggml_backend_rocket_reg();
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+
+    const int EK = 2880, EN = 2880, NE = 4, NT = 512, NUSED = 4;
+    ggml_init_params ip = { ggml_tensor_overhead()*(RK_MOE_SRC_STACKS + 8) + ggml_graph_overhead(),
+                            NULL, true };
+    ggml_context * wctx = ggml_init(ip);
+    ggml_tensor * as[RK_MOE_SRC_STACKS];
+    for (int i = 0; i < RK_MOE_SRC_STACKS; i++) {
+        as[i] = ggml_new_tensor_3d(wctx, GGML_TYPE_Q8_0, EK, EN, NE);
+        char nm[64]; snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_exps.weight", i);
+        ggml_set_name(as[i], nm);
+    }
+    // The rocket backend's buffer type IS the CPU buffer type, so this allocates plain host
+    // memory and gives the four stacks one shared ggml_backend_buffer, which is the shape
+    // llama.cpp's mmapped weight buffer has.
+    ggml_backend_buffer_t buf =
+        ggml_backend_alloc_ctx_tensors_from_buft(wctx, ggml_backend_cpu_buffer_type());
+    if (!buf) {
+        printf("  [FAIL] could not allocate the shared expert weight buffer\n");
+        ggml_free(wctx);
+        return 1;
+    }
+
+    // The budget is set from the buffer, not typed in, because what discriminates the two
+    // accountings is a ratio and not a byte count. At 1.6x the source the default admits
+    // three of the four stacks and the knob two: the default needs `k * (codes + source/k)`
+    // to fit, the knob `source + k * codes`, and between 1.5x and 1.7x those give different
+    // k for any codes-to-source ratio near 1. The pre-flight resolves its budget lazily at
+    // the first supports_op, so setting it here is in time.
+    char budget[32];
+    snprintf(budget, sizeof(budget), "%zu",
+             (size_t)((ggml_backend_buffer_get_size(buf) * 16 / 10) >> 20));
+    setenv("ROCKET_MOE_CACHE_MB", budget, 1);
+
+    int admitted = 0;
+    for (int i = 0; i < RK_MOE_SRC_STACKS; i++) {
+        ggml_init_params gp = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), NULL, true };
+        ggml_context * gctx = ggml_init(gp);
+        ggml_tensor * b   = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, EK, 1, NT);
+        ggml_tensor * ids = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, NUSED, NT);
+        ggml_tensor * dst = ggml_mul_mat_id(gctx, as[i], b, ids);
+        if (ggml_backend_dev_supports_op(dev, dst)) admitted++;
+        ggml_free(gctx);
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(wctx);
+    return admitted;
+}
+static int moe_src_default_child(void) { return moe_src_charge_cases(false); }
+static int moe_src_knob_child(void)    { return moe_src_charge_cases(true);  }
+
 // Run one child's cases in a forked process and return its failure count. The knobs the
 // child sets are cached-getenv statics; a fork is what keeps them independent.
 static int run_moe_child(int (*fn)(void)) {
@@ -379,6 +451,16 @@ int main() {
     fails += run_moe_child(moe_budget_child);
     fails += run_moe_child(moe_off_child);
     fails += run_moe_child(moe_forced_child);
+
+    // ROCKET_MOE_CHARGE_ALL_SOURCE. Each child returns the number of stacks it admitted,
+    // not a failure count, so these two are compared rather than summed.
+    printf("  -- ROCKET_MOE_CHARGE_ALL_SOURCE, same 460MB budget over 4 stacks in one buffer --\n");
+    const int n_default = run_moe_child(moe_src_default_child);
+    const int n_all_src = run_moe_child(moe_src_knob_child);
+    printf("  [%s] MoE source charge: default admitted %d of %d, knob admitted %d\n",
+           (n_all_src < n_default) ? "PASS" : "FAIL",
+           n_default, RK_MOE_SRC_STACKS, n_all_src);
+    if (!(n_all_src < n_default)) fails++;
 
     printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL PASS");
     return fails ? 1 : 0;

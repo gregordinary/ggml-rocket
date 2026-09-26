@@ -6,6 +6,12 @@
  *
  * For each shape: build dst = ggml_mul_mat(W[K,N], X[K,M]) -> [N,M], run it on the
  * CPU backend and on the rocket backend with identical inputs, compare.
+ *
+ * Every section also reads the backend's route counters: an op must finish on an NPU route
+ * (the fused cases on a fused one) with no CPU fallback. The fallback computes in fp64, as
+ * the CPU backend does, so a gate reading only the numbers passes on a device that computed
+ * nothing. The plain shapes gate the worst output column's cosine beside the element bar.
+ * The RK3576 has none of these routes, so this gate SKIPs there.
  */
 #include "ggml-cpu.h"
 #include "ggml-rocket.h"
@@ -126,21 +132,28 @@ int main() {
     };
 
     ggml_backend_t cpu    = ggml_backend_cpu_init();
-    ggml_backend_t rocket = ggml_backend_rocket_init();
     if (!cpu) { fprintf(stderr, "cpu backend init failed\n"); return 1; }
-    // No NPU -> the rocket backend won't init. SKIP (77) rather than FAIL, so this
-    // gate skips cleanly off-device under CTest (SKIP_RETURN_CODE 77).
+    // Every route this gate exercises is the RK3588's fp16 one, which refuses on the RK3576
+    // by construction; there each matmul would reach the CPU fallback. That part's matmul
+    // route is test-rk3576-w8a8's.
+    if (rk_is_rk3576()) { fprintf(stderr, "RK3576: no fp16 matmul route to test -> SKIP\n"); return 77; }
+    if (!rk_device_opens()) return 77;
+    ggml_backend_t rocket = ggml_backend_rocket_init();
     if (!rocket) { fprintf(stderr, "rocket backend unavailable (no NPU?) -> SKIP\n"); return 77; }
 
     int fails = 0;
     for (auto s : shapes) {
         std::vector<float> Wf((size_t)s.K*s.N), Xf((size_t)s.K*s.M), oc, orr;
-        for (size_t i = 0; i < Wf.size(); i++) Wf[i] = ((int)(i*7)%13-6)*0.05f;
-        for (size_t i = 0; i < Xf.size(); i++) Xf[i] = ((int)(i*5)%11-5)*0.05f;
+        // Period-free, and sized so the outputs sit near 10: the element bar below ignores
+        // an error under 0.5, so outputs below it would let a zeroed element through.
+        rk_fill(Wf, 101u + (uint64_t)s.K, 1.0f);
+        rk_fill(Xf, 202u + (uint64_t)s.M, rk_amp_for(s.K, 1.0f));
 
-        bool ok = rk_run_mul_mat(cpu,    GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, oc)
-               && rk_run_mul_mat(rocket, GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, orr);
+        bool ok = rk_run_mul_mat(cpu, GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, oc);
+        const rk_route_mark mk = rk_route_mark_take(rocket, nullptr);
+        ok = ok && rk_run_mul_mat(rocket, GGML_TYPE_F16, s.K, s.N, s.M, 1, Wf, Xf, orr);
         if (!ok) { fails++; continue; }
+        if (!rk_route_check(rocket, nullptr, mk, "on the NPU")) fails++;
 
         // An element is bad only if it fails BOTH tolerances at once (large abs alone
         // = fp16 rounding on a big value; large rel alone = a near-zero reference).
@@ -157,9 +170,11 @@ int main() {
             if (rd > max_rel) max_rel = rd;
             if (ad >= 0.5f && rd >= 0.05f) nbad++;
         }
-        bool pass = (nbad == 0);
-        printf("K=%4d N=%4d M=%4d  max_abs=%.4f max_rel=%.4f nbad=%ld -> %s\n",
-               s.K, s.N, s.M, max_abs, max_rel, nbad, pass ? "PASS" : "FAIL");
+        int wcol = -1;
+        const double wcos = rk_worst_col_cosine(oc, orr, s.M, s.N, &wcol);
+        bool pass = (nbad == 0) && wcos >= 0.999;
+        printf("K=%4d N=%4d M=%4d  max_abs=%.4f max_rel=%.4f nbad=%ld worst column %d cos=%.6f -> %s\n",
+               s.K, s.N, s.M, max_abs, max_rel, nbad, wcol, wcos, pass ? "PASS" : "FAIL");
         if (!pass) fails++;
     }
 
@@ -176,10 +191,12 @@ int main() {
         const int outlier_row = 3;
         for (int k = 0; k < K; k++) Xf[(size_t)outlier_row*K + k] = ((k%7)-3)*300.0f;  // |.|<=900
 
-        bool ok = rk_run_mul_mat(cpu,    GGML_TYPE_F16, K, N, M, 1, Wf, Xf, oc)
-               && rk_run_mul_mat(rocket, GGML_TYPE_F16, K, N, M, 1, Wf, Xf, orr);
+        bool ok = rk_run_mul_mat(cpu, GGML_TYPE_F16, K, N, M, 1, Wf, Xf, oc);
+        const rk_route_mark mk = rk_route_mark_take(rocket, nullptr);
+        ok = ok && rk_run_mul_mat(rocket, GGML_TYPE_F16, K, N, M, 1, Wf, Xf, orr);
         if (!ok) { fprintf(stderr, "outlier test: backend run failed\n"); fails++; }
         else {
+            if (!rk_route_check(rocket, nullptr, mk, "outlier test on the NPU")) fails++;
             // Check the SMALL (non-outlier) rows specifically.
             float small_max_rel = 0; int small_nonfinite = 0;
             for (int m = 0; m < M; m++) {
@@ -216,16 +233,31 @@ int main() {
         for (auto c : cases) {
             std::vector<std::vector<float>> Wf(c.ng);
             std::vector<float> Xf((size_t)K*M);
-            for (size_t i = 0; i < Xf.size(); i++) Xf[i] = ((int)(i*5)%11-5)*0.05f;
+            rk_fill(Xf, 303u, rk_amp_for(K, 1.0f));
             for (int g = 0; g < c.ng; g++) {
                 Wf[g].resize((size_t)K*c.Ns[g]);
-                for (size_t i = 0; i < Wf[g].size(); i++)   // distinct per-weight pattern
-                    Wf[g][i] = ((int)((i + (size_t)g*131)*7)%13-6)*0.05f;
+                rk_fill(Wf[g], 404u + (uint64_t)g, 1.0f);   // a distinct fill per member
             }
             std::vector<std::vector<float>> oc, orr;
-            bool ok = run_group(cpu,    K, c.Ns, c.ng, M, Wf, Xf, oc)
-                   && run_group(rocket, K, c.Ns, c.ng, M, Wf, Xf, orr);
+            bool ok = run_group(cpu, K, c.Ns, c.ng, M, Wf, Xf, oc);
+            // The fused route by NAME: members run one by one on the mt route compute the
+            // same numbers, so only the counter says the fusion this case is for ran. Either
+            // spelling counts, since ROCKET_F16_RESIDENT takes the resident one.
+            auto fused_ops = [&]() {
+                return ggml_backend_rocket_route_ops(rocket, "fused")
+                     + ggml_backend_rocket_route_ops(rocket, "fused-resident");
+            };
+            const long f0 = fused_ops(), fb0 = ggml_backend_rocket_cpu_fallbacks(rocket);
+            ok = ok && run_group(rocket, K, c.Ns, c.ng, M, Wf, Xf, orr);
             if (!ok) { fprintf(stderr, "fused %s: backend run failed\n", c.name); fails++; continue; }
+            {
+                const long fops = fused_ops() - f0;
+                const long fb   = ggml_backend_rocket_cpu_fallbacks(rocket) - fb0;
+                const bool rok  = fops > 0 && fb == 0;
+                printf("  %s: %ld op(s) on a fused route, %ld CPU fallback(s) -> %s\n",
+                       c.name, fops, fb, rok ? "PASS" : "FAIL");
+                if (!rok) fails++;
+            }
             float max_abs = 0, max_rel = 0; long nbad = 0;
             for (int g = 0; g < c.ng; g++)
                 for (size_t i = 0; i < oc[g].size(); i++) {
@@ -262,9 +294,13 @@ int main() {
             // make Q4_K's per-block scales noisy and the test about quant error, not the
             // NPU path). Magnitudes ~[-0.5,0.5].
             for (size_t i = 0; i < Wf.size(); i++) Wf[i] = sinf((float)i*0.013f)*0.5f;
-            for (size_t i = 0; i < Xf.size(); i++) Xf[i] = ((int)(i*5)%11-5)*0.05f;
+            // The sine's rms is 0.354, a uniform fill's of amplitude 0.61; sized off that so
+            // the outputs sit near 10 like the F16 shapes above.
+            rk_fill(Xf, 505u + (uint64_t)s.K, rk_amp_for(s.K, 0.61f));
 
+            const rk_route_mark mk = rk_route_mark_take(rocket, nullptr);
             if (!run_q(rocket, s.K, s.N, s.M, s.wt, Wf, Xf, orr, Wdq)) { fails++; continue; }
+            if (!rk_route_check(rocket, nullptr, mk, s.name)) fails++;
 
             // golden[m*N+n] = sum_k Wdq[n,k]*Xf[m,k]  (matches ggml mul_mat [N,M] layout)
             std::vector<double> golden((size_t)s.N*s.M, 0.0);

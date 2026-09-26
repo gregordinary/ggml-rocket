@@ -227,6 +227,18 @@ struct rocket_bf16_weight {
     int N, K; size_t bytes;
 };
 
+// One host-cached DEQUANTIZED fp16 weight for the streaming quant path
+// (ROCKET_DEQUANT_CACHE_MB). This is the -ub lever's MECHANISM CONTROL, not a production
+// lever: it removes ONLY the per-micro-batch dequant (the weight is decoded once and the
+// fp16 form re-served), while the per-call pack, the submit and the placement stay exactly
+// the shipped streaming path. An A/B of the same arm with and without it therefore prices
+// the dequant term alone. As a user knob it is dominated by ROCKET_QUANT_RESIDENT, which
+// holds the same fp16 footprint AND removes the per-call pack and upload as well.
+struct rocket_dq_weight {
+    std::vector<ggml_fp16_t> B16;  // [N*K] dequantized fp16
+    int N, K; size_t bytes;
+};
+
 // One RESIDENT natively-quantized MoE expert weight: the expert's [N,K] GGUF-quant
 // payload ingested ONCE into int8 codes + per-(output-channel, K-group) fp32 scales,
 // scattered into resident NPU int8 tile BOs, and the host int8 copy dropped. Keyed on
@@ -474,6 +486,18 @@ struct ggml_backend_rocket_context {
     rocket_bf16_stream * bf16_stream = nullptr;
     bool bf16_stream_failed = false;
 
+    // Host fp16 dequant cache for the streaming quant path (ROCKET_DEQUANT_CACHE_MB, default
+    // off = the shipped per-micro-batch dequant). The mechanism control; see rocket_dq_weight.
+    // The three counters split every dequant-path call by what it paid -- served from the
+    // cache, a one-time fill, or a per-call dequant the budget/key could not remove -- so the
+    // teardown line can say whether an arm actually isolated the dequant term.
+    std::unordered_map<std::string, rocket_dq_weight> dq_wcache;
+    size_t dq_resident_bytes = 0;
+    size_t dq_cache_budget   = 0;   // bytes; 0 = off (ROCKET_DEQUANT_CACHE_MB)
+    long   dq_hit_calls      = 0;   // dequants skipped (served from the cache)
+    long   dq_fill_calls     = 0;   // one-time fills (dequant into the cache)
+    long   dq_stream_calls   = 0;   // per-call dequants the cache could not remove
+
     // FLASH_ATTN_EXT (LLM prefill attention) path, ON by default, context-gated
     // (ROCKET_FLASH_ATTN=0 disables). The
     // handler fans the heads across n_threads worker fds (rocket_flash_attn_fp16_mt: per-head
@@ -538,6 +562,12 @@ struct ggml_backend_rocket_context {
     size_t moe_cache_budget      = 0;     // bytes; 0 = unlimited. Set in _init (default auto)
     bool   moe_i8_full           = false; // IOVA window full / budget hit -> stream the rest
     long   moe_n_resident        = 0;     // experts ingested (for the resident/streaming split)
+    // What computed each MUL_MAT, for a gate to assert: the ops each route finished (the
+    // label rocket_mul_mat_post names) and the slices or MoE experts that fell back to the
+    // CPU. A CPU fallback computes in fp64, as every gate's golden answer does, so a gate
+    // reading only the numbers passes on a device that computed nothing.
+    std::unordered_map<std::string, long> route_ops;
+    long   n_cpu_fallbacks       = 0;
     // What the residency COSTS: every resident expert is decoded from its GGUF blocks,
     // requantized to int8, and scattered into NPU BOs -- once. On a real MoE that is
     // thousands of experts and tens of GB, i.e. minutes, and because the ingest is lazy it
@@ -989,6 +1019,33 @@ static int rocket_flash_attn_min_kv(void) {
     if (kv == 0) { kv = rocket_knob_int("ROCKET_FLASH_ATTN_MIN_KV", 1024); if (kv < 1) kv = 1; }
     return kv;
 }
+// ROCKET_FLASH_ATTN_UNMASKED=1 admits FLASH_ATTN_EXT ops that carry no mask (encoder
+// self-attention). Off by default: measured at parity on CPU core-seconds and +36% on the
+// encode wall for whisper small (d=64, T=n_kv=1500), see the gate in supports_op.
+static bool rocket_flash_attn_unmasked(void) {
+    static int v = -1;
+    if (v < 0) v = rocket_knob_int("ROCKET_FLASH_ATTN_UNMASKED", 0);
+    return v > 0;
+}
+// ROCKET_FA_THREADS: worker count for the FLASH_ATTN_EXT handler's HOST gather and scatter.
+// 1 (the default) keeps the serial walks byte for byte. Those five walks -- the Q convert,
+// the K copy, the V transpose, the mask copy and the output scatter -- run on the dispatch
+// thread while the ggml scheduler waits, so the interval they occupy is wall and not
+// core-seconds: 5.44 s of a 97.8 s pinned prefill (gather 3.46, scatter 1.98) on gemma4-12b
+// F16 at pp2048 [HW readout 2026-09-03, ROCKET_FA_TIMING=1]. Threading them is therefore
+// capped at 5.6% x (1 - 1/k) of the wall with no exchange rate imported. The gain is now
+// MEASURED at k=4: 1.0389x of the pinned prefill wall, with G_k = 5.80 / 3.17 / 1.87 s at
+// 1 / 2 / 4 workers, and G_k = A/k + B fits a fixed residue of 0.55 s -- so four workers take
+// 89% of what any number would [HW sweep 2026-09-07, three arms x three passes, rotated]. The
+// default stays the serial path because the gain is one shape and one unit, and because
+// whether the split is bit-identical is open (see ROCKET_FA_CHECKSUM below). The value is
+// clamped to the shared dequant pool's worker count, since that pool is what runs the
+// chunks and a request above its size buys nothing.
+static int rocket_fa_threads(void) {
+    static int v = -1;
+    if (v < 0) { v = rocket_knob_int("ROCKET_FA_THREADS", 1); if (v < 1) v = 1; }
+    return v;
+}
 // ROCKET_FLASH_ATTN_NO_CTX=1 forces the per-call mt path (fresh worker fds + per-call score
 // scratch every call) instead of the persistent FA context. The persistent context is the
 // default (it removes the per-layer fd open/close + the 8-16 MB sc/P mmap churn that bites at
@@ -1091,6 +1148,81 @@ static void rocket_fatiming_dump(void) {
         g_fatiming.compute_ms, 100.0 * g_fatiming.compute_ms / tot,
         g_fatiming.scatter_ms, 100.0 * g_fatiming.scatter_ms / tot,
         g_fatiming.calls, g_fatiming.min_kv, g_fatiming.max_kv);
+}
+// FLASH_ATTN_EXT handler output checksum (ROCKET_FA_CHECKSUM=1, off by default). The handler's
+// five host walks answer to ROCKET_FA_THREADS, and the claim that splitting them is bit-identical
+// at every chunk count is an argument about disjoint index ranges rather than a measurement. This
+// makes it a measurement: an FNV-1a over every byte the handler writes to dst, accumulated across
+// every offloaded op and printed at exit, so two runs that differ in nothing but the chunk count
+// can be compared by one number.
+//
+// WHY IT LIVES HERE AND NOT IN A GATE. A wrong split computes a full, correctly sized, entirely
+// plausible surface, and the end-to-end instruments cannot see it: a greedy continuation absorbs
+// a small difference and prints the same text, and llama-perplexity does not reach this handler
+// at all on the shapes measured here. llama-bench does reach it, and llama-bench reports no
+// number that depends on the arithmetic -- so without this knob the one tool that exercises the
+// code has no observable that would notice it breaking.
+//
+// The hash is over the RAW dst bytes, which is what bit-identical means. dst is contiguous by the
+// supports_op gate, so ggml_nbytes covers exactly the surface written. Off by default and read
+// once: one cached env check and a branch, no hashing, on every arm that is being timed.
+//
+// WHAT THIS KNOB CANNOT DECIDE ON ITS OWN. It compares one run against one run, so it gates the
+// chunk count only if the handler is reproducible at a FIXED chunk count -- and on gemma4-12b F16
+// at pp2048 it is not: two runs differing in nothing disagreed twice in seven on one build, same
+// graph, same 288 ops and 2818572288 bytes [HW 2026-09-07, RK1]. Six runs under level 2 were then
+// identical in all 288 op lines, so no op has been named and the rate is not bounded. Until it
+// is, an equality across k measures the split PLUS whatever the handler does on its own. Run the
+// null arm against itself first, the way a paired A/B does for time.
+//
+// ROCKET_FA_CHECKSUM=2 ADDS PER-OP LINES, AND THAT IS WHAT LOCALIZES A MOVING HASH. One
+// aggregate hash says a run differed; it cannot say where, and the two candidates -- one op
+// wrong every time on some shape, or any op wrong occasionally -- look identical from it.
+// Level 2 records a hash per op with the shape beside it, so two runs diff to the op index.
+// Level 1 is unchanged and stays the cheap gate.
+static int rocket_facheck_level(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ROCKET_FA_CHECKSUM"); v = e ? atoi(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+static bool rocket_facheck_on(void) {
+    return rocket_facheck_level() > 0;
+}
+/* 0xcbf29ce484222325 and 0x100000001b3 are FNV-1a's standard 64-bit offset basis and prime,
+ * written in hex because the decimal basis is 20 digits and a dropped one still compiles, still
+ * hashes, and still compares equal across runs -- so the mistake is invisible to every use here
+ * and visible only to someone checking the number with a standard implementation. Which is the
+ * point of using a standard hash: the value is reproducible outside this file. */
+static struct { uint64_t h; long calls; size_t bytes; } g_facheck = { 0xcbf29ce484222325ULL, 0, 0 };
+static int g_facheck_armed = 0;
+// One entry per offloaded op at level 2. The handler runs on the ggml dispatch thread and a
+// graph's ops are computed one at a time, so this needs no lock -- the same assumption the
+// running hash above already makes.
+struct rocket_facheck_op { uint64_t h; int n_tokens, n_head, n_kv; size_t bytes; };
+static std::vector<rocket_facheck_op> g_facheck_ops;
+static void rocket_facheck_dump(void) {
+    if (!g_facheck.calls) return;
+    GGML_LOG_INFO("ROCKET FA checksum: %016llx over %ld ops, %zu bytes\n",
+                  (unsigned long long)g_facheck.h, g_facheck.calls, g_facheck.bytes);
+    for (size_t i = 0; i < g_facheck_ops.size(); i++) {
+        const rocket_facheck_op & o = g_facheck_ops[i];
+        GGML_LOG_INFO("ROCKET FA op %04zu: %016llx n_tokens=%d n_head=%d n_kv=%d bytes=%zu\n",
+                      i, (unsigned long long)o.h, o.n_tokens, o.n_head, o.n_kv, o.bytes);
+    }
+}
+static void rocket_facheck_add(const void * data, size_t nbytes, int n_tokens, int n_head, int n_kv) {
+    if (!g_facheck_armed) { atexit(rocket_facheck_dump); g_facheck_armed = 1; }
+    const unsigned char * p = (const unsigned char *)data;
+    uint64_t h = g_facheck.h;
+    // The per-op hash is over this op's bytes alone, from the standard basis, so it is
+    // comparable across runs on its own; the running hash stays a chain over every op.
+    uint64_t ho = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < nbytes; i++) {
+        h  ^= p[i]; h  *= 0x100000001b3ULL;
+        ho ^= p[i]; ho *= 0x100000001b3ULL;
+    }
+    g_facheck.h = h; g_facheck.calls++; g_facheck.bytes += nbytes;
+    if (rocket_facheck_level() >= 2) g_facheck_ops.push_back({ ho, n_tokens, n_head, n_kv, nbytes });
 }
 static void rocket_fatiming_add(double gather_ms, double compute_ms, double scatter_ms, int n_kv) {
     if (!g_fatiming_armed) { atexit(rocket_fatiming_dump); g_fatiming_armed = 1; }
@@ -1926,6 +2058,50 @@ static struct {
     long calls, cal_calls;
 } g_rk76_fe;
 static int g_rk76_fe_armed = 0;
+
+// The same buckets split by GEMM shape, converged calls only. A per-process total mixes
+// every shape the model offloads, and a term that is O(M*K) (the rotation and quantize) or
+// O(M*N) (the dequantize) has to be read against the shape it runs at: an fp16 route is
+// priced against this route one GEMM shape at a time. One row per (M, Kc, N), a chunk of a
+// split K being its own row.
+//
+// `reuse` counts the calls whose activation is the previous call's (the same src1 tensor
+// and data): q, k and v read one activation and gate and up another, and the handler
+// rotates and quantizes it again on each of them. A reuse count says how much of
+// `quant+rot` is a repeat rather than a necessary pass.
+//
+// `cvt16` is an ARM, not a term this route pays: with ROCKET_RK3576_PROF_CVT16=1 each
+// converged call also narrows its activation to fp16 (rk76_cvt16), the one host pass an
+// fp16 route would make in place of rk76_quant_act, after the dequantize so it cannot warm
+// the activation for the quantize it is compared with. It is timed only into its own
+// column, but it lengthens the arm process's wall.
+struct rk76_shape_row {
+    int M, K, N;
+    long calls, reuse;
+    double quant, entry, dequant, cvt16;
+};
+static rk76_shape_row g_rk76_sh[32];
+static int  g_rk76_nsh = 0;
+static long g_rk76_sh_over = 0;   // converged calls at a shape past the table's end
+static rk76_shape_row * rk76_shape_row_for(int M, int K, int N) {
+    for (int i = 0; i < g_rk76_nsh; i++)
+        if (g_rk76_sh[i].M == M && g_rk76_sh[i].K == K && g_rk76_sh[i].N == N)
+            return &g_rk76_sh[i];
+    if (g_rk76_nsh == (int)(sizeof(g_rk76_sh) / sizeof(g_rk76_sh[0]))) {
+        g_rk76_sh_over++;
+        return nullptr;
+    }
+    rk76_shape_row * r = &g_rk76_sh[g_rk76_nsh++];
+    memset(r, 0, sizeof(*r));
+    r->M = M; r->K = K; r->N = N;
+    return r;
+}
+static bool rk76_prof_cvt16(void) {
+    static int on = -1;
+    if (on < 0) on = rocket_knob_on("ROCKET_RK3576_PROF_CVT16", false);
+    return on != 0;
+}
+
 // ROCKET_LOGI and NOT GGML_LOG_*, for the reason the convert/i8/moe dumps above give: the
 // tool this has to survive is llama-bench, which installs a no-op ggml log callback and
 // swallows everything sent through ggml. ROCKET_LOG_STDERR=1 tees the rocket channel past
@@ -1936,6 +2112,18 @@ static void rk76_fe_dump(void) {
                 "(%ld of them calibration forwards)\n",
                 g_rk76_fe.valloc, g_rk76_fe.quant, g_rk76_fe.cal, g_rk76_fe.entry,
                 g_rk76_fe.dequant, g_rk76_fe.calscan, g_rk76_fe.calls, g_rk76_fe.cal_calls);
+    for (int i = 0; i < g_rk76_nsh; i++) {
+        const rk76_shape_row & r = g_rk76_sh[i];
+        const double c = r.calls > 0 ? (double)r.calls : 1.0;
+        ROCKET_LOGI("ROCKET rk3576 frontend shape M=%d K=%d N=%d, ms per converged call "
+                    "over %ld (%ld reusing the previous call's activation): quant+rot=%.3f "
+                    "entry=%.3f dequant=%.3f cvt16=%.3f\n",
+                    r.M, r.K, r.N, r.calls, r.reuse, r.quant / c, r.entry / c,
+                    r.dequant / c, r.cvt16 / c);
+    }
+    if (g_rk76_sh_over)
+        ROCKET_LOGI("ROCKET rk3576 frontend shape table full: %ld converged calls not split "
+                    "by shape\n", g_rk76_sh_over);
 }
 static double rk76_now_ms(void) {
     struct timespec ts;
@@ -1948,6 +2136,34 @@ static double rk76_now_ms(void) {
 #define RK76_FE_ADD(f, t0) do { if (fe_prof) {                                   \
         if (!g_rk76_fe_armed) { atexit(rk76_fe_dump); g_rk76_fe_armed = 1; }     \
         g_rk76_fe.f += rk76_now_ms() - (t0); } } while (0)
+// The same, also charged to the call's shape row `sh` when there is one.
+#define RK76_FE_ADDS(f, t0, sh) do { if (fe_prof) {                              \
+        const double d_ = rk76_now_ms() - (t0);                                  \
+        if (!g_rk76_fe_armed) { atexit(rk76_fe_dump); g_rk76_fe_armed = 1; }     \
+        g_rk76_fe.f += d_;                                                       \
+        if (sh) (sh)->f += d_; } } while (0)
+
+// The one host pass an fp16 route would make in place of rk76_quant_act: the activation
+// narrowed to fp16, eight lanes at a time. FCVTN is base AArch64, so this needs none of
+// the fp16-arithmetic extension the RK3576's A72s lack, and it is the conversion such a
+// route would ship rather than the scalar fallback the RK3588 kernels take on this part.
+// `stride` is the source row pitch in floats, as for rk76_quant_act.
+static void rk76_cvt16(const float * src, ggml_fp16_t * dst, int64_t M, int64_t K,
+                       int64_t stride) {
+    for (int64_t m = 0; m < M; m++) {
+        const float * r = src + m * stride;
+        ggml_fp16_t * d = dst + m * K;
+        int64_t k = 0;
+#if defined(ROCKET_NEON_F32) && defined(__aarch64__)
+        for (; k + 8 <= K; k += 8) {
+            const float16x8_t v = vcvt_high_f16_f32(vcvt_f16_f32(vld1q_f32(r + k)),
+                                                    vld1q_f32(r + k + 4));
+            vst1q_u16((uint16_t *)(d + k), vreinterpretq_u16_f16(v));
+        }
+#endif
+        for (; k < K; k++) d[k] = ggml_fp32_to_fp16(r[k]);
+    }
+}
 
 // Which rotation this K takes. The two exact constructions where they exist, the
 // block-diagonal fallback otherwise — and the fallback is what carries a K like Qwen's
@@ -2515,17 +2731,30 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         sc2.resize((size_t)N);
     }
 
+    // Whether this call's activation is the previous call's, for the shape rows' `reuse`.
+    // The handler runs on one thread, so the last call's identity needs no lock.
+    bool same_act = false;
+    if (fe_prof) {
+        static const void * last_t = nullptr;
+        static const void * last_d = nullptr;
+        static int          last_M = -1;
+        same_act = (src1 == last_t && src1->data == last_d && M == last_M);
+        last_t = src1; last_d = src1->data; last_M = M;
+    }
+
     // ---- one whole W8A8 GEMM per chunk, summed on the host. For an unsplit K this loop
     // runs once and is the path that shipped.
     for (size_t c = 0; c < w.ch.size(); c++) {
         rocket_rk3576_chunk & q = w.ch[c];
+        rk76_shape_row * sh = (fe_prof && !calibrating) ? rk76_shape_row_for(M, q.Kc, N)
+                                                        : nullptr;
 
         // activations: chunk c's columns, rotated and quantized, every call
         fet0 = RK76_FE_T0();
         if (rk76_quant_act((const float *)src1->data + q.K0, qA, M, q.Kc,
                            a_scale, rot, K, arow) < 0)
             return -1;
-        RK76_FE_ADD(quant, fet0);
+        RK76_FE_ADDS(quant, fet0, sh);
 
         if (calibrating) {
             // ---- calibration forward: two device passes to estimate this window's
@@ -2612,12 +2841,23 @@ static int ggml_backend_rocket_mul_mat_rk3576(
                                                 C8, &werr);
         if (mmrc != 0)
             return -1;
-        RK76_FE_ADD(entry, fet0);
+        RK76_FE_ADDS(entry, fet0, sh);
         fet0 = RK76_FE_T0();
         rk76_dequant(C8, (float *)dst->data, M, N, a_scale,
                      q.b_scale.data(), q.scale_n.data(), &w.sat_elems, c != 0, arow, dqf);
-        RK76_FE_ADD(dequant, fet0);
+        RK76_FE_ADDS(dequant, fet0, sh);
         w.tot_elems += (uint64_t)M * N;
+        if (sh) {
+            sh->calls++;
+            if (same_act) sh->reuse++;
+            if (rk76_prof_cvt16()) {
+                static std::vector<ggml_fp16_t> h16;
+                ggml_fp16_t * h = rk_scratch(h16, (size_t)M * q.Kc);
+                const double t = rk76_now_ms();
+                rk76_cvt16((const float *)src1->data + q.K0, h, M, q.Kc, K);
+                sh->cvt16 += rk76_now_ms() - t;
+            }
+        }
     }
 
     if (calibrating) {
@@ -3889,7 +4129,9 @@ static int ggml_backend_rocket_mul_mat_prepacked(
 // Per-op diagnostics, run after the NPU has produced dst (so every NPU/driver
 // side effect has already happened). Order matters: trace + verify must read the
 // NPU result BEFORE CPU_FORWARD overwrites it with the reference.
-static void rocket_mul_mat_post(ggml_tensor * dst, const char * path) {
+static void rocket_mul_mat_post(ggml_backend_rocket_context * ctx, ggml_tensor * dst,
+                                const char * path) {
+    ctx->route_ops[path]++;
 #ifdef ROCKET_DIAGNOSTICS
     if (rocket_trace_on())       rocket_trace(dst, path);
     if (rocket_verify_on())      rocket_verify(dst);
@@ -3908,16 +4150,27 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     const int64_t M  = src1->ne[1];
 
     // One-time hint: quantized weights run the per-microbatch dequant path, so a
-    // small micro-batch makes the dequant dominate. If we're offloading a quantized
-    // prefill below a full 2048 ubatch, nudge the user to raise it (~2x prefill).
+    // small micro-batch pays the dequant more often. RESIDENCY LEADS, and unstacked:
+    // on seven of seven models measured both ways (2.2-11.9 B, three rotated passes
+    // each) ROCKET_QUANT_RESIDENT=auto at the DEFAULT -ub reads 1.35-1.75x, against
+    // 1.00-1.66x for the same flag stacked on -b 2048 -ub 2048. There is no size above
+    // which stacking wins, and PARTIAL residency does not break the rule either: on the
+    // one model that places only part of its weights the unstacked form also buys 9-13
+    // points more residency, because -b 2048 -ub 2048 spends that RAM on compute buffers
+    // before the reserve floor stops placement. So -ub 2048 is named second and as the
+    // fallback for a model whose fp16 image does not fit at all. Its own lever is
+    // 0.91-1.53x over eleven models and negative on two, so the hint promises no ratio.
     if (ggml_is_quantized(src0->type) && M < 2048) {
         static bool ub_hinted = false;
         if (!ub_hinted) {
             ub_hinted = true;
             // Emitted on the rocket_log channel (not GGML_LOG_*) so ROCKET_LOG_STDERR
             // can surface it even when the host silences ggml (e.g. llama-bench).
-            ROCKET_LOGI("[rocket] quantized prefill is dequant-bound at this micro-batch; "
-                        "run with -b 2048 -ub 2048 for ~2x (the default -ub 512 ~halves it)\n");
+            ROCKET_LOGI("[rocket] quantized prefill re-dequantizes per micro-batch at this "
+                        "-ub. ROCKET_QUANT_RESIDENT=auto removes it outright if the fp16 "
+                        "image fits RAM -- set it at this -ub, do NOT stack -ub 2048 on it. "
+                        "If it does not fit, -b 2048 -ub 2048 amortizes the dequant instead "
+                        "(model-dependent, a loss on some small models)\n");
         }
     }
 
@@ -3934,7 +4187,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
         && src0->ne[2] == 1 && src0->ne[3] == 1
         && src1->ne[2] == 1 && src1->ne[3] == 1) {
         if (ggml_backend_rocket_mul_mat_bf16(ctx, dst, (int)M, (int)K, (int)N) == 0) {
-            rocket_mul_mat_post(dst, "bf16");
+            rocket_mul_mat_post(ctx, dst, "bf16");
             return;
         }
         // Declined (device open failed / unsupported shape): fall through to the fp16
@@ -3975,7 +4228,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
                 ? ggml_backend_rocket_mul_mat_int8_resident(ctx, dst, (int)M, (int)K, (int)N)
                 : ggml_backend_rocket_mul_mat_int8(ctx, dst, (int)M, (int)K, (int)N));
         if (r8 == 0) {
-            rocket_mul_mat_post(dst, rocket_rk3576_selected() ? "i8-76"
+            rocket_mul_mat_post(ctx, dst, rocket_rk3576_selected() ? "i8-76"
                                      : (ctx->int8_resident ? "int8r" : "int8"));
             return;
         }
@@ -3998,11 +4251,11 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
         // fall through to the one-shot int4 path.
         if (ctx->int4_resident
             && ggml_backend_rocket_mul_mat_int4_resident(ctx, dst, (int)M, (int)K, (int)N) == 0) {
-            rocket_mul_mat_post(dst, "int4r");
+            rocket_mul_mat_post(ctx, dst, "int4r");
             return;
         }
         if (ggml_backend_rocket_mul_mat_int4(ctx, dst, (int)M, (int)K, (int)N) == 0) {
-            rocket_mul_mat_post(dst, "int4");
+            rocket_mul_mat_post(ctx, dst, "int4");
             return;
         }
     }
@@ -4021,7 +4274,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
         && src0->ne[2] == 1 && src0->ne[3] == 1
         && src1->ne[2] == 1 && src1->ne[3] == 1
         && ggml_backend_rocket_mul_mat_prepacked(ctx, dst, (int)M, (int)K, (int)N) == 0) {
-        rocket_mul_mat_post(dst, "prepacked-q");
+        rocket_mul_mat_post(ctx, dst, "prepacked-q");
         return;
     }
 
@@ -4062,7 +4315,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
         && src1->ne[2] == 1 && src1->ne[3] == 1;
     if (cacheable &&
         ggml_backend_rocket_mul_mat_prepacked(ctx, dst, (int)M, (int)K, (int)N) == 0) {
-        rocket_mul_mat_post(dst, "prepacked");
+        rocket_mul_mat_post(ctx, dst, "prepacked");
         return;
     }
 
@@ -4082,8 +4335,10 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     float       * scales = rk_scratch(ctx->scratch_scales, (size_t)M);   // per-row activation scale
     ggml_fp16_t * C16    = rk_scratch(ctx->scratch_C16, (size_t)Mp * N);
     const bool b_is_f16 = (src0->type == GGML_TYPE_F16);
-    ggml_fp16_t * B16 = nullptr;             // used when weights are F32 / BF16 / quantized
-    if (!b_is_f16) B16 = rk_scratch(ctx->scratch_B16, (size_t)N * K);
+    ggml_fp16_t * B16 = nullptr;             // used when weights are F32 / BF16 / quantized;
+                                             // allocated at the point of use below, so a run
+                                             // whose weights are all dequant-cached never
+                                             // grows the [N,K] scratch at all
 
     for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
@@ -4106,19 +4361,57 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
             if (b_is_f16) {
                 Bp = (const ggml_fp16_t *)B_src;
             } else {
-                // Time the streaming dequant into its own ROCKET_MM_PROFILE bucket (see
-                // rocket_convprof_add_dequant): it is the dominant host cost here and is
-                // invisible to every other profiler.
-                const bool wprof = rocket_convprof_on();
-                const double wt0 = wprof ? rocket_now_ms() : 0.0;
-                const bool ok = rocket_weight_to_fp16(B_src, src0->type, N, K, B16);
-                if (wprof) rocket_convprof_add_dequant(rocket_now_ms() - wt0, (double)N * K);
-                if (ok) {
-                    Bp = B16;
+                // Held dequantized form if this weight is cached (ROCKET_DEQUANT_CACHE_MB, the
+                // -ub mechanism control): the dequant then runs once per weight instead of per
+                // micro-batch, and everything downstream -- pack, submit, placement -- is the
+                // unchanged streaming path. Batched weights (ne02/ne03 > 1) never cache: the
+                // key is the tensor NAME and one name spans every slice. Otherwise dequant
+                // transiently into the reused scratch, timed into its own ROCKET_MM_PROFILE
+                // bucket (see rocket_convprof_add_dequant): it is the dominant host cost here
+                // and is invisible to every other profiler.
+                const bool dq_op_ok = ctx->dq_cache_budget
+                    && ne02 == 1 && ne03 == 1 && src0->op == GGML_OP_NONE;
+                const std::string dqkey = dq_op_ok ? rocket_weight_key(src0) : std::string();
+                auto dqit = dqkey.empty() ? ctx->dq_wcache.end() : ctx->dq_wcache.find(dqkey);
+                if (dqit != ctx->dq_wcache.end() && dqit->second.N == N && dqit->second.K == K) {
+                    ctx->dq_hit_calls++;
+                    Bp = dqit->second.B16.data();
                 } else {
-                    rocket_cpu_matmul_slice((const float *)A_src, (const void *)B_src,
-                                            src0->type, (float *)C_dst, M, N, K);
-                    continue;
+                    const bool wprof = rocket_convprof_on();
+                    const double wt0 = wprof ? rocket_now_ms() : 0.0;
+                    const size_t est = (size_t)N * K * sizeof(ggml_fp16_t);
+                    const bool admit = !dqkey.empty()
+                        && ctx->dq_resident_bytes + est <= ctx->dq_cache_budget;
+                    ggml_fp16_t * Bdst;
+                    if (admit) {
+                        // Present-at-a-stale-shape: uncharge and drop before re-filling.
+                        rk_cache_evict(ctx->dq_wcache, dqit, ctx->dq_resident_bytes,
+                                       [](rocket_dq_weight &){});
+                        rocket_dq_weight e;
+                        e.B16.resize((size_t)N * K); e.N = (int)N; e.K = (int)K; e.bytes = est;
+                        auto & slot = (ctx->dq_wcache[dqkey] = std::move(e));
+                        ctx->dq_resident_bytes += est;
+                        ctx->dq_fill_calls++;
+                        Bdst = slot.B16.data();
+                    } else {
+                        if (ctx->dq_cache_budget) ctx->dq_stream_calls++;
+                        B16 = rk_scratch(ctx->scratch_B16, (size_t)N * K);
+                        Bdst = B16;
+                    }
+                    const bool ok = rocket_weight_to_fp16(B_src, src0->type, N, K, Bdst);
+                    if (wprof) rocket_convprof_add_dequant(rocket_now_ms() - wt0, (double)N * K);
+                    if (ok) {
+                        Bp = Bdst;
+                    } else {
+                        // Defensive path (supports_op gates the decodable types): drop the
+                        // half-written cache entry so a later call cannot serve it.
+                        if (admit) rk_cache_evict(ctx->dq_wcache, ctx->dq_wcache.find(dqkey),
+                                                  ctx->dq_resident_bytes, [](rocket_dq_weight &){});
+                        ctx->n_cpu_fallbacks++;
+                        rocket_cpu_matmul_slice((const float *)A_src, (const void *)B_src,
+                                                src0->type, (float *)C_dst, M, N, K);
+                        continue;
+                    }
                 }
             }
 
@@ -4154,6 +4447,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
                 GGML_LOG_ERROR("%s: rocket_matmul_fp16_mt failed (%d) for M=%lld K=%lld N=%lld"
                                " -> CPU fallback for this slice\n",
                                __func__, rc, (long long)M, (long long)K, (long long)N);
+                ctx->n_cpu_fallbacks++;
                 rocket_cpu_matmul_slice((const float *)A_src, (const void *)B_src,
                                         src0->type, (float *)C_dst, M, N, K);
                 continue;
@@ -4163,7 +4457,7 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
             rocket_unpack_output(C16, (float *)C_dst, M, N, scales);
         }
     }
-    rocket_mul_mat_post(dst, "mt");
+    rocket_mul_mat_post(ctx, dst, "mt");
 }
 
 // ---------------------------------------------------------------------------
@@ -4308,7 +4602,7 @@ static int ggml_backend_rocket_mul_mat_group(ggml_backend_rocket_context * ctx,
         rocket_unpack_output_seg(C16, Ntot, col0,
                                  (float *)nodes[i]->data, M, Ns[i], scales);
         col0 += Ns[i];
-        rocket_mul_mat_post(nodes[i], "fused");
+        rocket_mul_mat_post(ctx, nodes[i], "fused");
     }
     return 0;
 }
@@ -4447,7 +4741,7 @@ static int ggml_backend_rocket_mul_mat_group_resident(
         rocket_unpack_output_seg(C16, Ntot, col0,
                                  (float *)nodes[i]->data, M, Ni, scales);
         col0 += Ni;
-        rocket_mul_mat_post(nodes[i], "fused-resident");
+        rocket_mul_mat_post(ctx, nodes[i], "fused-resident");
     }
     return 0;
 }
@@ -4581,6 +4875,22 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
             ROCKET_LOGI("[f16-resident] %ld offloaded calls had no stable weight name and could "
                         "not be resident under any budget\n", ctx->f16_nokey_calls);
     }
+    // The dequant-cache outcome (ROCKET_DEQUANT_CACHE_MB), on the same teardown path as the
+    // residency splits above and for the same reason: an arm whose cache never engaged
+    // produces the same rows and the same t/s as one it fully served, and only this line
+    // tells them apart. "Skipped" counts the per-micro-batch dequants the control removed;
+    // a nonzero still-streaming count means some calls re-dequanted every micro-batch (over
+    // budget, or no stable weight name) and the arm did NOT isolate the dequant term.
+    if (ctx->dq_cache_budget) {
+        ROCKET_LOGI("[dq-cache] %zu weights held (%zuMB): %ld dequants skipped, %ld one-time "
+                    "fills, %ld still-streaming calls\n",
+                    ctx->dq_wcache.size(), ctx->dq_resident_bytes >> 20,
+                    ctx->dq_hit_calls, ctx->dq_fill_calls, ctx->dq_stream_calls);
+        if (ctx->dq_stream_calls)
+            ROCKET_LOGW("[dq-cache] %ld calls re-dequanted per micro-batch -- this run does NOT "
+                        "isolate the dequant term; raise ROCKET_DEQUANT_CACHE_MB\n",
+                        ctx->dq_stream_calls);
+    }
     if (ctx->i8_dev) {   // resident int8 weights hold BOs on the ctx fds -> free first
         for (auto & kv : ctx->i8_rwcache)   rocket_i8_weights_free(ctx->i8_dev, kv.second.w);
         for (auto & kv : ctx->moe_i8_cache) rocket_i8_weights_free(ctx->i8_dev, kv.second.w);
@@ -4599,6 +4909,42 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
     }
     delete ctx;
     delete backend;
+}
+
+// ---------------------------------------------------------------------------
+// The FA handler's host walks, and how they are split.
+//
+// The gather and scatter around the on-NPU attention are not backend glue that overlaps
+// the device: the handler runs on the dispatch thread while the ggml scheduler waits, so
+// every millisecond in them is a millisecond of prefill wall. rk_fa_walk is the one place
+// that decides whether a walk runs inline or fans out, so all five walks answer to a
+// single knob and the default stays the loop that shipped.
+//
+// The fan-out borrows the process-wide dequant pool rather than creating a second one.
+// The two never overlap -- a graph's ops are computed one at a time on the calling thread,
+// so a dequant fan-out has returned before an attention op starts -- and pool.run() is
+// serialized anyway, so a caller that did overlap would take turns rather than
+// oversubscribe. The pool's workers are already pinned to the big cluster, which is where
+// this work has to land.
+static int rocket_fa_walk_chunks(void) {
+    const int want = rocket_fa_threads();
+    if (want <= 1) return 1;
+    const int have = rocket_get_dequant_pool().size();
+    return want < have ? want : have;
+}
+
+// Run job over [0,n) as nc contiguous chunks. nc == 1 runs it inline on the calling
+// thread, which is the serial walk with no pool touched and no thread state read.
+template <typename F>
+static inline void rk_fa_walk(int nc, int64_t n, F && job) {
+    if (nc <= 1 || n <= 0) { job(0, n); return; }
+    const int64_t per = (n + nc - 1) / nc;
+    rocket_get_dequant_pool().run([&](int i) {
+        const int64_t lo = (int64_t)i * per;
+        if (lo >= n) return;                    // pool wider than nc, or n < nc
+        const int64_t hi = lo + per > n ? n : lo + per;
+        job(lo, hi);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -4634,7 +4980,7 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     memcpy(&max_bias, (const float *)dst->op_params + 1, sizeof(float));
     memcpy(&softcap,  (const float *)dst->op_params + 2, sizeof(float));
     if (max_bias != 0.0f) return -1;            // ALiBi unsupported (rope models pass 0)
-    if (!m) return -1;                          // require an explicit mask (the causal path)
+    // m == NULL is an unmasked (encoder) attention; the driver takes a NULL mask as such.
 
     // Lazily create the persistent FA context (worker fds + resident scratch); if it can't
     // open its fds, fall through to the lazy single fa_fd (and, failing that, the host
@@ -4662,41 +5008,57 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     ggml_fp16_t * Qd = rk_scratch(ctx->fa_Qd, (size_t)n_head     * n_tokens * head_dim); // [n_head][n_tokens][dk]
     ggml_fp16_t * Kd = rk_scratch(ctx->fa_Kd, (size_t)n_kv_heads * n_kv     * head_dim); // [n_kv_heads][n_kv][dk]
     ggml_fp16_t * Vd = rk_scratch(ctx->fa_Vd, (size_t)n_kv_heads * dv       * n_kv);     // [n_kv_heads][dv][n_kv]
-    ggml_fp16_t * Md = rk_scratch(ctx->fa_Md, (size_t)n_tokens   * n_kv);
+    ggml_fp16_t * Md = m ? rk_scratch(ctx->fa_Md, (size_t)n_tokens * n_kv) : NULL;       // NULL = unmasked
     ggml_fp16_t * Od = rk_scratch(ctx->fa_Od, (size_t)n_head     * n_tokens * dv);       // [n_head][n_tokens][dv]
 
+    // Each walk below is written as a closure over a contiguous range of its OWN outer
+    // index, and rk_fa_walk runs that range either inline (nc == 1, the default, which is
+    // the loop that shipped) or as nc disjoint chunks on the shared host pool. Splitting on
+    // the outer index is what makes the chunks independent: every chunk writes a disjoint
+    // slice of the dense destination tile and reads nothing another chunk writes, so the
+    // result is bit-identical to the serial walk at any nc.
+    const int fa_nc = rocket_fa_walk_chunks();
+
     const char * qb = (const char *)q->data;
-    for (int h = 0; h < n_head; h++)
-        for (int t = 0; t < n_tokens; t++) {
-            ggml_fp16_t * dstrow = Qd + ((size_t)h * n_tokens + t) * head_dim;
+    rk_fa_walk(fa_nc, (int64_t)n_head * n_tokens, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; r++) {
+            const int h = (int)(r / n_tokens), t = (int)(r % n_tokens);
+            ggml_fp16_t * dstrow = Qd + (size_t)r * head_dim;
             const char * src = qb + (size_t)t*q->nb[1] + (size_t)h*q->nb[2];
             for (int c = 0; c < head_dim; c++)   // Q is F32
                 dstrow[c] = ggml_fp32_to_fp16(*(const float *)(src + (size_t)c*q->nb[0]));
         }
+    });
     // K: [n_kv_heads][n_kv][head_dim]. In the normal KV-cache view a row IS contiguous
     // (nb[0] == 2), so the walk is a memcpy; the strided loop stays as the general case,
     // because the cache view is a promise about llama.cpp's graph and not about the op.
     const char * kb = (const char *)k->data;
     const bool k_row_contig = (k->nb[0] == sizeof(ggml_fp16_t));
-    for (int hk = 0; hk < n_kv_heads; hk++)
-        for (int j = 0; j < n_kv; j++) {
-            ggml_fp16_t * dstrow = Kd + ((size_t)hk * n_kv + j) * head_dim;
+    rk_fa_walk(fa_nc, (int64_t)n_kv_heads * n_kv, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; r++) {
+            const int hk = (int)(r / n_kv), j = (int)(r % n_kv);
+            ggml_fp16_t * dstrow = Kd + (size_t)r * head_dim;
             const char * src = kb + (size_t)j*k->nb[1] + (size_t)hk*k->nb[2];
             if (k_row_contig) { memcpy(dstrow, src, (size_t)head_dim * sizeof(ggml_fp16_t)); continue; }
             for (int c = 0; c < head_dim; c++)
                 dstrow[c] = *(const ggml_fp16_t *)(src + (size_t)c*k->nb[0]);
         }
+    });
     // V: [n_kv_heads][dv][n_kv] -- a genuine TRANSPOSE of the cache layout, so there is no
     // contiguous run to copy either way. Walk it in cache-friendly blocks instead: reading
     // BLK source rows at a time keeps the destination writes inside one set of cache lines
-    // per column block rather than touching dv distinct lines per element.
+    // per column block rather than touching dv distinct lines per element. The chunk unit
+    // is that block, not a row, so the blocking survives the split.
     const char * vb = (const char *)v->data;
     const int VBLK = 32;
-    for (int hk = 0; hk < n_kv_heads; hk++) {
-        const char  * vh = vb + (size_t)hk*v->nb[2];
-        ggml_fp16_t * vd = Vd + (size_t)hk * dv * n_kv;
-        for (int j0 = 0; j0 < n_kv; j0 += VBLK) {
+    const int64_t v_nblk_per_head = (n_kv + VBLK - 1) / VBLK;
+    rk_fa_walk(fa_nc, (int64_t)n_kv_heads * v_nblk_per_head, [&](int64_t b0, int64_t b1) {
+        for (int64_t b = b0; b < b1; b++) {
+            const int hk = (int)(b / v_nblk_per_head);
+            const int j0 = (int)(b % v_nblk_per_head) * VBLK;
             const int j1 = (j0 + VBLK < n_kv) ? j0 + VBLK : n_kv;
+            const char  * vh = vb + (size_t)hk*v->nb[2];
+            ggml_fp16_t * vd = Vd + (size_t)hk * dv * n_kv;
             for (int c = 0; c < dv; c++) {
                 ggml_fp16_t * dstrow = vd + (size_t)c * n_kv;
                 const char  * src    = vh + (size_t)c*v->nb[0];
@@ -4704,20 +5066,24 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
                     dstrow[j] = *(const ggml_fp16_t *)(src + (size_t)j*v->nb[1]);
             }
         }
-    }
+    });
     // mask: [n_kv, n_tokens] -> [n_tokens][n_kv]. supports_op requires ggml_is_contiguous(m),
     // so nb[0] is 2 for every op the scheduler places here and the whole row is one memcpy.
     // The strided walk stays as the general case rather than becoming an assert: this
     // handler is reachable directly, and degrading to a slower correct copy beats aborting
     // the host process over a shape the gate would have refused.
-    const char * mb = (const char *)m->data;
-    const bool m_row_contig = (m->nb[0] == sizeof(ggml_fp16_t));
-    for (int t = 0; t < n_tokens; t++) {
-        ggml_fp16_t * dstrow = Md + (size_t)t * n_kv;
-        const char * src = mb + (size_t)t*m->nb[1];
-        if (m_row_contig) { memcpy(dstrow, src, (size_t)n_kv * sizeof(ggml_fp16_t)); continue; }
-        for (int j = 0; j < n_kv; j++)
-            dstrow[j] = *(const ggml_fp16_t *)(src + (size_t)j*m->nb[0]);
+    if (m) {
+        const char * mb = (const char *)m->data;
+        const bool m_row_contig = (m->nb[0] == sizeof(ggml_fp16_t));
+        rk_fa_walk(fa_nc, (int64_t)n_tokens, [&](int64_t t0, int64_t t1) {
+            for (int64_t t = t0; t < t1; t++) {
+                ggml_fp16_t * dstrow = Md + (size_t)t * n_kv;
+                const char * src = mb + (size_t)t*m->nb[1];
+                if (m_row_contig) { memcpy(dstrow, src, (size_t)n_kv * sizeof(ggml_fp16_t)); continue; }
+                for (int j = 0; j < n_kv; j++)
+                    dstrow[j] = *(const ggml_fp16_t *)(src + (size_t)j*m->nb[0]);
+            }
+        });
     }
     const double t_g1 = fatiming ? rocket_now_ms() : 0.0;
 
@@ -4763,16 +5129,22 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     // bucket rather than to the scatter it precedes.
     const double t_c1 = fatiming ? rocket_now_ms() : 0.0;
 
-    // scatter Od [n_head][n_tokens][dv] -> dst F32 [dv, n_head, n_tokens]
+    // scatter Od [n_head][n_tokens][dv] -> dst F32 [dv, n_head, n_tokens]. Chunked on the
+    // token index, so a chunk owns whole dst rows across every head.
     char * db = (char *)dst->data;
-    for (int t = 0; t < n_tokens; t++)
-        for (int h = 0; h < n_head; h++) {
-            const ggml_fp16_t * srcrow = Od + ((size_t)h * n_tokens + t) * dv;
-            char * dr = db + (size_t)h*dst->nb[1] + (size_t)t*dst->nb[2];
-            for (int c = 0; c < dv; c++)
-                *(float *)(dr + (size_t)c*dst->nb[0]) = ggml_fp16_to_fp32(srcrow[c]);
-        }
+    rk_fa_walk(fa_nc, (int64_t)n_tokens, [&](int64_t t0, int64_t t1) {
+        for (int64_t t = t0; t < t1; t++)
+            for (int h = 0; h < n_head; h++) {
+                const ggml_fp16_t * srcrow = Od + ((size_t)h * n_tokens + (size_t)t) * dv;
+                char * dr = db + (size_t)h*dst->nb[1] + (size_t)t*dst->nb[2];
+                for (int c = 0; c < dv; c++)
+                    *(float *)(dr + (size_t)c*dst->nb[0]) = ggml_fp16_to_fp32(srcrow[c]);
+            }
+    });
     if (fatiming) rocket_fatiming_add(t_g1 - t_g0, t_c1 - t_g1, rocket_now_ms() - t_c1, n_kv);
+    // After the timing add, so hashing the surface is never charged to the scatter bucket it
+    // would otherwise inflate.
+    if (rocket_facheck_on()) rocket_facheck_add(dst->data, ggml_nbytes(dst), n_tokens, n_head, n_kv);
     return 0;
 }
 
@@ -5208,6 +5580,10 @@ struct rk_moe_preflight {
     size_t iova      = 0;       // bytes; aggregate resident-code ceiling across the fds
     size_t ram_used  = 0;
     size_t iova_used = 0;
+    size_t src_used  = 0;       // ROCKET_MOE_CHARGE_ALL_SOURCE: the whole mmapped weight
+                                // buffer, charged once, whether or not a stack is placed
+    bool   all_src   = false;   // resolved with the budgets
+    std::unordered_set<const void *> src_bufs;   // weight buffers already charged
     int    n_workers = 0;       // published by the backend at init / set_n_threads
     int    live      = 0;       // live rocket backends; the ledger clears when this hits 0
     bool   announced = false;   // the "budget reached" line is printed once
@@ -5215,12 +5591,50 @@ struct rk_moe_preflight {
 };
 static rk_moe_preflight g_moe_pf;
 
+// ROCKET_MOE_CHARGE_ALL_SOURCE: the corrected admission charge, OPT-IN, default off.
+//
+// The default charge below is per PLACED stack: int8 codes + scales + that stack's GGUF
+// source bytes. A stack this pre-flight DECLINES is charged nothing at all -- and its
+// experts are still read from the same mmap by the CPU path every micro-batch, so their
+// source is just as unreclaimable as a placed stack's. The budget therefore says there is
+// room after the true hot set has already crossed RAM, and the route places past the point
+// where placing more pays. Setting this knob to 1 charges the whole mmapped weight buffer
+// once, up front, and leaves only the codes and scales in the per-stack charge.
+//
+// WHY IT IS NOT THE DEFAULT. What the defect costs is not measurable on this board. The
+// evidence for it is a ladder on ONE model, Qwen3-30B-A3B, where the 18000-21000 MB plateau
+// (58-67 stacks, n=7) reads 1.046x against auto's 79 stacks (n=3) at 1.014x. That 3.2% gap
+// is inside the 8-13% per-process spread this board shows at those rung depths, and the
+// re-take that would settle it needs 27 rotated passes for 3 sigma (18.4 h) -- so it keeps
+// exactly the support the original ladder gave it and can gain none [a prediction
+// registered 2026-08-28, scored "unresolved -- bound fired"].
+//
+// AND THE CORRECTION MOVES BOTH MODEL CLASSES, IN OPPOSITE DIRECTIONS. On an
+// expert-dominated model (Qwen3-30B-A3B: 29 of 30.5 B in the experts) the correction lands
+// near 46 stacks, below the measured plateau and on its conservative side. On gpt-oss-20b it
+// lands near 58 of the 63 that auto places [expected -- derived from the published 1.521
+// charge factor, not measured] -- and that model's own measured ladder runs the other way:
+// 66 stacks reads +4.3%/+5.1% and 71 reads +8.3%/+14.1% over the 63 auto takes, monotone,
+// with no degradation. So making this the default would trade an unconfirmable gain on one
+// architecture for an unconfirmable loss on another, decided by which model happened to be
+// on the board. It ships as a knob until a model that actually reaches the scarcity regime
+// can measure it. Inducing that regime with ballast does NOT work and must not be retried:
+// the budget is MemAvailable minus the reserve, so the ballast is subtracted from the budget
+// before it can be over-committed [HW sweep 2026-08-28, five rungs, no turn at any].
+//
+// Scope: the PRE-FLIGHT only, which is what decides whether an op is claimed and therefore
+// how many stacks are placed. The runtime admission in rocket_moe_expert_resident is
+// unchanged, because it is only consulted for a stack the pre-flight did not reserve --
+// which under the default route means a stack whose op was never claimed, and under
+// ROCKET_MOE=1 means forced mode, where reserving nothing is the documented behaviour.
+
 // Reserve one expert stack. True iff the WHOLE stack fits both budgets, in which case it is
 // charged. The answer is memoized per stack name because supports_op is asked again for
 // every micro-batch, and an answer that drifted would move one op between backends between
 // two prefills -- re-ingesting the stack it had already placed.
 static bool rk_moe_preflight_admit(const std::string & key, int64_t K, int64_t N,
-                                   int64_t n_expert, int group, size_t src_bytes) {
+                                   int64_t n_expert, int group, size_t src_bytes,
+                                   const void * src_buf, size_t src_buf_bytes) {
     // No stable name -> the resident cache has no key to hold this weight under and the
     // runtime would stream it. Decline rather than admit something we cannot reserve.
     if (key.empty() || n_expert <= 0 || group <= 0 || K <= 0 || N <= 0) return false;
@@ -5237,10 +5651,12 @@ static bool rk_moe_preflight_admit(const std::string & key, int64_t K, int64_t N
         if (nw > 8) nw = 8;
         const size_t per_fd = RK_MOE_IOVA_PER_FD - RK_MOE_IOVA_SLACK;
         g_moe_pf.iova   = (size_t)nw * per_fd;
+        g_moe_pf.all_src = rocket_knob_int("ROCKET_MOE_CHARGE_ALL_SOURCE", 0) != 0;
         g_moe_pf.frozen = true;
         ROCKET_LOGI("[moe-int8] residency pre-flight: %zuMB RAM budget, %zuMB NPU IOVA "
-                    "across %d worker fds\n",
-                    g_moe_pf.ram >> 20, g_moe_pf.iova >> 20, nw);
+                    "across %d worker fds%s\n",
+                    g_moe_pf.ram >> 20, g_moe_pf.iova >> 20, nw,
+                    g_moe_pf.all_src ? ", charging every stack's GGUF source" : "");
     }
 
     // The SAME per-expert charge the runtime admission uses (rocket_moe_expert_resident),
@@ -5250,24 +5666,48 @@ static bool rk_moe_preflight_admit(const std::string & key, int64_t K, int64_t N
     // here, MoE decode reads the active experts from it on the CPU every token.
     const size_t codes     = (size_t)N * (size_t)K;
     const size_t scales    = (size_t)N * (size_t)(K / group) * sizeof(float);
-    const size_t ram_need  = (size_t)n_expert * (codes + scales + src_bytes);
     const size_t iova_need = (size_t)n_expert * codes;
 
-    const bool fits_ram  = !g_moe_pf.ram || g_moe_pf.ram_used + ram_need <= g_moe_pf.ram;
+    // The two halves of the charge are tracked separately so the log reads the same either
+    // way: ram_used is codes and scales, src_used is mmapped GGUF weights. What the knob
+    // changes is WHAT the source half counts. Under the default it is this stack's own
+    // source, charged only if this stack is admitted, so a declined stack's source is
+    // charged to nobody. Under the knob it is the whole weight BUFFER this stack came from,
+    // charged once on first sight and before any fit is tested.
+    //
+    // Per-stack source cannot be the fix, and the arithmetic says why: with uniform stacks
+    // the k-th admission costs `k * (codes + scales + src)` either way, so moving the same
+    // per-stack quantity earlier changes nothing at all. What the default misses is the
+    // source of the stacks it never places, and the only quantity at this seam that covers
+    // those is the buffer holding them.
+    const size_t src_need   = (size_t)n_expert * src_bytes;
+    const size_t codes_need = (size_t)n_expert * (codes + scales);
+    if (g_moe_pf.all_src && src_buf && src_buf_bytes
+        && g_moe_pf.src_bufs.insert(src_buf).second) {
+        g_moe_pf.src_used += src_buf_bytes;
+    }
+
+    const size_t ram_need = codes_need + (g_moe_pf.all_src ? 0 : src_need);
+    const bool fits_ram  = !g_moe_pf.ram
+                         || g_moe_pf.ram_used + g_moe_pf.src_used + ram_need <= g_moe_pf.ram;
     const bool fits_iova = g_moe_pf.iova_used + iova_need <= g_moe_pf.iova;
     const bool ok        = fits_ram && fits_iova;
     if (ok) {
-        g_moe_pf.ram_used  += ram_need;
+        g_moe_pf.ram_used += codes_need;
+        if (!g_moe_pf.all_src) g_moe_pf.src_used += src_need;
         g_moe_pf.iova_used += iova_need;
     } else if (!g_moe_pf.announced) {
         g_moe_pf.announced = true;
         // rocket_log, not GGML_LOG_*: llama-bench silences ggml's logger, and llama-bench is
         // the tool this placement is measured with. Say WHICH budget bound it, because the
         // two have different exits.
-        ROCKET_LOGI("[moe-int8] resident budget reached after %zu expert stacks (%zuMB RAM, "
-                    "%zuMB IOVA) -- the rest of the experts stay on the CPU, which is a "
-                    "partial offload and not a loss. %s\n",
-                    g_moe_pf.stacks.size(), g_moe_pf.ram_used >> 20, g_moe_pf.iova_used >> 20,
+        ROCKET_LOGI("[moe-int8] resident budget reached after %zu expert stacks (%zuMB RAM "
+                    "of which %zuMB is GGUF source, %zuMB IOVA) -- the rest of the experts "
+                    "stay on the CPU, which is a partial offload and not a loss. %s\n",
+                    g_moe_pf.stacks.size(),
+                    (g_moe_pf.ram_used + g_moe_pf.src_used) >> 20,
+                    g_moe_pf.src_used >> 20,
+                    g_moe_pf.iova_used >> 20,
                     fits_ram ? "Bound by NPU IOVA: raise ROCKET_N_THREADS for more per-fd "
                                "window."
                              : "Bound by RAM: raise ROCKET_MOE_CACHE_MB if it is there.");
@@ -5304,7 +5744,8 @@ static void rk_moe_preflight_open(int n_workers) {
     std::lock_guard<std::mutex> lk(g_moe_pf.mu);
     if (g_moe_pf.live == 0) {
         g_moe_pf.stacks.clear();
-        g_moe_pf.ram_used = g_moe_pf.iova_used = 0;
+        g_moe_pf.src_bufs.clear();
+        g_moe_pf.ram_used = g_moe_pf.iova_used = g_moe_pf.src_used = 0;
         g_moe_pf.frozen = g_moe_pf.announced = false;
     }
     if (n_workers > 0) g_moe_pf.n_workers = n_workers;
@@ -5831,6 +6272,7 @@ static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggm
                 // undecodable weight (supports_op gates the types, so this is defensive):
                 // CPU-fallback this expert straight from the raw weight.
                 ctx->moe_Cf32.resize((size_t)M_e * N);
+                ctx->n_cpu_fallbacks++;
                 rocket_cpu_matmul_slice(ctx->moe_Af32.data(), (const void *)W_src, wt,
                                         ctx->moe_Cf32.data(), M_e, N, K);
                 scatter_f32(ctx->moe_Cf32.data(), r0, M_e);
@@ -5852,6 +6294,7 @@ static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggm
                            " -> CPU fallback for this expert\n",
                            __func__, rc, (long long)e, (long long)M_e, (long long)K, (long long)N);
             ctx->moe_Cf32.resize((size_t)M_e * N);
+            ctx->n_cpu_fallbacks++;
             rocket_cpu_matmul_slice(ctx->moe_Af32.data(), (const void *)W_src, wt,
                                     ctx->moe_Cf32.data(), M_e, N, K);
             scatter_f32(ctx->moe_Cf32.data(), r0, M_e);
@@ -5859,6 +6302,7 @@ static int ggml_backend_rocket_mul_mat_id(ggml_backend_rocket_context * ctx, ggm
         }
         scatter_fp16(ctx->moe_C16.data(), r0, M_e);
     }
+    ctx->route_ops["moe"]++;   // an expert that fell back counts in n_cpu_fallbacks instead
     return 0;
 }
 
@@ -6303,8 +6747,14 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             if (rk_moe_preflight_decided(moe_key, &moe_admitted)) return moe_admitted;
             const int moe_group = rocket_moe_pick_group((int)K, (int)N);
             if (moe_group <= 0) return false;         // no legal K-group -> fp16 route only
+            // The buffer is what ROCKET_MOE_CHARGE_ALL_SOURCE charges: llama.cpp mmaps
+            // the GGUF and hands every weight of a split out of one backend buffer, so its
+            // size is the mmapped weight bytes that must stay resident beside the codes.
+            // It is null for a graph built with no_alloc, and the knob then charges nothing.
+            const void * src_buf   = (const void *)a->buffer;
+            const size_t src_buf_b = a->buffer ? ggml_backend_buffer_get_size(a->buffer) : 0;
             return rk_moe_preflight_admit(moe_key, K, N, a->ne[2],
-                                          moe_group, (size_t)a->nb[2]);
+                                          moe_group, (size_t)a->nb[2], src_buf, src_buf_b);
         }
         case GGML_OP_FLASH_ATTN_EXT: {
             // Offload the fused attention op (LLM prefill). Gate exactly what the handler
@@ -6327,8 +6777,19 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];
+            // The mask is OPTIONAL to the handler and the driver (NULL = unmasked,
+            // rocket_attn.h), and an ENCODER's self-attention passes none: whisper.cpp's
+            // audio encoder and the vision encoders behind mtmd build ggml_flash_attn_ext
+            // with src[3] NULL. Unmasked ops are admitted only under
+            // ROCKET_FLASH_ATTN_UNMASKED=1, because at the one shape measured the offload
+            // is not a win: whisper small (12 heads, d=64, T=n_kv=1500) reads the same CPU
+            // core-seconds as the CPU kernel it replaces (16.2 -> 16.1 on a 20 s window)
+            // and +36% encode wall, since the [T,n_kv] scores round-trip through the host
+            // softmax and at d=64 that traffic costs what the QK/AV MACs save [HW sweep
+            // 2026-09-03, RK3588 600 MHz]. A masked (LLM decoder) op is gated as before.
             const ggml_tensor * m = op->src[3];
-            if (!rocket_flash_attn_on() || !q || !k || !v || !m) return false;
+            if (!rocket_flash_attn_on() || !q || !k || !v) return false;
+            if (!m && !rocket_flash_attn_unmasked()) return false;
             // NOT ON THE RK3576. Every compute path in the handler goes through
             // rocket_flash_attn_fp16*, and every path in THAT goes through
             // rocket_matmul_fp16, which refuses on any profile that is not rk3588 -- the
@@ -6374,9 +6835,10 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             const int64_t n_kv = k->ne[1], n_kv_heads = k->ne[2];
             return max_bias == 0.0f
                 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16
-                && v->type == GGML_TYPE_F16 && m->type == GGML_TYPE_F16
+                && v->type == GGML_TYPE_F16
+                && (!m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m)))
                 && op->type == GGML_TYPE_F32
-                && ggml_is_contiguous(m) && ggml_is_contiguous(op)
+                && ggml_is_contiguous(op)
                 && q->ne[3] == 1 && k->ne[3] == 1   // no batch dim (LLM prefill)
                 && k->ne[0] == head_dim             // K matches Q on the QK contraction (DK)
                 && op->ne[0] == dv                  // dst head dim is the value dim (DV)
@@ -6389,7 +6851,7 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
                 && n_head % n_kv_heads == 0          // GQA group divides cleanly
                 // The mask gather reads m[t in 0..n_tokens, j in 0..n_kv]; require it to
                 // span at least that (ggml pads ne[1] up to GGML_KQ_MASK_PAD, so >=).
-                && m->ne[0] >= n_kv && m->ne[1] >= n_tokens
+                && (!m || (m->ne[0] >= n_kv && m->ne[1] >= n_tokens))
                 && n_tokens >= rocket_flash_attn_min_t()    // decode (1 token) stays on CPU
                 && n_kv >= rocket_flash_attn_min_kv();       // short context stays on CPU (parity below ~1K)
         }
@@ -6695,6 +7157,21 @@ ggml_backend_t ggml_backend_rocket_init(void) {
                         e, b ? "set" : "unlimited");
         }
     }
+    // ROCKET_DEQUANT_CACHE_MB: host fp16 cache for the streaming quant path's per-micro-batch
+    // dequant, in MB (explicit 0 = unlimited). Default off = the shipped path. This is the
+    // -ub lever's MECHANISM CONTROL, not a recommendation: it removes the dequant term alone
+    // -- the per-call pack/upload and the placement stay the shipped streaming path -- so a
+    // stock-vs-ub2048 A/B under it prices what the flag buys BEYOND dequant amortization,
+    // the dense analogue of the MoE units' ROCKET_MOE=0 arm. As a user lever it is dominated
+    // by ROCKET_QUANT_RESIDENT: the same fp16 footprint buys strictly more there.
+    if (const char * e = getenv("ROCKET_DEQUANT_CACHE_MB")) {
+        size_t b;
+        if (rocket_parse_mb_budget(e, &b)) {
+            ctx->dq_cache_budget = b ? b : (size_t)-1;
+            ROCKET_LOGI("[rocket] ROCKET_DEQUANT_CACHE_MB=%s -> host fp16 dequant cache %s\n",
+                        e, b ? "set" : "unlimited");
+        }
+    }
     const int backend_n_threads = ctx->n_threads;   // ctx is released to the backend below
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_rocket_guid(),
@@ -6720,6 +7197,23 @@ void ggml_backend_rocket_moe_stats(ggml_backend_t backend, long * n_resident, lo
     const ggml_backend_rocket_context * ctx = (const ggml_backend_rocket_context *)backend->context;
     if (n_resident) *n_resident = ctx->moe_n_resident;
     if (n_streamed) *n_streamed = (long)ctx->moe_streamed_keys.size();
+}
+
+long ggml_backend_rocket_route_ops(ggml_backend_t backend, const char * route) {
+    GGML_ASSERT(ggml_backend_is_rocket(backend));
+    const ggml_backend_rocket_context * ctx = (const ggml_backend_rocket_context *)backend->context;
+    if (!route) {
+        long total = 0;
+        for (const auto & kv : ctx->route_ops) total += kv.second;
+        return total;
+    }
+    auto it = ctx->route_ops.find(route);
+    return it == ctx->route_ops.end() ? 0 : it->second;
+}
+
+long ggml_backend_rocket_cpu_fallbacks(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_rocket(backend));
+    return ((const ggml_backend_rocket_context *)backend->context)->n_cpu_fallbacks;
 }
 
 void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, int n_threads) {

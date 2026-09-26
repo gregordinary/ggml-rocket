@@ -215,7 +215,8 @@ sudo ./build/test-rocket-matmul  # needs /dev/accel/accel0; each shape prints PA
 ```
 
 The gates are all CTest-registered. Run `ctest` from the build dir. The NPU gates report
-`Skipped` off-device, and the pure-CPU ones run anywhere:
+`Skipped` off-device, and the pure-CPU ones run anywhere. Each NPU gate also reads the backend's
+route counters, so it asserts where its ops computed rather than inferring it from the numbers:
 
 | Gate | What it covers |
 |---|---|
@@ -288,6 +289,17 @@ GGML_BACKEND_PATH=$PWD/build-dl/libggml-rocket.so \
 `sudo -E` because `/dev/accel/accel0` needs privilege and `-E` preserves the env var. The startup
 log lists a `ROCKET` device described by the detected part, "RK3588 NPU" or "RK3576 NPU". The
 `drm_mm "Memory manager not clean"` WARN at exit is a known-benign teardown race.
+
+`whisper-server` loads the `.so` the same way. A client that posts fixed-length chunks with no
+request fields, as OpenWebRX+ does, leaves the server's settings to decide the CPU cost. Three
+matter: `-nt -sns`, an `-ac` of 50 times the chunk length plus 4 s (capped at 1500), and the
+temperature fallback off. The fallback is turned off through a `temperature_inc=0` request
+field, because the server's `-nf` flag is parsed and never applied. Together they read 0.70x
+the defaults' CPU on 20 s chunks at better WER.
+
+The rows are in
+[API.md](API.md#recommended-configurations). Two traps sit behind the rules: an `-ac` equal
+to the chunk length loops the decoder, and a 30 s chunk without `-nt` is encoded twice.
 
 ### Drop into transcribe.cpp (multi-model STT)
 
@@ -369,10 +381,13 @@ raw prompt completion.
 
 Two more things shape a run:
 
-- **CPU thread placement: leave it unpinned for F16.** On Gemma-4-12B F16, pinning the process to
-  the A76 big cores is not a win: prefill is flat (the matmul workers are already A76-pinned) and
-  decode is −34% (F16 decode is LPDDR-bandwidth-bound, so confining it to 4 A76 cores starves it).
-  Let decode use all 8 cores.
+- **CPU thread placement: pin to the A76 big cores for prefill, not for decode.** `taskset 0xf0`
+  is worth **1.05-1.13x** on NPU prefill, largest on the smallest model [three models, rotated
+  interleaved passes, RK3588 at 600 MHz, governor pinned]. The NPU half is identical in every
+  arm, so the gain is host-side. Holding the weights resident is not what earns it, since the 12B
+  streams all of its and still gains 1.05x. Decode is the opposite, 34% down on Gemma-4-12B F16,
+  because F16 decode is LPDDR-bandwidth-bound and wants all 8 cores. Pin a prefill-heavy run, and
+  measure a mixed one.
 - **Measurement discipline.** The clock parks at idle, so discard the first `-r 1` run, which is
   cold and reads ~15% low. Run >=3x and compare warm runs.
 
