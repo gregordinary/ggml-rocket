@@ -5160,9 +5160,8 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
 //
 // The NPU cannot apply a K-blocked scale on chip -- at the output stage K is fully
 // contracted, so no register or operand cube is indexed by a K-block, for any dtype. But
-// integer partials ALREADY leave the chip at every K-tile boundary (on-device integer
-// K-accumulation is architecturally impossible: the DPU eltwise operand DMA is <=16-bit
-// and an int32 partial does not fit), so a per-K-group scale rides along for free at a
+// integer partials ALREADY leave the chip at every K-tile boundary (no on-device integer
+// K-accumulation is implemented), so a per-K-group scale rides along for free at a
 // boundary that is already being paid for. Keep each K-tile inside one quant group,
 // multiply its int32 partial by that group's scale, accumulate in fp32 on the host --
 // which is exactly rocket_matmul_int8_prepacked_gw's contract, and why the ingest emits

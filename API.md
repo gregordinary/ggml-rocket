@@ -480,8 +480,8 @@ Three facts make this work, and each is load-bearing.
 
 At the output stage `K` is fully contracted, so nothing in the DPU is indexed by a K-block.
 
-Integer partials **already** leave the chip at every K-tile boundary, because on-device integer
-K-accumulation is architecturally impossible. So a per-K-group scale rides along **free at a
+Integer partials **already** leave the chip at every K-tile boundary, because no on-device
+integer K-accumulation is implemented. So a per-K-group scale rides along **free at a
 boundary already being paid for**. Keep each K-tile inside one quant group, and fold that group's
 scale into the readback loop that exists anyway.
 
@@ -857,8 +857,8 @@ stack does *not* include is quantization.
 peak, so it is **DMA/dispatch-bound rather than MAC-bound**, and int8's 2x and int4's 4x MAC do not
 express.
 
-In-model **resident int8 prefill is 0.60x fp16**. Its int32 readback cannot be K-accumulated,
-because the NPU's eltwise operand DMA is <=16-bit.
+In-model **resident int8 prefill is 0.60x fp16**. Its int32 readback is not K-accumulated on
+the NPU.
 
 So quantization's payoff *today* is **RAM, model size and decode-coexistence**, not throughput.
 Treat this as **bottleneck-conditional rather than permanent**. Quant's MAC advantage is gated
@@ -950,7 +950,7 @@ therefore rises by attacking the dispatch floor, meaning fewer, bigger, batched 
 than by narrowing the datatype.
 
 On-device integer K-accumulation would let int8 keep its narrow weights *and* avoid the int32
-readback. It does not exist on this silicon.
+readback. None is implemented, and whether the eltwise unit can add int32 is unestablished.
 
 ## Recommended configurations
 
