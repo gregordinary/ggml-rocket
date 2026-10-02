@@ -67,9 +67,11 @@ The 14.66 B Phi-4 is arch `llama`, dense GQA, a different architecture from Phi-
 It prefills on the NPU through the same drop-in, **PPL-faithful** to the CPU, at Q8_0 and Q4_K_M
 wikitext Δ −0.09% and −0.31%.
 
-Its F16 GGUF is 29.3 GB and does not fit a 31 GB board, so it runs quantized. **Q8_0 and Q4_K_M
-reach ~3.4-3.5x CPU at pp2048**, about 12 t/s over a ~3.5 t/s 14 B CPU baseline. The win rises
-with prompt length as the per-micro-batch dequant amortizes.
+Its F16 GGUF is 29.3 GB and does not fit a 31 GB board, so it runs quantized. **Q4_K_M reaches
+3.1x CPU at pp2048**, 16.7 t/s against 5.45 for a CPU with llama.cpp's weight repack on
+(`-b 2048 -ub 2048`, governor pinned) [HW sweep 2026-09-29]. Against an unrepacked CPU, ~3.4 t/s,
+Q8_0 and Q4_K_M read ~3.4-3.5x. The win rises with prompt length as the per-micro-batch dequant
+amortizes.
 
 Q4_K_M at 8.28 GB is the practical pick. It fits a ~9 GB budget and streams decode ~2.2 t/s. It
 is a mid-large point between Gemma-4-12B and Qwen3.6-27B.
@@ -82,8 +84,9 @@ attention**, prefill on the NPU through the same drop-in, **PPL-faithful** to th
 The DeltaNet and SSM-scan layers are CPU-only ops and stay there. The FFN and projections offload
 and the prefill win holds. The hybrid's linear-attention layers do not block it.
 
-**27B Q4_K_M reaches 4.4x CPU at pp2048**, the largest prefill win measured. Its quant laps an
-especially slow 27B CPU baseline.
+**27B Q4_K_M reaches 3.2x CPU at pp2048**, the largest win among the quantized models. That is
+9.6 t/s against 3.0 for a CPU with its weight repack on [HW sweep 2026-09-29]. Against the unrepacked CPU,
+an especially slow 1.8 t/s at 27 B, it read 4.4x.
 
 The NPU prefill advantage **grows with model size**: F16 0.8B 1.44x to 9B 3.65x CPU. A quantized
 GGUF whose fp16 image fits RAM wants `ROCKET_QUANT_RESIDENT=auto` at the default `-ub`, not
@@ -150,7 +153,8 @@ Importance-matrix quants such as `IQ4_XS` take this same path, because an imatri
 4.25 bpw with 256-element super-blocks and `K%32` holds. Their prefill GEMMs offload like any quant rather than falling back to the CPU. Qwen3.5-9B
 `IQ4_XS` prefill is 3.1x CPU at pp2048, the fastest-decoding rung at 4.80 GB.
 
-It requires the host built `-DGGML_CPU_REPACK=OFF`, in *Drop-in use with llama.cpp* below.
+It requires the host's weight repack off, `-nr` or a `-DGGML_CPU_REPACK=OFF` build, in *Drop-in
+use with llama.cpp* below.
 
 ### Resident weights
 
@@ -318,8 +322,9 @@ Mixture-of-experts models route the expert FFNs through `GGML_OP_MUL_MAT_ID`. Th
 `MUL_MAT_ID` handler. It buckets the routed `(slot,token)` rows by expert and runs each active
 expert's GEMM on the NPU, bit-faithfully.
 
-It is worth **~2.4x the CPU** at pp2048 on gpt-oss-20b, and it wins at every prefill length there,
-in the table below. Eligibility is per architecture rather than universal. The DeepSeek-V2-Lite
+It is worth **1.9x the CPU** at pp2048 on gpt-oss-20b, against a CPU with llama.cpp's weight
+repack on [HW sweep 2026-09-29]. Against an unrepacked CPU it read ~2.4x and won at every prefill
+length, in the table below. Eligibility is per architecture rather than universal. The DeepSeek-V2-Lite
 section covers a MoE whose routing puts it under the per-dispatch work floor at short prefill.
 
 **`ROCKET_MOE` has three states**, because the route's two regimes have opposite signs:
@@ -967,9 +972,10 @@ budget does not fit, so it is safe to request.
 | Agentic / RAG / long prompts | quantized GGUF | `-b 2048 -ub 2048` | A quant GGUF re-dequantizes per micro-batch; `-ub 2048` ~doubles prefill over the `-ub 512` default |
 | Agentic / RAG, repeated prefill | quantized GGUF, fp16 fits RAM | `+ ROCKET_QUANT_RESIDENT=auto` | Dequant + pack once -> fp16 prefill parity (~1.5x). Needs ~the fp16 model size free |
 | Agentic / RAG, repeated prefill | F16, fits ~2x RAM | `+ ROCKET_F16_RESIDENT=auto` | Pack weights once across turns; single-digit-percent gain |
-| Any | MoE (gpt-oss, …) | `-b 2048 -ub 2048` | Routed experts resident as int8, on by default: ~2.4x at pp2048 on gpt-oss. A stack that will not fit the resident budget, or whose per-expert row count is under the tile granule, is left on the CPU by the placement gate, so there is nothing to set. `ROCKET_MOE=1` is 13-18% faster where the stack nearly fits and *below* the experts-on-CPU baseline where it does not |
+| Any | MoE (gpt-oss, …) | `-b 2048 -ub 2048` | Routed experts resident as int8, on by default: 1.9x a repacked CPU at pp2048 on gpt-oss. A stack that will not fit the resident budget, or whose per-expert row count is under the tile granule, is left on the CPU by the placement gate, so there is nothing to set. `ROCKET_MOE=1` is 13-18% faster where the stack nearly fits and *below* the experts-on-CPU baseline where it does not |
 | Model too big at F16 | n/a | a `Q4_K_M` GGUF, or `ROCKET_INT4=1` from an F16 GGUF | Footprint, not speed; quantization does not speed prefill here |
 | Transcription service (`whisper-server` fed fixed-length chunks) | F16 whisper | `-nt -sns`, `-ac 50*(chunk_s+4)` capped at 1500, and `temperature_inc=0` as a request field | 0.70x the server defaults' CPU core-seconds per second of audio at better WER on 20 s chunks, 0.65x on 30 s chunks with `-nt`. `-ac` set to the chunk length itself makes the decoder loop at the audio's end; a 30 s chunk without `-nt` is encoded twice; the server's `-nf` is a no-op, hence the field. A quantized whisper costs more, not less: its unnamed tensors keep the encoder off the resident route, so each request dequantizes it. [HW sweep, RK3588 600 MHz, `ggml-small`] |
+| Voice commands, short utterances (Parakeet through whisper.cpp's `parakeet-cli`) | F16 | `ROCKET_MIN_M=16` in the STT process, plus `OMP_WAIT_POLICY=PASSIVE` when another process shares its cores | A 1-5 s command is 16-75 encoder rows, under the default floor, so nothing offloads. At 16 the encoder ties the CPU at 1.3-1.8 s and runs 1.18-1.73x faster at 2-6 s, freeing 34-61% of the CPU core-seconds with the transcript unchanged. Beside a CPU-bound process the offloaded stream slows more than a CPU one does, and the passive policy recovers most of that. Leave an LLM process at the default |
 
 `ROCKET_INT8`, `ROCKET_INT4` and `ROCKET_BF16` are numerically faithful, and they tie the prefill
 throughput of fp16. Use them to fit a model in less RAM, never to speed prefill.
@@ -997,7 +1003,7 @@ arm", so an empty value arms them. None of them changes a result.
 | **`ROCKET_KACC`** | **on** | **the operating mode**: fp16 NPU-side K-accumulation (+19%). Default-on; `=0` (or `ROCKET_NO_KACC`) opts out to the byte-exact host fp64-accum path. Under it, `ROCKET_REUSE` defaults to 2 |
 | **`ROCKET_REUSE`** | 2 (KACC on by default) | CBUF operand reuse: 0 off / 1 WEIGHT_REUSE / 2 DATA_REUSE (+7%). Defaults to 2 whenever K-accum is on, which is the default |
 | `ROCKET_N_THREADS` | 5 | worker count (knee ~5; "one above #cores"). Raising it grows the per-fd IOVA window, and that is worth doing only where the window is what bound the residency route. **On the MoE route it never is**: the pre-flight charges the GGUF source against RAM and only the int8 codes against IOVA, so RAM binds by a factor no worker count can close, and 5 against 8 admits a byte-identical 62 stacks. Raising it there is nonetheless a small **gain**, and the gain is a step at **six**: 1.022x / 1.016x / 1.018x at 6 / 7 / 8 against 5 at pp2048 on gpt-oss-20b over three rotated passes, each resolved but none separated from another, with the little-cluster instruction share stepping 0.120 to 0.115 at six and flat above it. **On the f16 route it can be, and the curve is not monotone**: at `-p 512` on a 12 B F16 the route declines on the window at 5 workers and places 286 / **293** / 274 / 287 weights at 5 / 6 / 7 / 8, each byte-identical across processes, so 7 is worse than the default. It also costs throughput **on that route**: 5 to 8 measured **0.987x** prefill wall there, with the little-cluster instruction share rising 0.141 to 0.150. **The sign is route-dependent and does not transfer** -- the same step is 1.027x on the MoE route, so measure the knob on the route you are on. **Six is the value to take on both routes measured**: it buys the MoE route's whole gain, and on the f16 route it is the placement peak whose wall difference is below this instrument's resolution. The shipped default stays 5 because every published ratio in the tuning matrix is taken against it. Read the `admission first declined` line at the shape you will run, then ladder rather than raise |
-| `ROCKET_MIN_M` | 128 | min M to offload. Below the crossover the per-call dispatch + weight packing (a weight only goes resident at `max_tile`=256, so below that it re-packs every call) outweigh the NPU's per-row advantage and the offload **loses to the CPU**. Measured F16 ratio NPU/CPU, 0.8B: pp16 0.36 / pp64 0.83 / pp96 1.04 / pp128 1.15; 3B: pp64 1.03 / pp128 1.60; 8B: pp48 0.93 / pp64 1.24 / pp128 1.89. The crossover is nearly model-independent (the packB you pay and the compute you gain both scale with K·N, so it cancels); the residual drift (~86 rows at 0.8B down to ~55 at 8B) is the dispatch term, which does *not* scale with K·N and so weighs more when the weights are small. **128 is at or above every measured crossover, so no model regresses below CPU**; bigger models cross earlier still. Also covers **batched** decode: whisper.cpp's default beam search presents M=5 per step, which the old floor of 4 wrongly offloaded (2.3x slower; a 1.40x net loss end-to-end). Do **not** set it to 256: llama streams below 256 and still wins, so 256 costs pp128 −46% |
+| `ROCKET_MIN_M` | 128 | min M to offload. Below the crossover the per-call dispatch + weight packing (a weight only goes resident at `max_tile`=256, so below that it re-packs every call) outweigh the NPU's per-row advantage and the offload **loses to the CPU**. Measured F16 ratio NPU/CPU in 2026-07, 0.8B: pp16 0.36 / pp64 0.83 / pp96 1.04 / pp128 1.15; 8B: pp48 0.93 / pp64 1.24 / pp128 1.89. The 3B re-measured in 2026-09 reads pp16 0.70 / pp32 1.25 / pp64 2.34 / pp128 3.58, a crossover near 24 rows, so 128 is conservative on it; the 0.8B and 8B rows are not re-measured. A CTC or transducer encoder on a short utterance wants 16 in its own process (see Recommended configurations). The crossover is nearly model-independent (the packB you pay and the compute you gain both scale with K·N, so it cancels); the residual drift (~86 rows at 0.8B down to ~55 at 8B) is the dispatch term, which does *not* scale with K·N and so weighs more when the weights are small. **128 is at or above every measured crossover, so no model regresses below CPU**; bigger models cross earlier still. Also covers **batched** decode: whisper.cpp's default beam search presents M=5 per step, which the old floor of 4 wrongly offloaded (2.3x slower; a 1.40x net loss end-to-end). Do **not** set it to 256: llama streams below 256 and still wins, so 256 costs pp128 −46% |
 | `ROCKET_MIN_M_QUANT` | 512 | min M to offload **quantized** weights (the dequant->fp16 path). Its per-microbatch dequant needs more rows than F16 to amortize; measured crossover ~360 on 9B/27B `Q4_K`, so short quant prefills below this stay on the CPU (avoids a net-loss offload). Floored at `ROCKET_MIN_M` |
 | **`ROCKET_QUANT_RESIDENT`** | off | dequant a quantized GGUF weight to fp16 **once** and hold it in resident NPU BOs (reuses the F16 prepacked path) instead of re-dequantizing **and** re-packing it every micro-batch, lifting quant prefill to F16 parity (closes the per-microbatch dequant tax, and the `-ub 512` / short-follow-up cases `-ub 2048`'s amortization can't) at the cost of the **full fp16 resident footprint**. Modes: `1` = blanket, bounded by `ROCKET_CACHE_MB` (default 2 GB); **`auto`** = size the budget from free RAM (MemAvailable − a swap-safe reserve `max(6 GiB, 30 % of RAM)`, override `ROCKET_QUANT_RESIDENT_RESERVE_MB`); `N` = an explicit N-MB budget. Prefer `auto` for the "quantized-for-download, RAM-to-spare" case: on a model **larger than the default budget**, blanket `1` residents only part of it and is a **net loss vs streaming**; `auto` reaches parity (Qwen3.5-9B-`Q4_K` pp2048: `auto` 25.8 ~ F16 25.1 vs streaming 22.1 t/s [HW sweep, 600 MHz]). Over-budget / IOVA-full weights fall back to streaming |
 | **`ROCKET_FLASH_ATTN`** | on | offload the attention op (`FLASH_ATTN_EXT`) to the NPU: heads fanned across the worker fds + submit-chained (see `ROCKET_FA_CHAIN`), bit-faithful (PPL == CPU) **for the attention it implements**: `softmax(scale·QKᵀ + mask)·V`. An op carrying **attention sinks** (`src[4]`, a learned per-head logit in the softmax denominator: gpt-oss, `mimo2`, `deepseek4`) is **declined**: the handler has no sink term, so accepting it would compute a *different* attention, silently. **Parity at <=1K, a growing win above: 1.07x at 4K, 1.50x at 8K, 1.25x at 16K** [HW sweep, `-r3`]. Context-gated (see `MIN_KV`); `=0` disables. A driver failure degrades the layer to the host reference rather than failing the graph, as `MUL_MAT` and `MUL_MAT_ID` do: correct but slow, and it logs a warning saying so |
@@ -1006,9 +1012,10 @@ arm", so an empty value arms them. None of them changes a result.
 | `ROCKET_FLASH_ATTN_MIN_T` | 16 | min prefill `n_tokens` to offload attention (single-token decode stays on CPU) |
 | `ROCKET_FLASH_ATTN_UNMASKED` | off | admit `FLASH_ATTN_EXT` ops that carry **no mask**: an encoder's self-attention (whisper.cpp's audio encoder, the mtmd vision encoders). The handler and the driver take a NULL mask as unmasked, so the op computes correctly (whisper transcript md5-identical). Off because at the one shape measured it is not a win: whisper small (12 heads, d=64, T = n_kv = 1500) reads the same CPU core-seconds as the CPU kernel it replaces (16.2 -> 16.1 on a 20 s window) and **+36% encode wall**, because the `[T, n_kv]` scores round-trip through the host softmax and at d=64 that traffic costs what the QK/AV MACs save. The on-NPU softmax variant (`ROCKET_ATTN_HOST_SOFTMAX=0`) is worse again, +96% wall. [HW sweep, RK3588 600 MHz, A76-pinned] A masked (LLM decoder) op is unaffected by this knob |
 | `ROCKET_ATTN_HOST_SOFTMAX` | host (FA) | attention softmax placement; `=0` forces the on-NPU softmax (default host, since scores are already host-side for the additive mask) |
+| `ROCKET_FA_QSCALE` | 1 | fold the op's scale into Q as the handler converts Q to fp16, and hand the driver a scale of 1. The QK contraction accumulates in fp32 but writes an fp16 score surface, so a raw `q.k` past 65504 overflowed there; folded, the surface carries `scale*q.k` and overflows only past `65504/scale` (8x at head_dim 64, 16x at 256). The score is the same function, `softcap*tanh(scale*q.k/softcap) + mask`, with one fp16 rounding of Q either way. `test-rocket-fa` scores a raw `q.k` of 60000-135000 exactly with it and wrong by up to 1.0 without it, and random operands to 3.2e-5 and 3.4e-5 of a double reference either way [HW, RK3588 600 MHz]. The CPU backend returns NaN on that case on this ARM build, since its fp16 dot product accumulates in fp16. `=0` restores the unscaled surface |
 | `ROCKET_FA_THREADS` | 1 | worker count for the FA handler's HOST gather and scatter (the Q convert, K copy, V transpose, mask copy and output scatter). Those five walks run on the dispatch thread while the scheduler waits, so they are prefill wall rather than overlapped host work: **5.44 s of a 97.8 s pinned prefill**, gather 3.46 and scatter 1.98, on `gemma4-12b` F16 at pp2048 [HW readout, `ROCKET_FA_TIMING=1`, RK3588 600 MHz, A76-pinned]. Threading them is capped at **5.6% x (1 - 1/k)** of the wall, and at `k`=4 it is **measured at 1.0389x** of that wall (`G_k` 5.80 / 3.17 / 1.87 s per prefill at 1 / 2 / 4 workers) [HW sweep 2026-09-07, three arms x three passes, rotated and paired within a pass]. **4 is the value worth setting**: fitting `G_k` = `A`/`k` + `B` gives a fixed residue of 0.55 s, so more workers than the four A76s would buy about 0.6% of wall between them, and the value is clamped to the shared host pool's worker count (`ROCKET_DEQUANT_THREADS`, the A76 count by default) in any case. **Whether it is bit-identical at every value is OPEN, and the evidence that said so is retired**: the `ROCKET_FA_CHECKSUM` hash agreed across `k` = 1, 2, 3, 4, 5, but two runs at ONE `k` on `gemma4-12b` F16 also disagree -- twice in seven runs on one build, same graph, same 288 ops and 2818572288 bytes -- so an equality across `k` is not evidence about the split until the same-`k` disagreement rate is bounded [HW 2026-09-07, RK1]. The chunks are disjoint index ranges by construction and nothing here contradicts that; what is gone is the measurement. The default stays 1 because the gain is one shape and one unit, and because the walks then run with no pool touched |
 | `ROCKET_FA_TIMING` | off | print the FA handler's host split at exit: gather / on-NPU compute / scatter ms (the `FLASH_ATTN_EXT` outer gather is host glue the driver's `ROCKET_MM_PROFILE` does not see). Diagnostic only; near-zero when off |
-| `ROCKET_FA_CHECKSUM` | off | `=1` prints an FNV-1a over every byte the FA handler writes to its output, accumulated across every offloaded op, at exit; `=2` adds one hash per op with its shape beside it, which is what localizes a hash that moves. It was built to make `ROCKET_FA_THREADS`'s bit-identical claim a measurement, and **it cannot carry that on its own**: two runs at one chunk count disagreed twice in seven on `gemma4-12b` F16, so a comparison across `k` measures the split PLUS whatever the handler does run to run, and the two are not separable from inside it. Repeat one arm and bound its self-disagreement rate before reading any cross-`k` comparison. Read the op count first, since a run that prints nothing agrees with another such run about nothing. **Both this and `ROCKET_FA_TIMING`'s summary are emitted from an `atexit` handler, and a tool built on llama.cpp's `common_init` drops them**: `common_log` is asynchronous and discards messages once its worker is paused. `llama-bench -v` prints them; `llama-perplexity` prints neither, while still running the handler -- its perplexity moves by 13.8994 against 13.9024 between `ROCKET_FLASH_ATTN=1` and `=0`, with two `=1` processes agreeing to every digit [HW, ministral3-3b F16, 2026-09-07]. So the absent line is about the log and not about placement, and reading either probe means `llama-bench -v`. Diagnostic only; near-zero when off |
+| `ROCKET_FA_CHECKSUM` | off | `=1` prints an FNV-1a over every byte the FA handler writes to its output, accumulated across every offloaded op, at exit; `=2` adds one hash per op with its shape beside it, which is what localizes a hash that moves; `=3` adds, on each op's line, the hashes of the four dense fp16 tiles the driver is handed (`q`, `k`, `v`, mask), so an op whose output differs between two runs says whether its inputs already did. With `ROCKET_FA_DUMP_OP=N` (and `ROCKET_FA_DUMP_DIR`, default `/tmp`), op `N`'s four tiles and its fp16 output are also written to raw files, for a value-by-value comparison of two runs. It was built to make `ROCKET_FA_THREADS`'s bit-identical claim a measurement, and **it cannot carry that on its own**: two runs at one chunk count disagreed twice in seven on `gemma4-12b` F16, so a comparison across `k` measures the split PLUS whatever the handler does run to run, and the two are not separable from inside it. Repeat one arm and bound its self-disagreement rate before reading any cross-`k` comparison. Read the op count first, since a run that prints nothing agrees with another such run about nothing. **Both this and `ROCKET_FA_TIMING`'s summary are emitted from an `atexit` handler, and a tool built on llama.cpp's `common_init` drops them**: `common_log` is asynchronous and discards messages once its worker is paused. `llama-bench -v` prints them; `llama-perplexity` prints neither, while still running the handler -- its perplexity moves by 13.8994 against 13.9024 between `ROCKET_FLASH_ATTN=1` and `=0`, with two `=1` processes agreeing to every digit [HW, ministral3-3b F16, 2026-09-07]. So the absent line is about the log and not about placement, and reading either probe means `llama-bench -v`. Diagnostic only; near-zero when off |
 | `ROCKET_MOE` | **auto (on)** | MoE routed-expert FFNs (`MUL_MAT_ID`): bucket the `(slot,token)` rows by expert id, run each active expert's `[M_e,K]x[N,K]ᵀ` GEMM fanned across the worker fds, scatter the rows back. **Three states.** *Unset* = auto: claim the op only for a **GGUF-quantized** stack, on the RK3588, whose whole `[K, N, n_expert]` stack the residency pre-flight can reserve before the first ingest **and** whose per-expert GEMM clears both the tile granule (`ROCKET_MOE_M_BUCKET`) and the per-dispatch work floor (`ROCKET_MOE_MIN_WORK`); that is the native-quant route (`ROCKET_MOE_NATIVE`), which holds each expert resident as int8 and is worth **~2.4x the CPU** at pp2048 on gpt-oss-20b MXFP4 (~1.8x at pp512). *`=1`* = forced: claim every `MUL_MAT_ID` the handler can compute, reserving nothing and ignoring both size floors, which includes the fp16 streaming route (an F16 stack, or a stack too large to hold resident), which measured 0.42-0.90x. Forced is **6-13% faster at pp512 and 18-21% at pp2048 where the stack nearly fits** (measured twice; the pp512 half is inside that arm's own spread) and **below the experts-on-CPU baseline where it does not** (0.97x at pp512 on an induced 12 GB budget), and `ROCKET_MOE_CACHE_MB=28000` buys back 79% of the pp2048 gap on a 31 GiB board while keeping the sign guarantee forced gives up; it is the A/B arm and the configuration the archived MoE measurements were taken under. *`=0`* = off. Run at **`-b 2048 -ub 2048`**, not because the experts re-dequantize (native-quant is what stops that) but because the **dense** quantized weights still do, and because a smaller micro-batch gives each expert proportionally fewer rows (64 at `-ub 512` vs 256 at `-ub 2048`) while the per-expert dispatch/gather/scatter/padding stays flat. Measured at `-ub 512`: ~1.6x/1.7x over experts-on-CPU, i.e. **no collapse**; that tax belonged to the fp16 route. Costs a one-time expert ingest per `llama_context` (~36 s on gpt-oss-20b, ~32 s on DeepSeek-V2-Lite; the dominant NPU-BO pack term is bytes-bound at ~500-545 MB/s, not per expert). See the MoE note above |
 | `ROCKET_MOE_MIN_TOKENS` | 512 | in every `ROCKET_MOE` state, the min micro-batch `n_tokens` for a `MUL_MAT_ID` op to offload; `M_e ~ n_tokens · n_expert_used / n_expert` sets the per-expert GEMM size; short prefills and decode stay on the CPU. Floored at `ROCKET_MIN_M` |
 | `ROCKET_MOE_NATIVE` | **on** | route a **GGUF-quantized** expert through the resident int8 group-wise path: ingest its quant blocks **once** into int8 codes held in NPU BOs, then quantize only the activation per call. This is what removes the per-micro-batch host dequant that makes the fp16 expert route a loss, and it is the only route the default placement claims; `=0` forces the fp16 dequant route (the A/B baseline) and leaves auto placement with nothing to claim, so it takes effect under `ROCKET_MOE=1`. An **F16** expert always takes the fp16 route, since it has no dequant to delete |
@@ -1097,6 +1104,37 @@ Both counts are cumulative over the backend's life. The fallback computes in fp6
 reference does, so a test that compares only numbers passes on a device that computed nothing.
 The gates take a mark before each run and assert over the difference.
 
+## Precision declarations
+
+A ggml graph can declare, per op, the lowest precision its implementation has to keep
+(`ggml_prec_set_acc` and `ggml_prec_set_src`, ggml 0.25). A backend that cannot meet a
+declaration has to leave the op to one that can, and `supports_op` declines these:
+
+| Declaration | Declined when | Why |
+|---|---|---|
+| Accumulator of a `MUL_MAT` / `MUL_MAT_ID` | F32 or BF16 | No route guarantees an fp32 result. The fp16 route writes fp16, and with `ROCKET_KACC` on, its default, sums the K-partials in fp16. The RK3576 route writes int8 through its requant. The bf16, int8 and int4 routes write fp32 or int32 but fall back to the fp16 route when they decline. |
+| Activation (`src1`) of a `MUL_MAT` / `MUL_MAT_ID` | Declared above the route's own rank | The fp16 route converts the activation to fp16. `ROCKET_INT8`, the RK3576 route and the native-quant expert route quantize it to int8, and `ROCKET_INT4` to int4. The gate takes the lowest rank the op could reach, because every route falls back to fp16 and the quantizing routes are tried first. |
+| `GGML_HINT_SRC0_IS_HADAMARD` on a `MUL_MAT` | Always | The CPU backend runs it as a fast Walsh-Hadamard transform, O(n log n) a row and exact in f32. Here it would be a dense n × n fp16 GEMM. |
+
+The ranks run F32, BF16, F16, Q8, Q4, highest first, and an accumulator declared F16 is met by
+every route. In llama.cpp b11242 these declarations reach an offloadable op:
+
+- An F32 activation on Mistral-4's routed down-projection
+- An F32 accumulator on the `ffn_down` and attention output of GLM-4, GLM-4-MoE and JAIS-2, on
+  MiniMax-M3's attention output, and on DeepSeek-V4's expert router
+- A per-weight activation rank, which a GGUF can carry in `general.tensor_extra`
+
+The Hadamard tag appears around a quantized KV cache (`-ctk` / `-ctv` with a quantized type) and
+in DeepSeek's lightning indexer. None of the models in this document's tables carries one.
+
+**`FLASH_ATTN_EXT`'s accumulator declaration is read and not enforced.** llama.cpp declares F32
+on every attention op it builds. It did so before this offload was measured, so every attention
+number here was taken with it set, and enforcing it would retire the offload. The route computes
+Q·K on the NPU from fp16 operands, accumulates in fp32 there, and writes the unscaled scores as
+fp16. The scale, soft-cap, mask and softmax then run in fp32 on the host. A model whose raw
+Q·K passes 65504 would therefore overflow where its declaration says it must not [expected, no
+model measured reaching it].
+
 ## Implementation notes
 
 - Uses ggml's private headers, `ggml-impl.h` and `ggml-backend-impl.h`, as expected for
@@ -1108,13 +1146,26 @@ The gates take a mark before each run and assert over the difference.
 
   The concrete ABI this backend targets is **`GGML_BACKEND_API_VERSION 2`**, with the
   device vtable that *includes* the `set_tensor_2d_async` and `get_tensor_2d_async`
-  slots. It is built and verified against the in-repo `ggml/` tagged v0.14.0.
+  slots. It builds against ggml 0.14.0 through 0.25.3.
 
   The host apps, llama.cpp and whisper.cpp, clone their own ggml. Build this backend
   against **that checkout's** headers and re-check on every bump. A host
   `ggml-backend-impl.h` with a different `GGML_BACKEND_API_VERSION` or 2d-field layout
   drifts the positional vtable, and you get a "ROCKET device not listed at startup"
   failure.
+
+  **The op numbering is checked at load.** ggml numbers its ops by position in an enum,
+  and inserting one shifts every op after it without moving `GGML_BACKEND_API_VERSION`.
+  ggml 0.15 inserted `COL2IM_1D`, so `FLASH_ATTN_EXT` moved from 73 to 74 while
+  `MUL_MAT` stayed at 29. A `.so` built for whisper.cpp 1.8.6 loads into 1.9.x, passes
+  the version check, keeps offloading matmuls, and never recognizes an attention op
+  again.
+
+  The dlopen entry therefore asks the host's `ggml_op_name` to name each op number the
+  backend handles, and returns `NULL` on a mismatch. The loader reports that as
+  `ggml_backend_init returned NULL` and unloads the `.so`. The line before it names
+  the op, for example `op ordinal 73 is FLASH_ATTN_EXT in this .so and FILL in the
+  host's ggml`, which is what a 1.8.6 build prints when loaded into whisper.cpp 1.9.4.
 
 Two further implementation facts:
 

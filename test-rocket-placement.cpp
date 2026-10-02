@@ -27,6 +27,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>       // strcmp
 #include <unistd.h>      // fork/_exit — one child per cached-getenv MoE mode
 #include <sys/wait.h>
 
@@ -37,6 +38,23 @@ static bool mm_supported(ggml_backend_dev_t dev, int K, int N, int M, ggml_type 
     ggml_tensor * W = ggml_new_tensor_2d(ctx, wt, K, N);
     ggml_tensor * X = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
     ggml_tensor * dst = ggml_mul_mat(ctx, W, X);
+    bool ok = ggml_backend_dev_supports_op(dev, dst);
+    ggml_free(ctx);
+    return ok;
+}
+
+// The same 2D mul_mat with one op_params slot written: a precision declaration (ggml.h,
+// [TAG_GGML_PREC]; slot 0 the accumulator, 3 the activation) or the op hint (slot 1). The slot
+// is written directly rather than through ggml_prec_set_*, which ggml before 0.25 lacks, so the
+// case builds against every host this backend supports.
+static bool mm_declared(ggml_backend_dev_t dev, int K, int N, int M, ggml_type wt,
+                        int slot, int32_t value) {
+    ggml_init_params ip = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * W = ggml_new_tensor_2d(ctx, wt, K, N);
+    ggml_tensor * X = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * dst = ggml_mul_mat(ctx, W, X);
+    ((int32_t *) dst->op_params)[slot] = value;
     bool ok = ggml_backend_dev_supports_op(dev, dst);
     ggml_free(ctx);
     return ok;
@@ -89,7 +107,8 @@ static bool mm_offloaded(ggml_backend_dev_t dev, int K, int N, int M) {
 // ALiBi off. (The V/mask-extent guards in supports_op defend against malformed graphs
 // the public constructor can't build, so they aren't reachable from here.)
 static bool fa_supported(ggml_backend_dev_t dev, int head_dim, int n_tokens, int n_head,
-                         int n_kv, int n_kv_heads, ggml_type kv_t, float max_bias) {
+                         int n_kv, int n_kv_heads, ggml_type kv_t, float max_bias,
+                         int32_t acc = 0) {
     ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), NULL, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_tokens, n_head, 1);
@@ -98,6 +117,7 @@ static bool fa_supported(ggml_backend_dev_t dev, int head_dim, int n_tokens, int
     const int n_tok_pad = ((n_tokens + 31) / 32) * 32;             // mask rows padded (>= n_tokens)
     ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tok_pad);
     ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f, max_bias, 0.0f);
+    if (acc) ((int32_t *) dst->op_params)[3] = acc;   // the accumulator declaration's slot
     bool ok = ggml_backend_dev_supports_op(dev, dst);
     ggml_free(ctx);
     return ok;
@@ -108,7 +128,8 @@ static bool fa_supported(ggml_backend_dev_t dev, int head_dim, int n_tokens, int
 // residency pre-flight keys its ledger on the weight's name, and an unnamed stack has no
 // identity the resident expert cache could hold it under.
 static bool moe_supported(ggml_backend_dev_t dev, int K, int N, int n_expert, int n_tokens,
-                          ggml_type wt, const char * name, int n_used_in = 4) {
+                          ggml_type wt, const char * name, int n_used_in = 4,
+                          int32_t src1_prec = 0) {
     const int n_used = n_used_in;
     ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), NULL, true };
     ggml_context * ctx = ggml_init(ip);
@@ -117,6 +138,7 @@ static bool moe_supported(ggml_backend_dev_t dev, int K, int N, int n_expert, in
     ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
     ggml_tensor * dst = ggml_mul_mat_id(ctx, as, b, ids);
+    if (src1_prec) ((int32_t *) dst->op_params)[3] = src1_prec;   // the activation's slot
     bool ok = ggml_backend_dev_supports_op(dev, dst);
     ggml_free(ctx);
     return ok;
@@ -159,6 +181,15 @@ static int moe_child(const char * moe, const char * budget_mb) {
 
     if (!moe) {   // AUTO — the default
         printf("  -- ROCKET_MOE unset (AUTO) --\n");
+        // A declared activation precision the route cannot meet. These come first because a
+        // decline charges nothing to the pre-flight's ledger, and the accept right after them,
+        // the same stack shape and type with nothing declared, is what makes them non-vacuous.
+        // F32 is what llama.cpp declares on Mistral4's routed down-projection. F16 is declined
+        // too, because the native route quantizes a quantized expert's activation to int8.
+        CHECK( !moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_Q8_0, "blk.20.ffn_down_exps.weight", 4, 10),
+               "MoE: Q8_0 experts, src1 F32 declared -> CPU (Mistral4's down_exps)" );
+        CHECK( !moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_Q8_0, "blk.21.ffn_down_exps.weight", 4, 20),
+               "MoE: Q8_0 experts, src1 F16 declared -> CPU (the native route is int8)" );
         // A quantized expert stack that fits: the native-quant route, which is the only MoE
         // route measured to WIN. RK3576 declines it -- there is no encoder for this
         // datapath on that part, so claiming it would hand the scheduler host-reference work.
@@ -239,6 +270,12 @@ static int moe_child(const char * moe, const char * budget_mb) {
                 : "MoE: F16 experts, ROCKET_MOE=1  -> offload (the streaming A/B arm)" );
     CHECK( !moe_supported(dev, EK, EN, NE, 1, GGML_TYPE_Q8_0, "blk.1.ffn_gate_exps.weight"),
            "MoE: n_tokens=1, ROCKET_MOE=1   -> CPU (the prefill floor still holds)" );
+    // An F16 stack takes the fp16 streaming route, so it meets an F16 declaration and not F32.
+    CHECK( moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_F16, "blk.2.ffn_down_exps.weight", 4, 20) == !rk76,
+           rk76 ? "MoE: F16 experts, src1 F16 declared -> CPU (rk3576)"
+                : "MoE: F16 experts, src1 F16 declared -> offload (the fp16 route meets it)" );
+    CHECK( !moe_supported(dev, EK, EN, NE, NT, GGML_TYPE_F16, "blk.3.ffn_down_exps.weight", 4, 10),
+           "MoE: F16 experts, src1 F32 declared -> CPU" );
     return fails;
 }
 
@@ -346,6 +383,31 @@ static int run_moe_child(int (*fn)(void)) {
     if (!WIFEXITED(st)) { printf("  [FAIL] MoE placement child did not exit cleanly\n"); return 1; }
     return WEXITSTATUS(st);
 }
+// ROCKET_INT8 / ROCKET_INT4 quantize an F16/F32 weight's activation, so under them a declared
+// activation rank is met only down to Q8 / Q4. RK3588 only: the RK3576 has run with ROCKET_INT8
+// set from the start of main, and its cases there already cover a Q8 route.
+static int prec_quant_child(const char * knob) {
+    setenv(knob, "1", 1);
+    ggml_backend_reg_t reg = ggml_backend_rocket_reg();
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+    int fails = 0;
+    const bool i4 = strcmp(knob, "ROCKET_INT4") == 0;
+    printf("  -- %s=1, precision declarations --\n", knob);
+    CHECK( !mm_declared(dev, 256, 128, 256, GGML_TYPE_F16, 3, 20),
+           i4 ? "src1 F16 declared, INT4 -> CPU" : "src1 F16 declared, INT8 -> CPU" );
+    CHECK(  mm_declared(dev, 256, 128, 256, GGML_TYPE_F16, 3, 30) == !i4,
+           i4 ? "src1 Q8 declared,  INT4 -> CPU (the route is 4-bit)"
+              : "src1 Q8 declared,  INT8 -> offload" );
+    CHECK(  mm_declared(dev, 256, 128, 256, GGML_TYPE_F16, 3, 40),
+           i4 ? "src1 Q4 declared,  INT4 -> offload" : "src1 Q4 declared,  INT8 -> offload" );
+    // A GGUF-quantized weight takes the dequant->fp16 route under either knob.
+    CHECK(  mm_declared(dev, 256, 128, 512, GGML_TYPE_Q8_0, 3, 20),
+           "Q8_0 weight, src1 F16 declared -> offload (dequant->fp16, not the quantizing route)" );
+    return fails;
+}
+static int prec_int8_child(void) { return prec_quant_child("ROCKET_INT8"); }
+static int prec_int4_child(void) { return prec_quant_child("ROCKET_INT4"); }
+
 static int moe_auto_child(void)   { return moe_child(nullptr, nullptr); }
 static int moe_off_child(void)    { return moe_child("0", nullptr); }
 static int moe_forced_child(void) { return moe_child("1", nullptr); }
@@ -366,6 +428,13 @@ int main() {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
 
     int fails = 0;
+    // The int8 / int4 precision children go FIRST: the knobs they set are cached on first read,
+    // and a fork inherits the parent's cache, so they must run before this process asks
+    // supports_op about any declared activation precision.
+    if (!rk76) {
+        fails += run_moe_child(prec_int8_child);
+        fails += run_moe_child(prec_int4_child);
+    }
     const int K = 256, N = 128, M = 256;   // valid F16/F32 shape (floor = rocket_min_m, default 4)
     const int Mq = 512;                    // quantized floor = rocket_min_m_quant (default 512)
 
@@ -423,6 +492,23 @@ int main() {
     CHECK(  mm_offloaded(dev, K, N, M), "offload_op: valid GEMM   -> offload" );
     CHECK( !add_offloaded(dev, K, M),   "offload_op: GGML_OP_ADD  -> CPU" );
 
+    // THE PRECISION CONTRACT (ggml.h, [TAG_GGML_PREC]; see rocket_prec_declines). Each case is
+    // the canonical accepted F16 GEMM above with ONE declaration added, so a decline here is the
+    // declaration's. Values: F32 10, BF16 15, F16 20, Q8 30, Q4 40.
+    CHECK( !mm_declared(dev, K, N, M, GGML_TYPE_F16, 0, 10), "acc F32 declared   -> CPU (no route writes an fp32 result)" );
+    CHECK( !mm_declared(dev, K, N, M, GGML_TYPE_F16, 0, 15), "acc BF16 declared  -> CPU" );
+    CHECK(  mm_declared(dev, K, N, M, GGML_TYPE_F16, 0, 20), "acc F16 declared   -> offload" );
+    CHECK( !mm_declared(dev, K, N, M, GGML_TYPE_F16, 3, 10), "src1 F32 declared  -> CPU (the activation is converted)" );
+    CHECK( !mm_declared(dev, K, N, M, GGML_TYPE_F16, 3, 15), "src1 BF16 declared -> CPU" );
+    CHECK(  mm_declared(dev, K, N, M, GGML_TYPE_F16, 3, 20) == !rk76,
+           rk76 ? "src1 F16 declared  -> CPU (rk3576 quantizes it to int8)"
+                : "src1 F16 declared  -> offload (the fp16 route meets it)" );
+    CHECK(  mm_declared(dev, K, N, M, GGML_TYPE_F16, 3, 30), "src1 Q8 declared   -> offload" );
+    // The Hadamard hint, at the rotation's own shape (n = head_dim = 128, an F32 leaf): the
+    // untagged shape offloads, the tagged one stays with the CPU's fast Walsh-Hadamard transform.
+    CHECK(  mm_supported(dev, 128, 128, M, GGML_TYPE_F32),        "128x128 F32 leaf            -> offload" );
+    CHECK( !mm_declared(dev, 128, 128, M, GGML_TYPE_F32, 1, 1),   "same, SRC0_IS_HADAMARD hint -> CPU" );
+
     // FLASH_ATTN_EXT placement (the LLM-prefill attention offload, default-on). FA has no
     // weight src, so the scheduler never consults offload_op for it -- it reaches the NPU
     // via supports_op + the expand passes (see ggml_backend_rocket_device_offload_op). So
@@ -435,6 +521,11 @@ int main() {
     CHECK(  fa_supported(dev, HD, 256, NH, 1024, NKVH, GGML_TYPE_F16, 0.0f) == !rk76,
             rk76 ? "FA: F16 KV                                -> CPU (no fp16 attention encoder on rk3576)"
                  : "FA: F16 KV, n_tokens>=min_t, n_kv>=min_kv -> offload" );
+    // llama.cpp declares an F32 accumulator on EVERY FA op; the gate reads it and does not
+    // enforce it (see supports_op), so the declared op places exactly as the undeclared one.
+    CHECK(  fa_supported(dev, HD, 256, NH, 1024, NKVH, GGML_TYPE_F16, 0.0f, 10) == !rk76,
+            rk76 ? "FA: acc F32 declared                      -> CPU (rk3576)"
+                 : "FA: acc F32 declared                      -> offload (read, not enforced)" );
     CHECK( !fa_supported(dev, HD,   1, NH, 1024, NKVH, GGML_TYPE_F16, 0.0f),
             "FA: decode (n_tokens=1 < min_t)           -> CPU" );
     CHECK( !fa_supported(dev, HD, 256, NH,  512, NKVH, GGML_TYPE_F16, 0.0f),

@@ -2,10 +2,10 @@
 
 ## AI disclosure
 
-Except for the prior work it builds on, ggml-rocket was developed by AI, primarily Claude Code
-(Opus 4.8). Human involvement was mostly limited to setting project goals and providing hardware
-access. This is a side project for curiosity's sake, and it comes with no guarantee of quality,
-accuracy, or update frequency.
+Except for the prior work it builds on, ggml-rocket was developed by AI, primarily Claude. Human
+involvement was mostly limited to setting project goals and providing hardware access. This is a
+side project for curiosity's sake, and it comes with no guarantee of quality, accuracy, or update
+frequency.
 
 ## About ggml-rocket
 
@@ -44,7 +44,9 @@ with model size. Decode is forced to the CPU. It is bandwidth-bound and scales w
 rather than the backend.
 
 All figures warm, RK3588 @ 600 MHz, same GGUF on NPU and CPU. NPU prefill is perplexity-faithful
-to the CPU on every model. [HW sweep]
+to the CPU on every model. [HW sweep] The four quantized rows are against a CPU with llama.cpp's
+weight repack on (llama.cpp b11242, `-b 2048 -ub 2048`, governor pinned, 2026-09-29). The repack
+does not touch F16.
 
 | Model | Params | Prefill NPU @pp2048 (xCPU) | Decode Q4 t/s | Fits Q4 |
 |---|---:|---:|---:|---:|
@@ -55,13 +57,13 @@ to the CPU on every model. [HW sweep]
 | Ministral-3-8B | 8.5B | 21.4 F16 (3.1x) | 3.8 | 4.8 GB |
 | Qwen3.5-9B | 9.0B | 24.9 F16 (3.5x) | 3.6 | 5.3 GB |
 | Gemma-4-12B | 11.9B | 15.0 F16 (3.2x) | 2.5 | 6.9 GB |
-| Phi-4 (14B) | 14.7B | 11.8 Q4 (3.5x) | 2.2 | 8.3 GB |
-| DeepSeek-V2-Lite (MoE+MLA) | 15.7B | 23.9 Q4 (1.26x) | 7.8 | 9.7 GB |
-| gpt-oss-20b (MoE) | 20.9B | 13.1 MXFP4 (1.04x) | 7.2 | 11.3 GB |
-| Qwen3.6-27B (hybrid) | 27.3B | 7.8 Q4 (4.4x) | 1.1 | 15.9 GB |
+| Phi-4 (14B) | 14.7B | 16.7 Q4 (3.1x) | 2.2 | 8.3 GB |
+| DeepSeek-V2-Lite (MoE+MLA) | 15.7B | 34.1 Q4 (1.44x) | 7.8 | 9.7 GB |
+| gpt-oss-20b (MoE) | 20.9B | 30.2 MXFP4 (1.90x) | 7.2 | 11.3 GB |
+| Qwen3.6-27B (hybrid) | 27.3B | 9.6 Q4 (3.2x) | 1.1 | 15.9 GB |
 
-Where the ratio is small, the architecture keeps most prefill FLOPs off the NPU. The MoE expert
-FFNs of gpt-oss (1.04x) and DeepSeek (1.26x) stay on the CPU by default.
+The MoE rows are smaller because a MoE keeps more of its prefill on the CPU: the router, the
+attention path and the expert gathers. The experts themselves run on the NPU by default.
 
 Speech models are a separate case, because the NPU offloads the **encoder**. The Whisper encoder
 wins 1.18x to 2.14x by model size.
@@ -117,12 +119,17 @@ The backend offloads the ops that dominate prefill and leaves the rest on the CP
   [HW sweep, F16, 600 MHz]
 - **`MUL_MAT_ID`**: MoE routed experts, on the NPU by default for a **quantized** expert stack
   meeting two conditions. A residency pre-flight must reserve the whole `[K, N, n_expert]` stack
-  up front, and the per-expert GEMM must pay for its own dispatch. Worth **~2.4x the CPU** at
-  pp2048 on gpt-oss-20b. A stack that does not qualify is left on the CPU rather than
+  up front, and the per-expert GEMM must pay for its own dispatch. Worth **1.9x the CPU** at
+  pp2048 on gpt-oss-20b, against a CPU with its weight repack on. A stack that does not qualify is left on the CPU rather than
   half-ingested, so the default never falls below the experts-on-CPU baseline.
 - **Opt-in datapaths**: native int8 (`ROCKET_INT8=1`), int4 (`ROCKET_INT4=1`), and bf16
   (`ROCKET_BF16=1`). Each is numerically faithful, and the [knob table](API.md#runtime-knobs) has
   the detail.
+- **Precision declarations**: a matmul whose model declares a precision the backend cannot meet
+  stays on the CPU. llama.cpp declares an F32 activation on Mistral-4's routed down-projection and
+  an F32 result on some GLM-4 projections. A matmul tagged as a Hadamard rotation, which llama.cpp
+  builds around a quantized KV cache, also stays on the CPU. The rules are in
+  [API.md](API.md#precision-declarations).
 - **Everything else** stays on the CPU: norms, rope, the conv front-end and decode. The
   `rocket-userspace` driver composes the offloaded matmuls into a full Whisper and transformer
   encoder block on the NPU. That is cos = 1.000000 against an fp64 oracle. This backend wires that
@@ -136,9 +143,10 @@ The envelope, all HW-validated on the RK3588 and PPL-faithful to the CPU backend
   Resident matmul is ~460 GOP/s across precisions, DMA/dispatch-bound rather than MAC-bound. A
   quantized GGUF wants `-b 2048 -ub 2048`. That is bottleneck-conditional rather than a permanent
   property, and [API.md](API.md#why-quantization-does-not-speed-prefill) has the detail.
-- **MoE routed experts are worth ~2.4x the CPU at pp2048** on gpt-oss-20b, MXFP4,
-  `-b 2048 -ub 2048`. It is ~1.8x at pp512, so it wins at every prefill length, and ~1.6x to 1.7x
-  over experts-on-CPU at the llama.cpp default `-ub 512`.
+- **MoE routed experts are worth 1.9x the CPU at pp2048** on gpt-oss-20b, MXFP4,
+  `-b 2048 -ub 2048`, against a CPU with its weight repack on. Against an unrepacked CPU it read
+  ~1.8x at pp512, winning at every prefill length, and ~1.6x to 1.7x over experts-on-CPU at the
+  llama.cpp default `-ub 512`.
 
   The lever is **residency rather than quantization**. A quantized expert on the naive route is
   dequantized on the host *every micro-batch*. That decode does not shrink with the row count, so
@@ -343,19 +351,22 @@ A BF16 GGUF also prefills on the NPU, with weights decoded to fp16 on the fly at
 Convert with `llama-quantize in.gguf out.gguf f16` for full speed, or set `ROCKET_BF16=1` for the
 fp32-output datapath.
 
-> **Quantized GGUFs need `-DGGML_CPU_REPACK=OFF` on the host build.** ggml-cpu repacks quantized
-> weights into a non-host `CPU_REPACK` buffer for its own SIMD kernels, on by default. The
-> scheduler only hands an op to this backend when the weight sits in a host buffer. Building with
-> `-DGGML_CPU_REPACK=OFF` keeps quantized weights in a host (`CPU_Mapped`) buffer so they reach the
-> NPU. F16 weights are never repacked. Confirm offload with `ROCKET_MM_PROFILE=1` or
-> `ROCKET_DEBUG_GRAPH=1`.
+> **A quantized GGUF needs the host's weight repack off: pass `-nr` (`--no-repack`), or
+> `--repack 0` to `llama-bench`.** Without it the quantized weights stay on the CPU and nothing
+> says so.
+>
+> ggml-cpu repacks quantized weights into a non-host `CPU_REPACK` buffer for its own SIMD
+> kernels, on by default. The scheduler only hands an op to this backend when the weight sits in a
+> host buffer. A host built `-DGGML_CPU_REPACK=OFF` works too, but for every run. That takes the
+> repack away from a CPU-only run as well, where it is worth 1.3-1.7x on quantized prefill. F16
+> weights are never repacked. Confirm offload with `ROCKET_MM_PROFILE=1` or `ROCKET_DEBUG_GRAPH=1`.
 
 ```sh
-# 1. latest llama.cpp, shared + DL-capable ggml. Add -DGGML_CPU_REPACK=OFF if you will
-#    run a QUANTIZED GGUF on the NPU (keeps quant weights in a host buffer; see note above).
+# 1. latest llama.cpp, shared + DL-capable ggml. The weight repack stays on; pass -nr to a
+#    run of a QUANTIZED GGUF on the NPU (see the note above).
 cd <workspace>     # the dir holding ggml-rocket/
 git clone https://github.com/ggml-org/llama.cpp
-cmake -S llama.cpp -B llama.cpp/build -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON -DGGML_CPU_REPACK=OFF
+cmake -S llama.cpp -B llama.cpp/build -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON
 cmake --build llama.cpp/build -j
 
 # 2. libggml-rocket.so against llama.cpp's BUNDLED ggml
@@ -403,10 +414,15 @@ The host's `ggml-backend-impl.h` can carry a different `GGML_BACKEND_API_VERSION
 field layout than the ggml this backend was compiled against. The positional vtable then drifts,
 and the device silently fails to register.
 
+The same mismatch can also shift ggml's op numbering, which the API version does not track. The
+backend checks the numbering when it loads and refuses to register, and the host's log then
+shows `ggml-rocket: op ordinal N is X in this .so and Y in the host's ggml` followed by
+`ggml_backend_init returned NULL`.
+
 The fix is to rebuild against that host checkout's ggml headers, and to re-check on every ggml
 bump. This backend targets `GGML_BACKEND_API_VERSION 2`, with the device vtable that includes the
-`set_tensor_2d_async` and `get_tensor_2d_async` slots, verified against the in-repo `ggml/` tagged
-v0.14.0.
+`set_tensor_2d_async` and `get_tensor_2d_async` slots. It builds against ggml 0.14.0 through
+0.25.3, the ggml of whisper.cpp 1.8.6 and 1.9.4 and of llama.cpp b10558 and b11242.
 
 If the device appears but runs zero matmuls, the backend was built without a working `offload_op`.
 See [implementation notes](API.md#implementation-notes).

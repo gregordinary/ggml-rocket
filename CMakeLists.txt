@@ -176,6 +176,15 @@ else()
     add_test(NAME test-rocket-matmul COMMAND test-rocket-matmul)
     set_tests_properties(test-rocket-matmul PROPERTIES SKIP_RETURN_CODE 77)  # no NPU -> SKIP
 
+    # FLASH_ATTN_EXT against the CPU backend, including a raw q.k past fp16's range that the
+    # scale folded into Q keeps on the surface (ROCKET_FA_QSCALE).
+    add_executable(test-rocket-fa test-rocket-fa.cpp)
+    target_include_directories(test-rocket-fa PRIVATE ${GGML_DIR}/include)
+    target_link_libraries(test-rocket-fa PRIVATE ggml-rocket ggml ggml-cpu)
+    target_compile_options(test-rocket-fa PRIVATE -Wall -Wextra)
+    add_test(NAME test-rocket-fa COMMAND test-rocket-fa)
+    set_tests_properties(test-rocket-fa PROPERTIES SKIP_RETURN_CODE 77)  # no NPU -> SKIP
+
     # MoE MUL_MAT_ID (routed-expert FFN) handler vs the CPU backend: both b-forms,
     # balanced/imbalanced routing, pad rows, and the F16 / MXFP4 / Q4_K weight paths.
     add_executable(test-rocket-moe test-rocket-moe.cpp)

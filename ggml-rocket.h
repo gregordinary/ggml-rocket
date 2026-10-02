@@ -51,15 +51,17 @@ GGML_BACKEND_API void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, 
 GGML_BACKEND_API void ggml_backend_rocket_moe_stats(ggml_backend_t backend,
                                                     long * n_resident, long * n_streamed);
 
-/* What computed the MUL_MATs, for a gate to assert rather than infer. A failed NPU job
+/* What computed the MUL_MATs and the attention ops, for a gate to assert rather than infer. A failed NPU job
  * degrades that slice (or that MoE expert) to a CPU matmul in fp64, which is exactly how
  * a gate builds its golden answer, so a gate reading only the numbers passes on a device
  * that computed nothing.
  *
  * ggml_backend_rocket_route_ops() returns the MUL_MAT ops the named route finished: "mt"
  * (the per-call fp16 path), "prepacked", "prepacked-q", "bf16", "int8", "int8r", "i8-76"
- * (the RK3576 W8A8 route), "int4", "int4r", "fused", "fused-resident", and "moe" for a
- * MUL_MAT_ID the expert handler took. A NULL route returns the total. An "mt" or "moe" op
+ * (the RK3576 W8A8 route), "int4", "int4r", "fused", "fused-resident", "moe" for a
+ * MUL_MAT_ID the expert handler took, and "fa" for a FLASH_ATTN_EXT the NPU computed (one
+ * that fell to the host reference counts in the fallbacks instead). A NULL route returns
+ * the total. An "mt" or "moe" op
  * counts once however many of its slices or experts fell back, so a gate reads
  * ggml_backend_rocket_cpu_fallbacks() beside it: the slices and MoE experts computed on the
  * CPU. The ROCKET_MOE_COSINE probe's CPU reference is not one. Both counts are cumulative

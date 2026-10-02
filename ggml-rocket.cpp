@@ -946,6 +946,14 @@ static bool rocket_int8_mode_on(void) {
     if (v < 0) v = rocket_knob_on("ROCKET_INT8", false);
     return v > 0;
 }
+// ROCKET_INT4, read without a context handle, for the same reason: the precision gate in
+// supports_op must know whether an F16/F32 weight's activation can be quantized to 4 bits.
+// ctx->int4_mode is the same knob and stays the one the dispatch reads.
+static bool rocket_int4_mode_on(void) {
+    static int v = -1;
+    if (v < 0) v = rocket_knob_on("ROCKET_INT4", false);
+    return v > 0;
+}
 
 static bool rocket_quant_resident_on(void) {
     static int v = -1;
@@ -1045,6 +1053,19 @@ static int rocket_fa_threads(void) {
     static int v = -1;
     if (v < 0) { v = rocket_knob_int("ROCKET_FA_THREADS", 1); if (v < 1) v = 1; }
     return v;
+}
+// ROCKET_FA_QSCALE (default 1): fold the op's scale into Q as the handler converts Q to fp16,
+// and hand the driver a scale of 1. The QK contraction accumulates in fp32 on the NPU but
+// writes an fp16 score surface, so a RAW q.k past 65504 overflows there, where llama.cpp's F32
+// declaration says it must not; folded, the surface carries scale*q.k and overflows only past
+// 65504/scale (8x at head_dim 64, 16x at 256). The score is the same function either way,
+// softcap*tanh(scale*q.k/softcap) + mask, and Q takes one fp16 rounding either way.
+// test-rocket-fa carries a case whose raw q.k runs 60000-135000. =0 restores the unscaled
+// surface.
+static bool rocket_fa_qscale_on(void) {
+    static int v = -1;
+    if (v < 0) v = rocket_knob_int("ROCKET_FA_QSCALE", 1) != 0;
+    return v != 0;
 }
 // ROCKET_FLASH_ATTN_NO_CTX=1 forces the per-call mt path (fresh worker fds + per-call score
 // scratch every call) instead of the persistent FA context. The persistent context is the
@@ -1180,6 +1201,18 @@ static void rocket_fatiming_dump(void) {
 // wrong every time on some shape, or any op wrong occasionally -- look identical from it.
 // Level 2 records a hash per op with the shape beside it, so two runs diff to the op index.
 // Level 1 is unchanged and stays the cheap gate.
+//
+// ROCKET_FA_CHECKSUM=3 ALSO HASHES WHAT THE OP READ. Once two runs disagree at one op, the next
+// question is whether that op's inputs already differed -- an upstream op wrote a different Q, K,
+// V or mask -- or the handler turned the same inputs into a different output. Level 3 adds the
+// FNV-1a of the four dense fp16 tiles the driver is handed (Qd, Kd, Vd, Md), after the gather and
+// hashed after the scatter so the timing buckets never see it. Equal input hashes with a different
+// output hash put the difference inside the handler and the device; a different input hash puts
+// it upstream. The level-2 line gains four fields, so a level-2 parser still reads its prefix.
+//
+// ROCKET_FA_DUMP_OP=N (with ROCKET_FA_DUMP_DIR, default /tmp) writes op N's dense tiles and its
+// fp16 output to five raw files, so two runs that disagree at N can be compared value by value.
+// Op N counts offloaded ops from 0, as the level-2 lines do.
 static int rocket_facheck_level(void) {
     static int v = -1;
     if (v < 0) { const char * e = getenv("ROCKET_FA_CHECKSUM"); v = e ? atoi(e) : 0; if (v < 0) v = 0; }
@@ -1198,7 +1231,7 @@ static int g_facheck_armed = 0;
 // One entry per offloaded op at level 2. The handler runs on the ggml dispatch thread and a
 // graph's ops are computed one at a time, so this needs no lock -- the same assumption the
 // running hash above already makes.
-struct rocket_facheck_op { uint64_t h; int n_tokens, n_head, n_kv; size_t bytes; };
+struct rocket_facheck_op { uint64_t h; int n_tokens, n_head, n_kv; size_t bytes; uint64_t hq, hk, hv, hm; };
 static std::vector<rocket_facheck_op> g_facheck_ops;
 static void rocket_facheck_dump(void) {
     if (!g_facheck.calls) return;
@@ -1206,9 +1239,38 @@ static void rocket_facheck_dump(void) {
                   (unsigned long long)g_facheck.h, g_facheck.calls, g_facheck.bytes);
     for (size_t i = 0; i < g_facheck_ops.size(); i++) {
         const rocket_facheck_op & o = g_facheck_ops[i];
-        GGML_LOG_INFO("ROCKET FA op %04zu: %016llx n_tokens=%d n_head=%d n_kv=%d bytes=%zu\n",
-                      i, (unsigned long long)o.h, o.n_tokens, o.n_head, o.n_kv, o.bytes);
+        if (rocket_facheck_level() >= 3)
+            GGML_LOG_INFO("ROCKET FA op %04zu: %016llx n_tokens=%d n_head=%d n_kv=%d bytes=%zu "
+                          "q=%016llx k=%016llx v=%016llx m=%016llx\n",
+                          i, (unsigned long long)o.h, o.n_tokens, o.n_head, o.n_kv, o.bytes,
+                          (unsigned long long)o.hq, (unsigned long long)o.hk,
+                          (unsigned long long)o.hv, (unsigned long long)o.hm);
+        else
+            GGML_LOG_INFO("ROCKET FA op %04zu: %016llx n_tokens=%d n_head=%d n_kv=%d bytes=%zu\n",
+                          i, (unsigned long long)o.h, o.n_tokens, o.n_head, o.n_kv, o.bytes);
     }
+}
+static uint64_t rocket_fnv1a(const void * data, size_t nbytes) {
+    const unsigned char * p = (const unsigned char *)data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < nbytes; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+// Inputs of the op being checked, set by the handler just before rocket_facheck_add at level 3.
+static uint64_t g_facheck_in[4];
+static void rocket_fadump_write(const char * dir, long op, const char * tag, const void * data, size_t n) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/fa_op%04ld_pid%d_%s.f16", dir, op, (int)getpid(), tag);
+    FILE * f = fopen(path, "wb");
+    if (!f) { GGML_LOG_WARN("rocket FA dump: cannot write %s\n", path); return; }
+    if (n && fwrite(data, 1, n, f) != n) GGML_LOG_WARN("rocket FA dump: short write %s\n", path);
+    fclose(f);
+}
+// ROCKET_FA_DUMP_OP: the offloaded-op index to dump, or -1.
+static long rocket_fadump_op(void) {
+    static long v = -2;
+    if (v == -2) { const char * e = getenv("ROCKET_FA_DUMP_OP"); v = e ? atol(e) : -1; }
+    return v;
 }
 static void rocket_facheck_add(const void * data, size_t nbytes, int n_tokens, int n_head, int n_kv) {
     if (!g_facheck_armed) { atexit(rocket_facheck_dump); g_facheck_armed = 1; }
@@ -1222,7 +1284,9 @@ static void rocket_facheck_add(const void * data, size_t nbytes, int n_tokens, i
         ho ^= p[i]; ho *= 0x100000001b3ULL;
     }
     g_facheck.h = h; g_facheck.calls++; g_facheck.bytes += nbytes;
-    if (rocket_facheck_level() >= 2) g_facheck_ops.push_back({ ho, n_tokens, n_head, n_kv, nbytes });
+    if (rocket_facheck_level() >= 2)
+        g_facheck_ops.push_back({ ho, n_tokens, n_head, n_kv, nbytes,
+                                  g_facheck_in[0], g_facheck_in[1], g_facheck_in[2], g_facheck_in[3] });
 }
 static void rocket_fatiming_add(double gather_ms, double compute_ms, double scatter_ms, int n_kv) {
     if (!g_fatiming_armed) { atexit(rocket_fatiming_dump); g_fatiming_armed = 1; }
@@ -2182,42 +2246,33 @@ static int rk76_rotate(float * row, int K) {
 // THE K SPLIT. Which contraction depths go to the part in one piece, and how the rest are
 // cut.
 //
-// Two separate things put a K out of reach of one device call:
+// One thing puts a K out of reach of one device call: the library refuses K >= 6176 —
+// past there its single-task planner cannot fit an output tile — and the int32 K-split
+// route that would run it wedges the part until it is rebooted, so that is not a route a
+// frontend takes.
 //
-//   1. the library refuses K >= 6176 — past there its single-task planner cannot fit an
-//      output tile — and the int32 K-split route that would run it wedges the part until
-//      it is rebooted, so that is not a route a frontend takes;
-//   2. a set of K at which an int8 matmul job raises no completion at all. The submit is
-//      retired by the driver's 125 ms backstop, the surface is untouched, and the write
-//      guard's redo (after a power-domain cycle) succeeds — so the result is CORRECT and
-//      40-480x slower: 1028 ms at K=2240 against 24.6 ms at K=2304 on the same plan.
-//      Mechanism unknown.
-//      [HW sweep, M=512 N=1536, H96 MAX M9, rocket 1.6.0, 2026-08-11]
-//
-// The stall set below is what that sweep MEASURED, at one (M, N), on a step of 128 above
-// 2304 — so it is a list of known-bad points and emphatically not a boundary. Steering off
-// it is an optimization, not a correctness guard: a chunk that stalls anyway still returns
-// the right answer, just slowly.
-static bool rk76_k_stalls(int K) {
-    static const int s[] = { 2208, 2240, 2272, 2432, 4416, 4448, 4480, 4512, 4544 };
-    for (size_t i = 0; i < sizeof(s)/sizeof(s[0]); i++) if (s[i] == K) return true;
-    return false;
-}
+// The K at which an int8 matmul job used to stall at a fixed output channel (320 at
+// K=2240) are NOT a frontend concern. Where a job stops is a rule on the weight slice and
+// the CBUF allowance the task's rows select, and the library plans every tile and row
+// window clear of it (rocket_rk3576_weight_phase_groups()), so the entry computes those K
+// at the clean neighbour's cost: 23-30 ms at M=512 N=1536 for K 2144-2528 against K=2304's
+// 24-27, with no retirement. A frontend list of them was a copy of a planner rule, and an
+// incomplete one (it lacked 2144, 2336-2400, 2464-2528, 4192, 4384 and 4576).
+// [HW sweep, H96 MAX M9, rocket 1.6.0, rocket-userspace tests/rk3576_retire_probe,
+// 2026-09-27]
 static bool rk76_k_single_ok(int K) {
-    return K > 0 && K % 32 == 0 && K < 6176 && rk76_rot_ok(K) && !rk76_k_stalls(K);
+    return K > 0 && K % 32 == 0 && K < 6176 && rk76_rot_ok(K);
 }
+
 // The chunk-size preference, largest first. Every entry satisfies rk76_k_single_ok(), and
 // 32 is on the list so the greedy walk always terminates EXACTLY: K%32==0 is a claim-time
 // gate, so every remainder is a multiple of 32 and the last entry covers it.
 //
-// 2304 and 2048 are the two that were measured clean, 48 submits and 0 redos, and greedy
-// returns 3*2304 + 2048 for the shape this exists for — Qwen2.5-1.5B's ffn_down at
-// K=8960. 1536 is a real model's own K, clean on the same run. The rest are UNMEASURED and
-// are the tail of a general K: a model whose chunking lands on them should have that chunk
-// timed (one process a cell, reading the profiler's redo count) before its numbers are
-// quoted, because the stall map's step leaves gaps a clean sample says nothing about.
-// ROCKET_RK3576_KCHUNK moves the head of this list so a candidate can be validated
-// without a rebuild.
+// Greedy returns 3*2304 + 2048 for the shape this exists for — Qwen2.5-1.5B's ffn_down at
+// K=8960 — and 2304 and 2048 were measured clean there, 48 submits and 0 redos; 1536 is a
+// real model's own K, clean on the same run. The rest are the tail of a general K and were
+// not timed as chunks. ROCKET_RK3576_KCHUNK moves the head of this list so a candidate can
+// be validated without a rebuild.
 static const int RK76_KCHUNK_PREF[] = { 2304, 2048, 1536, 1024, 512, 256, 128, 64, 32 };
 static const size_t RK76_KCHUNK_MAX = 16;   // a runaway guard; K=8960 takes 4
 
@@ -4981,6 +5036,9 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     memcpy(&softcap,  (const float *)dst->op_params + 2, sizeof(float));
     if (max_bias != 0.0f) return -1;            // ALiBi unsupported (rope models pass 0)
     // m == NULL is an unmasked (encoder) attention; the driver takes a NULL mask as such.
+    // The scale goes into Q below (ROCKET_FA_QSCALE), and the driver gets what is left of it.
+    const float q_scale     = (rocket_fa_qscale_on() && scale != 0.0f) ? scale : 1.0f;
+    const float score_scale = scale / q_scale;
 
     // Lazily create the persistent FA context (worker fds + resident scratch); if it can't
     // open its fds, fall through to the lazy single fa_fd (and, failing that, the host
@@ -5025,8 +5083,8 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
             const int h = (int)(r / n_tokens), t = (int)(r % n_tokens);
             ggml_fp16_t * dstrow = Qd + (size_t)r * head_dim;
             const char * src = qb + (size_t)t*q->nb[1] + (size_t)h*q->nb[2];
-            for (int c = 0; c < head_dim; c++)   // Q is F32
-                dstrow[c] = ggml_fp32_to_fp16(*(const float *)(src + (size_t)c*q->nb[0]));
+            for (int c = 0; c < head_dim; c++)   // Q is F32; the op's scale is folded in here
+                dstrow[c] = ggml_fp32_to_fp16(q_scale * *(const float *)(src + (size_t)c*q->nb[0]));
         }
     });
     // K: [n_kv_heads][n_kv][head_dim]. In the normal KV-cache view a row IS contiguous
@@ -5095,14 +5153,14 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     // create failed do we fall to the per-call _mt path (own fds, per-call scratch).
     int rc = ctx->fa_ctx
         ? rocket_flash_attn_fp16_ctx(ctx->fa_ctx, n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
-                                    scale, softcap,
+                                    score_scale, softcap,
                                     reinterpret_cast<const _Float16 *>(Qd),
                                     reinterpret_cast<const _Float16 *>(Kd),
                                     reinterpret_cast<const _Float16 *>(Vd),
                                     reinterpret_cast<const _Float16 *>(Md),
                                     reinterpret_cast<_Float16 *>(Od))
         : rocket_flash_attn_fp16_mt(use_fd, n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
-                                    scale, softcap,
+                                    score_scale, softcap,
                                     reinterpret_cast<const _Float16 *>(Qd),
                                     reinterpret_cast<const _Float16 *>(Kd),
                                     reinterpret_cast<const _Float16 *>(Vd),
@@ -5114,11 +5172,13 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     // are already gathered into exactly the dense fp16 tiles the host reference wants, and it
     // is the same reference rocket_flash_attn_fp16_mt itself falls back to when it has no fd,
     // so this is one slow-but-correct layer instead of a failed graph.
-    if (rc != 0) {
+    if (rc == 0) ctx->route_ops["fa"]++;
+    else {
+        ctx->n_cpu_fallbacks++;
         GGML_LOG_WARN("%s: NPU attention failed (rc=%d) at n_tokens=%d n_kv=%d -- this layer "
                       "falls back to the host reference\n", __func__, rc, n_tokens, n_kv);
         rocket_flash_attn_ref_fp16(n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads,
-                                   scale, softcap,
+                                   score_scale, softcap,
                                    reinterpret_cast<const _Float16 *>(Qd),
                                    reinterpret_cast<const _Float16 *>(Kd),
                                    reinterpret_cast<const _Float16 *>(Vd),
@@ -5144,7 +5204,31 @@ static int ggml_backend_rocket_flash_attn(ggml_backend_rocket_context * ctx, ggm
     if (fatiming) rocket_fatiming_add(t_g1 - t_g0, t_c1 - t_g1, rocket_now_ms() - t_c1, n_kv);
     // After the timing add, so hashing the surface is never charged to the scatter bucket it
     // would otherwise inflate.
-    if (rocket_facheck_on()) rocket_facheck_add(dst->data, ggml_nbytes(dst), n_tokens, n_head, n_kv);
+    if (rocket_facheck_on()) {
+        const size_t nq = (size_t)n_head * n_tokens * head_dim * sizeof(ggml_fp16_t);
+        const size_t nk = (size_t)n_kv_heads * n_kv * head_dim * sizeof(ggml_fp16_t);
+        const size_t nv = (size_t)n_kv_heads * dv * n_kv * sizeof(ggml_fp16_t);
+        const size_t nm = m ? (size_t)n_tokens * n_kv * sizeof(ggml_fp16_t) : 0;
+        const size_t no = (size_t)n_head * n_tokens * dv * sizeof(ggml_fp16_t);
+        if (rocket_facheck_level() >= 3) {
+            g_facheck_in[0] = rocket_fnv1a(Qd, nq);
+            g_facheck_in[1] = rocket_fnv1a(Kd, nk);
+            g_facheck_in[2] = rocket_fnv1a(Vd, nv);
+            g_facheck_in[3] = m ? rocket_fnv1a(Md, nm) : 0;
+        }
+        if (rocket_fadump_op() == g_facheck.calls) {
+            const char * dir = getenv("ROCKET_FA_DUMP_DIR");
+            if (!dir) dir = "/tmp";
+            rocket_fadump_write(dir, g_facheck.calls, "q", Qd, nq);
+            rocket_fadump_write(dir, g_facheck.calls, "k", Kd, nk);
+            rocket_fadump_write(dir, g_facheck.calls, "v", Vd, nv);
+            rocket_fadump_write(dir, g_facheck.calls, "m", Md, nm);
+            rocket_fadump_write(dir, g_facheck.calls, "o", Od, no);
+            GGML_LOG_INFO("ROCKET FA dump: op %ld n_tokens=%d n_head=%d n_kv=%d n_kv_heads=%d dk=%d dv=%d "
+                          "to %s\n", g_facheck.calls, n_tokens, n_head, n_kv, n_kv_heads, head_dim, dv, dir);
+        }
+        rocket_facheck_add(dst->data, ggml_nbytes(dst), n_tokens, n_head, n_kv);
+    }
     return 0;
 }
 
@@ -6501,18 +6585,30 @@ static void ggml_backend_rocket_device_get_memory(ggml_backend_dev_t dev, size_t
 static enum ggml_backend_dev_type ggml_backend_rocket_device_get_type(ggml_backend_dev_t dev) {
     (void)dev; return GGML_BACKEND_DEVICE_TYPE_ACCEL;
 }
+// caps.mmap_support arrived in ggml 0.25 with no API-version bump, so it cannot be a positional
+// initializer here; this sets it when the host's header has it and compiles to nothing when not.
+// True, because the weights are read in place from the host's own (mmapped) CPU buffers. llama.cpp
+// turns mmap off for a whole model when a device of it reports false, though today it asks only
+// its GPU devices and skips an ACCEL one.
+template <typename caps_t>
+static auto rocket_caps_set_mmap(caps_t & caps, int) -> decltype(caps.mmap_support = true, void()) {
+    caps.mmap_support = true;
+}
+template <typename caps_t>
+static void rocket_caps_set_mmap(caps_t &, long) {}
+
 static void ggml_backend_rocket_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
     props->name        = ggml_backend_rocket_device_get_name(dev);
     props->description  = ggml_backend_rocket_device_get_description(dev);
     props->type         = ggml_backend_rocket_device_get_type(dev);
     props->device_id    = nullptr;   // no PCI/UUID identity to report; the caller may not have zeroed it
     ggml_backend_rocket_device_get_memory(dev, &props->memory_free, &props->memory_total);
-    props->caps = {
-        /* .async                 = */ false,
-        /* .host_buffer           = */ false,
-        /* .buffer_from_host_ptr  = */ true,
-        /* .events                = */ false,
-    };
+    props->caps = {};
+    props->caps.async                = false;
+    props->caps.host_buffer          = false;
+    props->caps.buffer_from_host_ptr = true;
+    props->caps.events               = false;
+    rocket_caps_set_mmap(props->caps, 0);
 }
 static ggml_backend_t ggml_backend_rocket_device_init(ggml_backend_dev_t dev, const char * params) {
     (void)dev; (void)params; return ggml_backend_rocket_init();
@@ -6523,6 +6619,78 @@ static ggml_backend_buffer_type_t ggml_backend_rocket_device_get_buffer_type(ggm
 static ggml_backend_buffer_t ggml_backend_rocket_device_buffer_from_host_ptr(
         ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     (void)dev; (void)max_tensor_size; return ggml_backend_cpu_buffer_from_ptr(ptr, size);
+}
+
+// ggml's precision contract (ggml.h, [TAG_GGML_PREC]). A graph may declare, per op, the least
+// precision an implementation may use, and a backend that cannot meet a declaration has to
+// decline the op, so the scheduler places it where it can be met. The declarations live in
+// op_params:
+//
+//   MUL_MAT, MUL_MAT_ID  [0]  accumulator: the result must be accumulated at least this wide
+//   MUL_MAT, MUL_MAT_ID  [3]  src1: the activation may be converted to nothing below this rank
+//   MUL_MAT              [1]  hint: GGML_HINT_SRC0_IS_HADAMARD, src0 is a Walsh-Hadamard matrix
+//   FLASH_ATTN_EXT       [3]  accumulator
+//
+// The ranks, highest first, are F32 (10), BF16 (15), F16 (20), Q8 (30) and Q4 (40), and 0 means
+// nothing was declared. A larger value is a LOWER rank, so a route meets a declaration when its
+// own value is no larger. ggml before 0.25 names only 0 and F32, so the ranks are spelled here
+// to build against every host; on those hosts nothing writes the src1 slot and it reads 0.
+enum : int32_t {
+    RK_PREC_UNDECLARED = 0,
+    RK_PREC_F32        = 10,
+    RK_PREC_BF16       = 15,
+    RK_PREC_F16        = 20,
+    RK_PREC_Q8         = 30,
+    RK_PREC_Q4         = 40,
+};
+
+// The lowest rank a claimed MUL_MAT / MUL_MAT_ID can convert its activation to. It is the worst
+// route the op may take, not the likeliest, because every route falls back to the fp16 one on a
+// decline and the int8 / int4 routes are tried first: an op this gate accepts must be computable
+// at the declared rank whichever of them ends up running it.
+//   - the fp16 route converts src1 to fp16                                       -> F16
+//   - ROCKET_INT8 / ROCKET_INT4 quantize an F16/F32/BF16 weight's activation     -> Q8 / Q4
+//   - the RK3576's only route is W8A8                                            -> Q8
+//   - the native MoE route quantizes a GGUF-quantized expert's activation per
+//     (row, K-group) to int8                                                     -> Q8
+// ROCKET_BF16's route keeps src1 at bf16, and still falls back to fp16, so it adds nothing here.
+static int32_t rocket_src1_route_rank(const ggml_tensor * op) {
+    const bool a_quant = ggml_is_quantized(op->src[0]->type);
+    if (rocket_rk3576_selected()) return RK_PREC_Q8;
+    if (op->op == GGML_OP_MUL_MAT_ID) {
+        return (a_quant && rocket_moe_native_on()) ? RK_PREC_Q8 : RK_PREC_F16;
+    }
+    if (!a_quant && rocket_int4_mode_on()) return RK_PREC_Q4;
+    if (!a_quant && rocket_int8_mode_on()) return RK_PREC_Q8;
+    return RK_PREC_F16;
+}
+
+// Does this MUL_MAT / MUL_MAT_ID declare a precision no route here meets?
+//
+// THE ACCUMULATOR. F32 or BF16 is declined. No matmul route guarantees an fp32 result: the fp16
+// route writes an fp16 C and, with ROCKET_KACC on (its default), sums the K-partials in fp16 on
+// the DPU; the RK3576's W8A8 route writes int8 through a per-column requant; and the bf16, int8
+// and int4 routes, which do write fp32 or int32, fall back to the fp16 route on a decline. An
+// accumulator declared F16 is met by all of them.
+//
+// THE ACTIVATION. Declined when the declared rank is above rocket_src1_route_rank. llama.cpp
+// declares F32 for Mistral4's routed-expert down-projection, whose activation "can exceed F16
+// range"; the CUDA, Vulkan and WebGPU backends decline that op, and on an fp16 route its
+// overflow would reach the output as inf. A GGUF can also declare a rank per weight
+// (llama_prec_policy, from general.tensor_extra), so this is not specific to one model.
+//
+// THE HADAMARD HINT. Declined. The CPU backend evaluates a Hadamard-tagged matmul as a fast
+// Walsh-Hadamard transform, O(n log n) a row and exact in f32; here it would be a dense n x n
+// fp16 GEMM. llama.cpp tags the rotation it applies around a QUANTIZED KV cache (-ctk / -ctv
+// with a quantized type) and DeepSeek's lightning indexer; with an F16 cache it builds none.
+static bool rocket_prec_declines(const ggml_tensor * op) {
+    const int32_t acc = ggml_get_op_params_i32(op, 0);
+    if (acc != RK_PREC_UNDECLARED && acc < RK_PREC_F16) return true;
+    const int32_t src1 = ggml_get_op_params_i32(op, 3);
+    if (src1 != RK_PREC_UNDECLARED && src1 < rocket_src1_route_rank(op)) return true;
+    if (op->op == GGML_OP_MUL_MAT
+        && ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) return true;
+    return false;
 }
 
 static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
@@ -6552,6 +6720,7 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             // to the type's block size so each [K] row is a whole number of quant blocks
             // (K%32 below already covers Q8_0's block 32; K-quants use 256).
             const bool a_quant = ggml_is_quantized(a->type);
+            if (rocket_prec_declines(op)) return false;
             // On the RK3576 the W8A8 route is the ONLY matmul route: the RK3588 fp16
             // generators refuse on that part by construction, so an op accepted here and
             // then declined by the W8A8 entry does not fall back — it fails at compute
@@ -6620,6 +6789,8 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             const ggml_tensor * b  = op->src[1];
             const ggml_tensor * id = op->src[2];
             if (!a || !b || !id) return false;
+            // Before the residency pre-flight below, which charges its ledger on an accept.
+            if (rocket_prec_declines(op)) return false;
             const int64_t K = a->ne[0];
             const int64_t N = a->ne[1];
             const int64_t n_tokens = id->ne[1];
@@ -6823,6 +6994,18 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             // extra term in the denominator) — but do that only if the offload is a WIN on a
             // sink-carrying model, which on gpt-oss it is not.
             if (op->src[4]) return false;
+            // THE ACCUMULATOR DECLARATION (op_params[3]) IS READ AND NOT ENFORCED. llama.cpp
+            // declares F32 on every FLASH_ATTN_EXT it builds, whatever the model, and has since
+            // before this offload was validated; every FA measurement here (perplexity equal to
+            // the CPU's, the 1.25-1.50x long-context wins) was taken with it set. Enforcing it
+            // would retire the offload outright. What the route does against it: Q and K reach
+            // the NPU as fp16 with the scale already folded into Q (ROCKET_FA_QSCALE), the QK
+            // contraction accumulates in fp32 on the NPU and is written out as an fp16 surface
+            // of scale*q.k, and the soft-cap, mask and softmax then run in fp32 on the host. So
+            // what still overflows is a SCALED logit past 65504. test-rocket-fa scores a raw q.k
+            // of 60000-135000 exactly against a double reference, where the CPU backend on an
+            // ARMv8.2 build returns NaN: its fp16 dot product accumulates in fp16 and overflows
+            // at a RAW q.k past 65504, so that backend does not honor the declaration either.
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *)op->op_params + 1, sizeof(float));
             // head_dim (= DK) is the QK contraction dim; dv (= DV) the value/output dim.
@@ -6875,8 +7058,10 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
 // enabled (the GGML_CPU_REPACK build option, on by default), quantized weights are loaded
 // into a non-host "CPU_REPACK" buffer for the CPU's fast repacked kernels, so this returns
 // false for them and their prefill stays on the CPU. To prefill a quantized GGUF on the NPU
-// (dequant->fp16, see rocket_weight_to_fp16), build the host's ggml with GGML_CPU_REPACK=OFF
-// so the weights stay in a host (CPU_Mapped) buffer. F16 weights are never repacked.
+// (dequant->fp16, see rocket_weight_to_fp16), turn the host's repack off so the weights stay in
+// a host (CPU_Mapped) buffer: `-nr` / `--no-repack` (llama-bench `--repack 0`), which sets
+// use_extra_bufts, or a GGML_CPU_REPACK=OFF build. The runtime flag leaves a CPU-only run its
+// repack, worth 1.3-1.7x on quantized prefill. F16 weights are never repacked.
 static bool ggml_backend_rocket_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     (void)dev; return ggml_backend_buft_is_host(buft);
 }
@@ -7249,4 +7434,48 @@ void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, int n_threads) {
     rk_moe_preflight_set_workers(v);
 }
 
-GGML_BACKEND_DL_IMPL(ggml_backend_rocket_reg)
+#ifdef GGML_BACKEND_DL
+// The op ORDINALS this .so was compiled with must name the same ops in the host's ggml, and
+// nothing else checks that. GGML_BACKEND_API_VERSION does not move when ggml inserts an op, and
+// an insert shifts every ordinal after it: ggml 0.15 added COL2IM_1D ahead of FLASH_ATTN_EXT
+// (73 -> 74), so a .so built against whisper.cpp 1.8.6 loads into 1.9.x, passes the version
+// check, keeps offloading MUL_MAT (29, unmoved) and never recognizes an attention op again.
+// ggml_op_name reads the HOST's name table, so asking it to name our ordinals compares the two
+// enums at every op the backend switches on. (Every ordinal here is under 80 and every host
+// ggml this builds against has more ops than that, so the lookup stays in the host's table.)
+static bool rocket_host_op_ordinals_match(void) {
+    static const struct { ggml_op op; const char * name; } ops[] = {
+        { GGML_OP_NONE,           "NONE"           },
+        { GGML_OP_MUL_MAT,        "MUL_MAT"        },
+        { GGML_OP_MUL_MAT_ID,     "MUL_MAT_ID"     },
+        { GGML_OP_RESHAPE,        "RESHAPE"        },
+        { GGML_OP_VIEW,           "VIEW"           },
+        { GGML_OP_PERMUTE,        "PERMUTE"        },
+        { GGML_OP_TRANSPOSE,      "TRANSPOSE"      },
+        { GGML_OP_FLASH_ATTN_EXT, "FLASH_ATTN_EXT" },
+    };
+    bool ok = true;
+    for (const auto & e : ops) {
+        const char * host = ggml_op_name(e.op);
+        if (!host || strcmp(host, e.name) != 0) {
+            GGML_LOG_ERROR("ggml-rocket: op ordinal %d is %s in this .so and %s in the host's ggml\n",
+                           (int) e.op, e.name, host ? host : "(null)");
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// The dlopen entry. Declining here is the loader's own failure path: it logs that
+// ggml_backend_init returned NULL, unloads the .so, and the host runs without the device.
+static ggml_backend_reg_t ggml_backend_rocket_dl_init(void) {
+    if (!rocket_host_op_ordinals_match()) {
+        GGML_LOG_ERROR("ggml-rocket: this .so was built against a different ggml than the host "
+                       "loading it; rebuild it with -DHOST_DIR pointing at this host's tree\n");
+        return nullptr;
+    }
+    return ggml_backend_rocket_reg();
+}
+
+GGML_BACKEND_DL_IMPL(ggml_backend_rocket_dl_init)
+#endif
