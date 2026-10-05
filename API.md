@@ -1140,22 +1140,24 @@ model measured reaching it].
 - Uses ggml's private headers, `ggml-impl.h` and `ggml-backend-impl.h`, as expected for
   an out-of-tree backend.
 
-  The vtables, `ggml_backend_i` and the rest, are initialized positionally. The backend
-  must therefore be built against the **host's bundled ggml**, matching both field order
-  and `GGML_BACKEND_API_VERSION`.
+  The vtables, `ggml_backend_i` and the rest, are filled with C++20 designated
+  initializers, so each function binds to its slot by name. Only the slots the backend
+  implements are named, and ggml reads every other slot as an unimplemented optional one.
+  A slot ggml inserts therefore builds unchanged, and a change to a slot the backend
+  fills is a compile error.
 
-  The concrete ABI this backend targets is **`GGML_BACKEND_API_VERSION` 2 or 3**, with
-  the backend vtable that *includes* the `set_tensor_2d_async` and `get_tensor_2d_async`
-  slots. Version 3 adds two slots to the buffer-type vtable, which this backend does not
-  implement: its device hands out the host's CPU buffer type. It builds against ggml
+  The backend is audited against **`GGML_BACKEND_API_VERSION` 2 and 3**. Version 3 adds
+  two slots to the buffer-type vtable, which this backend does not implement: its device
+  hands out the host's CPU buffer type. Any other version builds with a warning, because
+  a new slot that ggml requires is the one change naming cannot see.
+  `-DGGML_ROCKET_STRICT_ABI=ON` turns that warning into an error. It builds against ggml
   0.14.0 through 0.25.3, including the ggml of llama.cpp b11351 through b11401, which
   carries version 3 under the same 0.25.3 label.
 
   The host apps, llama.cpp and whisper.cpp, clone their own ggml. Build this backend
-  against **that checkout's** headers and re-check on every bump. A host
-  `ggml-backend-impl.h` with a different `GGML_BACKEND_API_VERSION` or 2d-field layout
-  drifts the positional vtable, and you get a "ROCKET device not listed at startup"
-  failure.
+  against **that checkout's** headers. ggml's loader refuses a `.so` built for another
+  `GGML_BACKEND_API_VERSION`, logging `incompatible API version (backend: N, current: M)`,
+  and the device never appears.
 
   **The op numbering is checked at load.** ggml numbers its ops by position in an enum,
   and inserting one shifts every op after it without moving `GGML_BACKEND_API_VERSION`.

@@ -202,6 +202,7 @@ knobs, and what each is measured against are in [API.md](API.md#the-rk3576-secon
   `/dev/accel/accel0` present (`lsmod | grep rocket`).
 - The sibling `rocket-userspace` driver library, cloned next to this repo or installed as a
   `rocketnpu` package.
+- A C++20 compiler. The build is tested with GCC 13 and GCC 16.
 - Privilege to open the accel node. Run with `sudo -E` (the `-E` preserves the `ROCKET_*` env knobs
   plain `sudo` strips).
 
@@ -266,6 +267,9 @@ The build options are:
   to satisfy.
 - `-DGGML_ROCKET_RK3576_BENCH=ON`. Builds the RK3576 NPU-vs-CPU GEMM benchmark, which needs
   OpenBLAS. Off by default, and the gate list above has the caveat.
+- `-DGGML_ROCKET_STRICT_ABI=ON`. Fails the build when the host's ggml carries a
+  `GGML_BACKEND_API_VERSION` this backend has not been checked against. By default that build
+  continues with a warning.
 
 To run a real model you rebuild the `.so` against the host app's bundled ggml (so it links the same
 `libggml-base.so`) and point `GGML_BACKEND_PATH` at it. The two drop-in recipes below do both.
@@ -407,12 +411,11 @@ Two more things shape a run:
 **"ROCKET device not listed at startup"**, where the backend loads but no NPU device appears.
 Almost always an ABI mismatch.
 
-The ggml backend vtables are initialized positionally, so the backend must be built against the
-same ggml the host app uses. `llama.cpp` and `whisper.cpp` each clone their own ggml.
+The backend must be built against the same ggml the host app uses. `llama.cpp` and `whisper.cpp`
+each clone their own ggml.
 
-The host's `ggml-backend-impl.h` can carry a different `GGML_BACKEND_API_VERSION` or 2d-tensor
-field layout than the ggml this backend was compiled against. The positional vtable then drifts,
-and the device silently fails to register.
+When the host's `GGML_BACKEND_API_VERSION` differs from the one the backend was built against,
+ggml's loader refuses the `.so` and logs `incompatible API version (backend: N, current: M)`.
 
 The same mismatch can also shift ggml's op numbering, which the API version does not track. The
 backend checks the numbering when it loads and refuses to register, and the host's log then
@@ -420,9 +423,9 @@ shows `ggml-rocket: op ordinal N is X in this .so and Y in the host's ggml` foll
 `ggml_backend_init returned NULL`.
 
 The fix is to rebuild against that host checkout's ggml headers, and to re-check on every ggml
-bump. This backend targets `GGML_BACKEND_API_VERSION` 2 and 3, with the backend vtable that
-includes the `set_tensor_2d_async` and `get_tensor_2d_async` slots. It builds against the ggml of
-whisper.cpp 1.8.6 through 1.9.4 and of llama.cpp b10558 through b11401. llama.cpp moved to
+bump. This backend is checked against `GGML_BACKEND_API_VERSION` 2 and 3, and another version
+builds with a warning. It builds against the ggml of whisper.cpp 1.8.6 through 1.9.4 and of
+llama.cpp b10558 through b11401. llama.cpp moved to
 version 3 at b11351 and still labels that ggml 0.25.3. Read a host's API version from its
 `ggml/src/ggml-backend-impl.h`, not from the ggml version.
 

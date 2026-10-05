@@ -22,7 +22,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(ggml-rocket CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+# C++20 for designated initializers: the backend fills ggml's vtables by slot NAME, so a slot
+# ggml inserts or reorders cannot bind the wrong function. This scope reaches only this
+# project's targets. A standalone build's ggml sets its own standard, and rocketnpu is C.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # driver static lib links into our .so
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -37,6 +40,10 @@ option(GGML_ROCKET_DL "Build libggml-rocket.so as a drop-in GGML_BACKEND_DL back
 # / ROCKET_TRACE / ROCKET_AB / ROCKET_DUMP). The lightweight ROCKET_MM_PROFILE timing and
 # ROCKET_DEBUG trace lines are always available (cached-getenv, near-zero when unset).
 option(GGML_ROCKET_DIAGNOSTICS "Compile in the heavy per-op recompute/trace diagnostics (off in production)" OFF)
+
+# A host ggml whose GGML_BACKEND_API_VERSION this backend has not been audited against builds
+# with a warning by default. CI turns this ON so an unaudited version fails the job instead.
+option(GGML_ROCKET_STRICT_ABI "Fail the build on an unaudited GGML_BACKEND_API_VERSION (CI)" OFF)
 
 # Portability: internalize the glibc 2.38 __isoc23_* symbols so libggml-rocket.so loads on
 # an older-glibc runtime (e.g. a Debian-bookworm container) even when built on a newer host.
@@ -276,6 +283,9 @@ target_compile_options(ggml-rocket PRIVATE -Wall -Wextra)
 # GGML_ROCKET_DIAGNOSTICS option above). Applies in both DL and standalone modes.
 if(GGML_ROCKET_DIAGNOSTICS)
     target_compile_definitions(ggml-rocket PRIVATE ROCKET_DIAGNOSTICS)
+endif()
+if(GGML_ROCKET_STRICT_ABI)
+    target_compile_definitions(ggml-rocket PRIVATE GGML_ROCKET_STRICT_ABI)
 endif()
 
 # The backend convert kernels (rocket_pack_activations / rocket_unpack_output) use NEON

@@ -6500,38 +6500,44 @@ static enum ggml_status ggml_backend_rocket_graph_compute(ggml_backend_t backend
     return GGML_STATUS_SUCCESS;
 }
 
-// The vtables below (ggml_backend_i / ggml_backend_device_i / ggml_backend_reg_i) are
-// POSITIONAL designated initializers against the host app's ggml ABI. ggml's loader
-// rejects an api_version MISMATCH cleanly, but a struct field-ORDER drift WITHOUT a
-// version bump would silently bind the wrong slots (crash / wrong call, no diagnostic).
-// Pin the versions these literals were audited against, so any such drift fails at
-// COMPILE time. When this fires, re-audit every vtable literal against the new
-// ggml-backend-impl.h before admitting the version. Version 3 (llama.cpp b11351) inserted
-// alloc_buffer_n and get_alloc_size_n into ggml_backend_buffer_type_i, a vtable this
-// backend never fills: get_buffer_type hands out the host's own CPU buffer type. The three
-// literals below are identical under 2 and 3, and both stay admitted because each host app
-// bundles its own ggml and moves to a new version on its own schedule.
-static_assert(GGML_BACKEND_API_VERSION == 2 || GGML_BACKEND_API_VERSION == 3,
-              "ggml backend ABI changed: re-audit the rocket vtable literals, then admit this version");
+// The vtables below (ggml_backend_i / ggml_backend_device_i / ggml_backend_reg_i) and the
+// structs that carry them use C++20 designated initializers, so each function binds to its
+// slot by NAME. Only the slots this backend fills are named, and every other slot is NULL,
+// which ggml reads as an unimplemented optional slot. So a slot ggml inserts, or a change to
+// a slot left NULL, compiles unchanged. A filled slot that ggml renames, retypes or reorders
+// is a compile error.
+//
+// Naming cannot see a NEW slot that ggml requires. ggml announces a change to these structs
+// with a GGML_BACKEND_API_VERSION bump, so a version not yet audited against
+// ggml-backend-impl.h warns, and GGML_ROCKET_STRICT_ABI (the CMake option CI builds with)
+// turns the warning into an error. To admit a version, audit the three vtables below and add
+// it to the condition. Version 3 (llama.cpp b11351) inserted alloc_buffer_n and
+// get_alloc_size_n into ggml_backend_buffer_type_i, a vtable this backend never fills:
+// get_buffer_type hands out the host's own CPU buffer type.
+#if GGML_BACKEND_API_VERSION != 2 && GGML_BACKEND_API_VERSION != 3
+#  define ROCKET_STR_(x) #x
+#  define ROCKET_STR(x)  ROCKET_STR_(x)
+#  pragma message("ggml-rocket: this host's GGML_BACKEND_API_VERSION is " ROCKET_STR(GGML_BACKEND_API_VERSION))
+#  if defined(GGML_ROCKET_STRICT_ABI)
+#    error "ggml-rocket: unaudited GGML_BACKEND_API_VERSION (audited: 2, 3). Audit the vtables against ggml-backend-impl.h, then admit it."
+#  else
+#    warning "ggml-rocket is checked against GGML_BACKEND_API_VERSION 2 and 3 only. The build continues. If the ROCKET device misbehaves, report it at https://github.com/gregordinary/ggml-rocket/issues"
+#  endif
+#endif
 
+// -Wextra's -Wmissing-field-initializers flags every slot left unnamed, which is the point of
+// naming only the filled ones. These bracket the three vtables and nothing else.
+#define ROCKET_VTABLE_BEGIN _Pragma("GCC diagnostic push") \
+                            _Pragma("GCC diagnostic ignored \"-Wmissing-field-initializers\"")
+#define ROCKET_VTABLE_END   _Pragma("GCC diagnostic pop")
+
+ROCKET_VTABLE_BEGIN
 static const ggml_backend_i rocket_backend_i = {
-    /* .get_name           = */ ggml_backend_rocket_get_name,
-    /* .free               = */ ggml_backend_rocket_free,
-    /* .set_tensor_async   = */ NULL,
-    /* .get_tensor_async   = */ NULL,
-    /* .set_tensor_2d_async= */ NULL,
-    /* .get_tensor_2d_async= */ NULL,
-    /* .cpy_tensor_async   = */ NULL,
-    /* .synchronize        = */ NULL,
-    /* .graph_plan_create  = */ NULL,
-    /* .graph_plan_free    = */ NULL,
-    /* .graph_plan_update  = */ NULL,
-    /* .graph_plan_compute = */ NULL,
-    /* .graph_compute      = */ ggml_backend_rocket_graph_compute,
-    /* .event_record       = */ NULL,
-    /* .event_wait         = */ NULL,
-    /* .graph_optimize     = */ NULL,
+    .get_name      = ggml_backend_rocket_get_name,
+    .free          = ggml_backend_rocket_free,
+    .graph_compute = ggml_backend_rocket_graph_compute,
 };
+ROCKET_VTABLE_END
 
 static ggml_guid_t ggml_backend_rocket_guid(void) {
     // any fixed 16-byte GUID ("ROCK" + random)
@@ -6589,8 +6595,9 @@ static void ggml_backend_rocket_device_get_memory(ggml_backend_dev_t dev, size_t
 static enum ggml_backend_dev_type ggml_backend_rocket_device_get_type(ggml_backend_dev_t dev) {
     (void)dev; return GGML_BACKEND_DEVICE_TYPE_ACCEL;
 }
-// caps.mmap_support arrived in ggml 0.25 with no API-version bump, so it cannot be a positional
-// initializer here; this sets it when the host's header has it and compiles to nothing when not.
+// caps.mmap_support arrived in ggml 0.25 with no API-version bump, so naming it directly would not
+// compile against an older host. This sets it when the host's header has it and compiles to
+// nothing when not.
 // True, because the weights are read in place from the host's own (mmapped) CPU buffers. llama.cpp
 // turns mmap off for a whole model when a device of it reports false, though today it asks only
 // its GPU devices and skips an ACCEL one.
@@ -7100,23 +7107,21 @@ static bool ggml_backend_rocket_device_offload_op(ggml_backend_dev_t dev, const 
         && ggml_backend_rocket_device_supports_op(dev, op);
 }
 
+ROCKET_VTABLE_BEGIN
 static const ggml_backend_device_i rocket_device_i = {
-    /* .get_name             = */ ggml_backend_rocket_device_get_name,
-    /* .get_description      = */ ggml_backend_rocket_device_get_description,
-    /* .get_memory           = */ ggml_backend_rocket_device_get_memory,
-    /* .get_type             = */ ggml_backend_rocket_device_get_type,
-    /* .get_props            = */ ggml_backend_rocket_device_get_props,
-    /* .init_backend         = */ ggml_backend_rocket_device_init,
-    /* .get_buffer_type      = */ ggml_backend_rocket_device_get_buffer_type,
-    /* .get_host_buffer_type = */ NULL,
-    /* .buffer_from_host_ptr = */ ggml_backend_rocket_device_buffer_from_host_ptr,
-    /* .supports_op          = */ ggml_backend_rocket_device_supports_op,
-    /* .supports_buft        = */ ggml_backend_rocket_device_supports_buft,
-    /* .offload_op           = */ ggml_backend_rocket_device_offload_op,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    .get_name             = ggml_backend_rocket_device_get_name,
+    .get_description      = ggml_backend_rocket_device_get_description,
+    .get_memory           = ggml_backend_rocket_device_get_memory,
+    .get_type             = ggml_backend_rocket_device_get_type,
+    .get_props            = ggml_backend_rocket_device_get_props,
+    .init_backend         = ggml_backend_rocket_device_init,
+    .get_buffer_type      = ggml_backend_rocket_device_get_buffer_type,
+    .buffer_from_host_ptr = ggml_backend_rocket_device_buffer_from_host_ptr,
+    .supports_op          = ggml_backend_rocket_device_supports_op,
+    .supports_buft        = ggml_backend_rocket_device_supports_buft,
+    .offload_op           = ggml_backend_rocket_device_offload_op,
 };
+ROCKET_VTABLE_END
 
 // ---------------------------------------------------------------------------
 // registry
@@ -7130,19 +7135,20 @@ static size_t ggml_backend_rocket_reg_get_device_count(ggml_backend_reg_t reg) {
 static ggml_backend_dev_t ggml_backend_rocket_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     GGML_ASSERT(index == 0);
     static ggml_backend_device device = {
-        /* .iface   = */ rocket_device_i,
-        /* .reg     = */ reg,
-        /* .context = */ nullptr,
+        .iface   = rocket_device_i,
+        .reg     = reg,
+        .context = nullptr,
     };
     return &device;
 }
 
+ROCKET_VTABLE_BEGIN
 static const ggml_backend_reg_i rocket_reg_i = {
-    /* .get_name         = */ ggml_backend_rocket_reg_get_name,
-    /* .get_device_count = */ ggml_backend_rocket_reg_get_device_count,
-    /* .get_device       = */ ggml_backend_rocket_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    .get_name         = ggml_backend_rocket_reg_get_name,
+    .get_device_count = ggml_backend_rocket_reg_get_device_count,
+    .get_device       = ggml_backend_rocket_reg_get_device,
 };
+ROCKET_VTABLE_END
 
 // ===========================================================================
 // Log bridge, registration, and the .so entry points
@@ -7182,9 +7188,9 @@ static void rocket_install_log_bridge(void) {
 ggml_backend_reg_t ggml_backend_rocket_reg(void) {
     rocket_install_log_bridge();
     static ggml_backend_reg reg = {
-        /* .api_version = */ GGML_BACKEND_API_VERSION,
-        /* .iface       = */ rocket_reg_i,
-        /* .context     = */ nullptr,
+        .api_version = GGML_BACKEND_API_VERSION,
+        .iface       = rocket_reg_i,
+        .context     = nullptr,
     };
     return &reg;
 }
@@ -7362,10 +7368,10 @@ ggml_backend_t ggml_backend_rocket_init(void) {
     }
     const int backend_n_threads = ctx->n_threads;   // ctx is released to the backend below
     ggml_backend_t backend = new ggml_backend {
-        /* .guid    = */ ggml_backend_rocket_guid(),
-        /* .iface   = */ rocket_backend_i,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_rocket_reg(), 0),
-        /* .context = */ ctx.get(),
+        .guid    = ggml_backend_rocket_guid(),
+        .iface   = rocket_backend_i,
+        .device  = ggml_backend_reg_dev_get(ggml_backend_rocket_reg(), 0),
+        .context = ctx.get(),
     };
     ctx.release();   // ownership transferred to backend->context; freed in ggml_backend_rocket_free
     // Register with the MoE residency ledger only once the backend exists, so the claim is
