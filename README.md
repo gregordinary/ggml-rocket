@@ -420,9 +420,11 @@ shows `ggml-rocket: op ordinal N is X in this .so and Y in the host's ggml` foll
 `ggml_backend_init returned NULL`.
 
 The fix is to rebuild against that host checkout's ggml headers, and to re-check on every ggml
-bump. This backend targets `GGML_BACKEND_API_VERSION 2`, with the device vtable that includes the
-`set_tensor_2d_async` and `get_tensor_2d_async` slots. It builds against ggml 0.14.0 through
-0.25.3, the ggml of whisper.cpp 1.8.6 and 1.9.4 and of llama.cpp b10558 and b11242.
+bump. This backend targets `GGML_BACKEND_API_VERSION` 2 and 3, with the backend vtable that
+includes the `set_tensor_2d_async` and `get_tensor_2d_async` slots. It builds against the ggml of
+whisper.cpp 1.8.6 through 1.9.4 and of llama.cpp b10558 through b11401. llama.cpp moved to
+version 3 at b11351 and still labels that ggml 0.25.3. Read a host's API version from its
+`ggml/src/ggml-backend-impl.h`, not from the ggml version.
 
 If the device appears but runs zero matmuls, the backend was built without a working `offload_op`.
 See [implementation notes](API.md#implementation-notes).

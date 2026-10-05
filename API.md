@@ -1144,9 +1144,12 @@ model measured reaching it].
   must therefore be built against the **host's bundled ggml**, matching both field order
   and `GGML_BACKEND_API_VERSION`.
 
-  The concrete ABI this backend targets is **`GGML_BACKEND_API_VERSION 2`**, with the
-  device vtable that *includes* the `set_tensor_2d_async` and `get_tensor_2d_async`
-  slots. It builds against ggml 0.14.0 through 0.25.3.
+  The concrete ABI this backend targets is **`GGML_BACKEND_API_VERSION` 2 or 3**, with
+  the backend vtable that *includes* the `set_tensor_2d_async` and `get_tensor_2d_async`
+  slots. Version 3 adds two slots to the buffer-type vtable, which this backend does not
+  implement: its device hands out the host's CPU buffer type. It builds against ggml
+  0.14.0 through 0.25.3, including the ggml of llama.cpp b11351 through b11401, which
+  carries version 3 under the same 0.25.3 label.
 
   The host apps, llama.cpp and whisper.cpp, clone their own ggml. Build this backend
   against **that checkout's** headers and re-check on every bump. A host

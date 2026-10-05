@@ -6504,11 +6504,15 @@ static enum ggml_status ggml_backend_rocket_graph_compute(ggml_backend_t backend
 // POSITIONAL designated initializers against the host app's ggml ABI. ggml's loader
 // rejects an api_version MISMATCH cleanly, but a struct field-ORDER drift WITHOUT a
 // version bump would silently bind the wrong slots (crash / wrong call, no diagnostic).
-// Pin the version we were compiled against so any such drift fails at COMPILE time;
-// when this fires, re-audit every vtable literal against the new ggml-backend-impl.h
-// before bumping the constant.
-static_assert(GGML_BACKEND_API_VERSION == 2,
-              "ggml backend ABI changed: re-audit the rocket vtable literals, then bump this guard");
+// Pin the versions these literals were audited against, so any such drift fails at
+// COMPILE time. When this fires, re-audit every vtable literal against the new
+// ggml-backend-impl.h before admitting the version. Version 3 (llama.cpp b11351) inserted
+// alloc_buffer_n and get_alloc_size_n into ggml_backend_buffer_type_i, a vtable this
+// backend never fills: get_buffer_type hands out the host's own CPU buffer type. The three
+// literals below are identical under 2 and 3, and both stay admitted because each host app
+// bundles its own ggml and moves to a new version on its own schedule.
+static_assert(GGML_BACKEND_API_VERSION == 2 || GGML_BACKEND_API_VERSION == 3,
+              "ggml backend ABI changed: re-audit the rocket vtable literals, then admit this version");
 
 static const ggml_backend_i rocket_backend_i = {
     /* .get_name           = */ ggml_backend_rocket_get_name,
