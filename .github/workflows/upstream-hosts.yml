@@ -1,0 +1,107 @@
+# Builds the backend against the current llama.cpp and whisper.cpp, so a ggml change that
+# breaks it fails here before it reaches a user's build. GGML_ROCKET_STRICT_ABI turns an
+# unaudited GGML_BACKEND_API_VERSION, a warning in a user's build, into a failed job.
+#
+# No runner has an NPU. The device tests skip, and what runs is the build in both modes, the
+# placement gate, the pure-CPU gates, and a load of the drop-in .so through ggml's own loader,
+# which checks the API version and the op ordinals the backend switches on.
+name: upstream hosts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1"   # Mondays, 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.host }} on ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [llama.cpp, whisper.cpp]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: ggml-rocket
+
+      - uses: actions/checkout@v7
+        with:
+          repository: gregordinary/rocket-userspace
+          path: rocket-userspace
+
+      - name: Fetch the host's ggml
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+              https://github.com/ggml-org/${{ matrix.host }}.git host
+          git -C host sparse-checkout set ggml
+          echo "${{ matrix.host }} at $(git -C host rev-parse --short HEAD)"
+          grep -m1 "define GGML_BACKEND_API_VERSION" host/ggml/src/ggml-backend-impl.h
+
+      - name: Build the standalone backend and tests
+        run: |
+          cmake -S ggml-rocket -B build \
+              -DGGML_DIR="$PWD/host/ggml" -DROCKETNPU_DIR="$PWD/rocket-userspace" \
+              -DGGML_ROCKET_STRICT_ABI=ON
+          cmake --build build -j"$(nproc)"
+
+      - name: Run the tests
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+      - name: Build the host's ggml as shared libraries
+        run: |
+          mkdir -p hostlib
+          cat > hostlib/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(hostlib C CXX)
+          set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+          set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+          add_subdirectory(${GGML_SRC} ggml)
+          EOF
+          cmake -S hostlib -B hostlib/build -DGGML_SRC="$PWD/host/ggml" \
+              -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF
+          cmake --build hostlib/build -j"$(nproc)"
+
+      - name: Build the drop-in backend
+        run: |
+          cmake -S ggml-rocket -B build-dl -DGGML_ROCKET_DL=ON \
+              -DHOST_DIR="$PWD/host" -DGGML_LIB_DIR="$PWD/hostlib/build/bin" \
+              -DROCKETNPU_DIR="$PWD/rocket-userspace" -DGGML_ROCKET_STRICT_ABI=ON
+          cmake --build build-dl -j"$(nproc)"
+
+      - name: Load the drop-in backend through ggml's loader
+        run: |
+          cat > load.c <<'EOF'
+          #include <stdio.h>
+          #include "ggml-backend.h"
+          int main(int argc, char ** argv) {
+              (void) argc;
+              ggml_backend_reg_t reg = ggml_backend_load(argv[1]);
+              if (!reg || ggml_backend_reg_dev_count(reg) < 1) {
+                  printf("the host refused the backend\n");
+                  return 1;
+              }
+              ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+              printf("%s: %s\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+              return 0;
+          }
+          EOF
+          cc -o load load.c -Ihost/ggml/include -Lhostlib/build/bin -lggml -lggml-base \
+              -Wl,-rpath,"$PWD/hostlib/build/bin"
+          ./load build-dl/libggml-rocket.so
