@@ -46,10 +46,15 @@ jobs:
           repository: gregordinary/rocket-userspace
           path: rocket-userspace
 
-      - name: Install the driver library's dependency
+      # libdrm through pkg-config, and the rocket uAPI header, which the runner's kernel headers
+      # predate. The header is the mainline one, pinned to a kernel tag.
+      - name: Install the driver library's dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libdrm-dev
+          curl -fsSL -o rocket_accel.h \
+              https://raw.githubusercontent.com/torvalds/linux/v7.2/include/uapi/drm/rocket_accel.h
+          sudo install -D -m 644 rocket_accel.h /usr/include/drm/rocket_accel.h
 
       - name: Fetch the host's ggml
         run: |
