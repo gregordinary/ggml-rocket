@@ -39,11 +39,13 @@ GGML_BACKEND_API void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, 
  * route instead, correctly but at the streaming cost. So "how much of the model went
  * resident" is the number that explains the speed, and it is not otherwise observable.
  *
- * By default the placement gate reserves a whole expert stack before it claims that stack's
- * op, so a stack that would not fit is left on the CPU and *n_streamed stays 0. A nonzero
- * *n_streamed under the default therefore means a limit the pre-flight could not see ahead
- * of the ingest — most likely an exhausted NPU IOVA window. Under ROCKET_MOE=1 nothing is
- * reserved and streaming is expected.
+ * By default the placement gate charges an estimate of a whole expert stack's footprint
+ * against the budget before it claims that stack's op, so a stack that would not fit is left
+ * on the CPU and *n_streamed stays 0. A nonzero *n_streamed under the default therefore means
+ * a limit the pre-flight could not see ahead of the ingest: an exhausted NPU IOVA window, or
+ * a second live backend whose own resident copy of a placed stack did not fit the shared
+ * budget (each backend's copy is charged). Under ROCKET_MOE=1 nothing is reserved and
+ * streaming is expected.
  *
  * Writes the count of experts ingested to *n_resident and the count that fell back to
  * streaming to *n_streamed (either pointer may be NULL). Both are cumulative over the

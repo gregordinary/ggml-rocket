@@ -230,6 +230,18 @@ else()
     target_compile_options(test-rocket-placement PRIVATE -Wall -Wextra)
     add_test(NAME test-rocket-placement COMMAND test-rocket-placement)
 
+    # Internals gate: the FA dump's file handling, the MB-budget parser, the weight cache's
+    # identity, the MoE residency ledger across two live backends, the H60 build under
+    # concurrent first use, and the device-route circuit breaker. It includes ggml-rocket.cpp
+    # itself (so the static helpers are reachable without a seam in the shipped backend) and
+    # links ggml + rocketnpu in place of the backend library. Host-only: no NPU, no skip.
+    add_executable(test-rocket-internals test-rocket-internals.cpp)
+    target_include_directories(test-rocket-internals PRIVATE
+        ${GGML_DIR}/include ${GGML_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-rocket-internals PRIVATE ggml ggml-cpu rocketnpu::rocketnpu)
+    target_compile_options(test-rocket-internals PRIVATE -Wall -Wextra)
+    add_test(NAME test-rocket-internals COMMAND test-rocket-internals)
+
     # Pure-C NEON Hadamard-rotation gate (no ggml dep; libm only). On a non-aarch64 host
     # it exits 77 (SKIP) because the NEON path is not exercised there — the real gate
     # runs on the device. Wired as a CTest target so it can't rot.

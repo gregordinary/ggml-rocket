@@ -435,7 +435,7 @@ int main() {
         fails += run_moe_child(prec_int8_child);
         fails += run_moe_child(prec_int4_child);
     }
-    const int K = 256, N = 128, M = 256;   // valid F16/F32 shape (floor = rocket_min_m, default 4)
+    const int K = 256, N = 128, M = 256;   // valid F16/F32 shape (floor = rocket_min_m, default 32)
     const int Mq = 512;                    // quantized floor = rocket_min_m_quant (default 512)
 
     // ACCEPT — the canonical static-weight GEMM we offload (F16, F32, and BF16 weights;
@@ -548,10 +548,13 @@ int main() {
     printf("  -- ROCKET_MOE_CHARGE_ALL_SOURCE, same 460MB budget over 4 stacks in one buffer --\n");
     const int n_default = run_moe_child(moe_src_default_child);
     const int n_all_src = run_moe_child(moe_src_knob_child);
-    printf("  [%s] MoE source charge: default admitted %d of %d, knob admitted %d\n",
-           (n_all_src < n_default) ? "PASS" : "FAIL",
-           n_default, RK_MOE_SRC_STACKS, n_all_src);
-    if (!(n_all_src < n_default)) fails++;
+    // The RK3576 has no MoE route, so it admits no stack under either charge and the
+    // contrast does not exist there; what holds on that part is that nothing is claimed.
+    const bool src_ok = rk76 ? (n_default == 0 && n_all_src == 0) : (n_all_src < n_default);
+    printf("  [%s] MoE source charge: default admitted %d of %d, knob admitted %d%s\n",
+           src_ok ? "PASS" : "FAIL", n_default, RK_MOE_SRC_STACKS, n_all_src,
+           rk76 ? " (rk3576: no MoE route, nothing claimed)" : "");
+    if (!src_ok) fails++;
 
     printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL PASS");
     return fails ? 1 : 0;

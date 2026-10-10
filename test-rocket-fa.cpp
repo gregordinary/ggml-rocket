@@ -19,6 +19,16 @@
  *              pass on an unfolded surface whichever way the converter overflows.
  *   typical    random Q, K and V in [-1, 1] under a causal mask: the fold must not cost
  *              accuracy where nothing overflows.
+ *   scaled     the overflow construction with Q at 500*sqrt(head_dim) and K from 140 up, so
+ *              the SCALED logits start at 70000 at every head dim: past 65504 even with the
+ *              scale folded in. The
+ *              NPU's fp16 score surface saturates there (it does not read inf), so the case
+ *              must leave the NPU: the library flags the saturated score and the handler runs
+ *              its full-precision host reference. Scored on the same oracle, and it must be
+ *              that reference that computed it (a fallback, not the "fa" route).
+ *   q range    Q at 1e6, so the scaled Q itself (125000 at head_dim 64) does not fit fp16;
+ *              the gather catches it before the NPU is asked, and the same reference runs.
+ *              The oracle keeps Q in F32 for both range cases, as that reference does.
  *
  * THE ORACLE IS A HOST REFERENCE IN DOUBLE, NOT THE CPU BACKEND. On an ARMv8.2 build the
  * CPU backend's fp16 dot product accumulates q.k in fp16, so its own flash attention
@@ -27,7 +37,8 @@
  * NaN compares false against any tolerance.
  *
  * Every case also reads the backend's "fa" route counter, so a case the host reference
- * computed cannot pass as an NPU result. RK3588 only: the attention route does not exist on
+ * computed cannot pass as an NPU result, and the two range cases read the fallback counter,
+ * so they cannot pass as one either. RK3588 only: the attention route does not exist on
  * the RK3576, and the gate SKIPs there.
  *
  * Run with ROCKET_FA_QSCALE=0 to see the overflow case fail on the unfolded surface.
@@ -41,11 +52,12 @@
 #include <cmath>
 #include <cstdint>
 
+enum fa_kind { FA_TYPICAL, FA_OVERFLOW, FA_SCALED, FA_QRANGE };
 struct fa_case {
     const char * name;
     int D, T, H, KV, HK;
-    bool overflow;          // the one-hot overflow construction, else typical random
-    double tol;             // max abs error against the CPU backend
+    fa_kind kind;           // which construction (see the header)
+    double tol;             // max abs error against the double oracle
 };
 
 static bool run_fa(ggml_backend_t be, const fa_case & c, float scale,
@@ -96,6 +108,9 @@ static void ref_fa(const fa_case & c, float scale, const std::vector<float> & Q,
     std::vector<double> sc(c.KV);
     const int g = c.H / c.HK;
     auto h16 = [](float x) { return (double)ggml_fp16_to_fp32(ggml_fp32_to_fp16(x)); };
+    // The two range cases run on the handler's full-precision reference, which reads Q as F32.
+    const bool q_f32 = c.kind == FA_SCALED || c.kind == FA_QRANGE;
+    auto qv = [&](float x) { return q_f32 ? (double)x : h16(x); };
     for (int h = 0; h < c.H; h++) {
         const int hk = h / g;
         for (int t = 0; t < c.T; t++) {
@@ -103,7 +118,7 @@ static void ref_fa(const fa_case & c, float scale, const std::vector<float> & Q,
             for (int j = 0; j < c.KV; j++) {
                 double acc = 0.0;
                 for (int d = 0; d < c.D; d++)
-                    acc += h16(Q[((size_t)h * c.T + t) * c.D + d]) *
+                    acc += qv(Q[((size_t)h * c.T + t) * c.D + d]) *
                            h16(K[((size_t)hk * c.KV + j) * c.D + d]);
                 sc[j] = scale * acc + h16(M[(size_t)t * c.KV + j]);
                 if (sc[j] > mx) mx = sc[j];
@@ -132,15 +147,20 @@ static void fill_case(const fa_case & c, std::vector<float> & Q, std::vector<flo
         return (float)((double)(s >> 11) / (double)(1ull << 52)) - 1.0f;
     };
     for (auto & x : V) x = rnd();
-    if (c.overflow) {
-        // Query (t, h) points along direction (t + h) % D with amplitude 1000; key j points
-        // along j % D with amplitude 60 + 5 * (j / D). Every magnitude is exact in fp16.
+    if (c.kind != FA_TYPICAL) {
+        // Query (t, h) points along direction (t + h) % D with amplitude qa; key j points
+        // along j % D with amplitude k0 + 5 * (j / D), divided by kd. K is exact in fp16 but
+        // for the q-range case, whose oracle reads K in fp16 as every case's does.
+        const float qa = c.kind == FA_SCALED ? 500.0f * sqrtf((float)c.D)
+                       : c.kind == FA_QRANGE ? 1.0e6f : 1000.0f;
+        const float k0 = c.kind == FA_SCALED ? 140.0f : 60.0f;
+        const float kd = c.kind == FA_QRANGE ? 1000.0f : 1.0f;
         for (int h = 0; h < c.H; h++)
             for (int t = 0; t < c.T; t++)
-                Q[((size_t)h * c.T + t) * c.D + (size_t)((t + h) % c.D)] = 1000.0f;
+                Q[((size_t)h * c.T + t) * c.D + (size_t)((t + h) % c.D)] = qa;
         for (int hk = 0; hk < c.HK; hk++)
             for (int j = 0; j < c.KV; j++)
-                K[((size_t)hk * c.KV + j) * c.D + (size_t)(j % c.D)] = 60.0f + 5.0f * (float)(j / c.D);
+                K[((size_t)hk * c.KV + j) * c.D + (size_t)(j % c.D)] = (k0 + 5.0f * (float)(j / c.D)) / kd;
     } else {
         for (auto & x : Q) x = rnd();
         for (auto & x : K) x = rnd();
@@ -152,10 +172,13 @@ static void fill_case(const fa_case & c, std::vector<float> & Q, std::vector<flo
 
 int main() {
     const fa_case cases[] = {
-        { "overflow d64",  64, 32, 4, 1024, 2, true,  1e-3 },
-        { "overflow d128", 128, 32, 4, 1024, 2, true,  1e-3 },
-        { "typical d64",   64, 64, 8, 1024, 2, false, 2e-2 },
-        { "typical d128", 128, 64, 4, 1536, 4, false, 2e-2 },
+        { "overflow d64",  64, 32, 4, 1024, 2, FA_OVERFLOW, 1e-3 },
+        { "overflow d128", 128, 32, 4, 1024, 2, FA_OVERFLOW, 1e-3 },
+        { "typical d64",   64, 64, 8, 1024, 2, FA_TYPICAL,  2e-2 },
+        { "typical d128", 128, 64, 4, 1536, 4, FA_TYPICAL,  2e-2 },
+        { "scaled d64",    64, 32, 4, 1024, 2, FA_SCALED,   1e-3 },
+        { "scaled d128",  128, 32, 4, 1024, 2, FA_SCALED,   1e-3 },
+        { "q range d64",   64, 32, 4, 1024, 2, FA_QRANGE,   1e-3 },
     };
 
     if (rk_is_rk3576()) { fprintf(stderr, "RK3576: no attention route to test -> SKIP\n"); return 77; }
@@ -191,7 +214,10 @@ int main() {
         size_t nf_npu = 0, nf_cpu = 0;
         const double e_npu = ok ? worst(orr, nf_npu) : INFINITY;
         const double e_cpu = ok ? worst(oc, nf_cpu) : INFINITY;
-        const bool pass = ok && fa == 1 && fb == 0 && nf_npu == 0 && e_npu <= c.tol;
+        // The two range cases must have left the NPU for the full-precision reference.
+        const bool on_ref = c.kind == FA_SCALED || c.kind == FA_QRANGE;
+        const bool routed = on_ref ? (fa == 0 && fb == 1) : (fa == 1 && fb == 0);
+        const bool pass = ok && routed && nf_npu == 0 && e_npu <= c.tol;
         printf("%-14s D %3d T %2d H %d KV %4d HK %d: npu max err %.3g (%zu non-finite, tol %.0e), "
                "cpu backend %.3g (%zu non-finite), fa route %ld, fallbacks %ld -> %s\n",
                c.name, c.D, c.T, c.H, c.KV, c.HK, e_npu, nf_npu, c.tol, e_cpu, nf_cpu, fa, fb,

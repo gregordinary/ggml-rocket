@@ -35,6 +35,8 @@
  *   single ingest serve the ragged per-micro-batch row count a router produces. Drive one
  *   named weight at several n_tokens and assert the expert count does not grow.
  *
+ * The RK3576 has neither route, so this gate SKIPs there.
+ *
  * The tolerance mirrors test-rocket-matmul: an element fails only if it misses BOTH abs and
  * rel, and the aggregate cosine must clear the case's floor. The int8 route's floor is
  * lower than the fp16 route's by construction -- it re-quantizes the activation to 8 bits
@@ -218,6 +220,10 @@ int main() {
 
     ggml_backend_t cpu    = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "cpu backend init failed\n"); return 1; }
+    // Both expert routes run the RK3588's matmul programs, fp16 and resident int8, which
+    // refuse on the RK3576 by construction; there every expert would reach the CPU fallback
+    // and the route asserts below would fail on correct output.
+    if (rk_is_rk3576()) { fprintf(stderr, "RK3576: no MoE expert route to test -> SKIP\n"); return 77; }
     // Probe the accel node BEFORE the backend, and SKIP (77) if it will not open.
     // ggml_backend_rocket_init() opens nothing -- every fd is lazy -- so it succeeds on a
     // machine with no usable NPU and the matmuls then degrade to the CPU fallback. The

@@ -220,6 +220,44 @@ int main() {
         }
     }
 
+    // A weight's identity is its bytes, not its name. The same NAME at the same shape runs
+    // twice with different contents -- a model reloaded through a reused backend, a second
+    // model with the same layer names, a leaf a host rewrites -- on the resident path
+    // (K <= 2048, M = 256), which packs a weight once and serves later calls from the packed
+    // copy. Keyed on the name alone, the second run computes from the first weight: a full,
+    // plausible, wrong surface. Each run is scored against the CPU on its own weights.
+    {
+        const int K = 1024, N = 256, M = 256;
+        std::vector<float> W1((size_t)K*N), W2((size_t)K*N), Xf((size_t)K*M);
+        for (size_t i = 0; i < W1.size(); i++) {
+            W1[i] = (float)((int)((i * 2654435761u) >> 20) % 201 - 100) / 400.0f;
+            W2[i] = (float)((int)((i * 40503u + 17u) >> 6) % 201 - 100) / 400.0f;
+        }
+        for (size_t i = 0; i < Xf.size(); i++) Xf[i] = (float)((int)(i * 31u) % 97 - 48) / 100.0f;
+        const char * wname = "blk.0.reloaded.weight";
+        bool all = true;
+        for (int pass_i = 0; pass_i < 2; pass_i++) {
+            const std::vector<float> & Wf = pass_i ? W2 : W1;
+            std::vector<float> oc, orr;
+            bool ok = rk_run_mul_mat(cpu, GGML_TYPE_F16, K, N, M, 1, Wf, Xf, oc, wname);
+            ok = ok && rk_run_mul_mat(rocket, GGML_TYPE_F16, K, N, M, 1, Wf, Xf, orr, wname);
+            // Max error over the output's range: fp16 rounding is ~1e-3 of it, and a stale
+            // weight -- an unrelated matrix -- is of the order of the range itself.
+            float max_err = 0, range = 0; long nonfinite = 0;
+            for (size_t i = 0; ok && i < oc.size(); i++) {
+                range = fmaxf(range, fabsf(oc[i]));
+                if (!std::isfinite(orr[i])) { nonfinite++; continue; }
+                max_err = fmaxf(max_err, fabsf(orr[i] - oc[i]));
+            }
+            const float norm = range > 0 ? max_err / range : 1.0f;
+            const bool pass = ok && nonfinite == 0 && norm < 1e-2f;
+            printf("same name, new bytes  run %d max_err/range=%.5f nonfinite=%ld -> %s\n",
+                   pass_i + 1, norm, nonfinite, pass ? "PASS" : "FAIL");
+            all = all && pass;
+        }
+        if (!all) fails++;
+    }
+
     // Fused shared-src1 matmuls. Two patterns, both K>2048 so the rocket
     // backend takes the streaming + fusion path: gate/up (equal N) and Q/K/V
     // (GQA-style UNEQUAL N). Each member's output, sliced from the fused [M,sumN]

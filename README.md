@@ -18,7 +18,7 @@ whisper.cpp, and other ggml-based hosts (e.g. transcribe.cpp, a multi-model STT 
 `GGML_BACKEND_PATH` at it and the NPU appears as a ggml device, exactly like ggml's own BLAS
 backend. It runs the Whisper encoder end to end and the prefill of Gemma-4,
 Qwen3.5 / 3.6, Llama-3.2, Phi-4, Ministral and more on the NPU. Decode stays on the CPU: it is
-small-M work, and below `ROCKET_MIN_M` (default 128 rows) the per-call dispatch and weight packing
+small-M work, and below `ROCKET_MIN_M` (default 32 rows) the per-call dispatch and weight packing
 outweigh the NPU's per-row advantage. That covers llama.cpp's single-row GEMV decode (~82x slower
 on the NPU) and also **batched** decode: whisper.cpp's default beam search presents 5 rows per
 step, still far below the crossover.
@@ -118,8 +118,9 @@ The backend offloads the ops that dominate prefill and leaves the rest on the CP
   bit-faithful and submit-chained: 1.07x at 4K, 1.50x at 8K, 1.25x at 16K, and parity below.
   [HW sweep, F16, 600 MHz]
 - **`MUL_MAT_ID`**: MoE routed experts, on the NPU by default for a **quantized** expert stack
-  meeting two conditions. A residency pre-flight must reserve the whole `[K, N, n_expert]` stack
-  up front, and the per-expert GEMM must pay for its own dispatch. Worth **1.9x the CPU** at
+  meeting two conditions. A residency pre-flight must fit an estimate of the whole
+  `[K, N, n_expert]` stack's footprint in the budget up front. The per-expert GEMM must also pay
+  for its own dispatch. Worth **1.9x the CPU** at
   pp2048 on gpt-oss-20b, against a CPU with its weight repack on. A stack that does not qualify is left on the CPU rather than
   half-ingested, so the default never falls below the experts-on-CPU baseline.
 - **Opt-in datapaths**: native int8 (`ROCKET_INT8=1`), int4 (`ROCKET_INT4=1`), and bf16
@@ -158,9 +159,8 @@ The envelope, all HW-validated on the RK3588 and PPL-faithful to the CPU backend
   the default above the experts-on-CPU baseline on a board too small to hold the stack, where
   claiming it unreserved reads *below* that baseline.
 
-  It costs a one-time ingest at the first prefill, per `llama_context`: **~36 s** on gpt-oss-20b
-  and **~32 s** on DeepSeek-V2-Lite. The dominant term is the NPU-BO pack, and it is bytes-bound
-  at ~500-545 MB/s rather than per expert. It therefore tracks how much of the stack goes
+  It costs a one-time ingest at the first prefill, per `llama_context`: **~21 s** on gpt-oss-20b
+  and **~18 s** on DeepSeek-V2-Lite, measured at 600 MHz. It tracks how much of the stack goes
   resident, not how many experts there are. See [API.md](API.md#native-quant-experts).
 
 **bf16 weights prefill ~0.55-0.6x native fp16**, re-decoded per micro-batch. Convert to fp16 for
@@ -235,6 +235,8 @@ route counters, so it asserts where its ops computed rather than inferring it fr
 | `test-rocket-bf16` | The bf16 datapath |
 | `test-rk3576-w8a8` | The RK3576 W8A8 route against the CPU backend. `Skipped` on any other part |
 | `test-rocket-placement` | The `supports_op` and `offload_op` contract |
+| `test-rocket-fa` | `FLASH_ATTN_EXT` against a double oracle, including the logits fp16 cannot hold |
+| `test-rocket-internals` | Host-only: the weight cache's identity, the MoE residency ledger across two live backends, the budget parser, the FA dump's file handling, the device-route circuit breaker |
 | Hadamard construction tests | The rotation construction |
 
 The shared graph and compare scaffolding is `test-common.h`.
