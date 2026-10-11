@@ -21,9 +21,11 @@
  * WHOLE public entry — host pack of A and of B into the native cubes, the submits, the
  * de-scatter back to row-major — because that is what a frontend pays. The ggml arms
  * time `ggml_backend_graph_compute` only, so their weights are already in their final
- * layout and cost nothing per call. That is not a rigged comparison, it is the real
- * asymmetry: this part has NO resident-weight matmul path, so the entry re-packs B on
- * every call. To price what building one would buy, the (K, N) pair at 2048x2048 is run
+ * layout and cost nothing per call. That is the asymmetry of THIS entry, which re-packs B
+ * on every call. The backend's RK3576 route does not pay it once a weight converges: it
+ * hands that weight to rocket_matmul_int8_rk3576_perc_wbo() as a resident device cube
+ * (ROCKET_RK3576_WDEV, default on), so this NPU arm prices the per-call-pack path, not the
+ * route. To price what the resident cube buys, the (K, N) pair at 2048x2048 is run
  * at four values of M. B's pack is a function of (K, N) alone, so a least-squares fit of
  * T(M) = alpha + beta*M puts the M-independent work — B's pack plus the fixed per-call
  * overhead — in alpha, with no library change and no second copy of the arithmetic.

@@ -44,23 +44,33 @@ with model size. Decode is forced to the CPU. It is bandwidth-bound and scales w
 rather than the backend.
 
 All figures warm, RK3588 @ 600 MHz, same GGUF on NPU and CPU. NPU prefill is perplexity-faithful
-to the CPU on every model. [HW sweep] The four quantized rows are against a CPU with llama.cpp's
-weight repack on (llama.cpp b11242, `-b 2048 -ub 2048`, governor pinned, 2026-09-29). The repack
-does not touch F16.
+to the CPU on every model. [HW sweep] The F16 rows run at the llama.cpp default `-b` and `-ub`,
+and the unmarked ones are 2026-07 sessions with both arms. The four quantized rows are against a
+CPU with llama.cpp's weight repack on (llama.cpp b11242, `-b 2048 -ub 2048`, governor pinned,
+2026-09-29). The repack does not touch F16.
 
-| Model | Params | Prefill NPU @pp2048 (xCPU) | Decode Q4 t/s | Fits Q4 |
-|---|---:|---:|---:|---:|
-| SmolVLM2-2.2B (multimodal) | 1.8B | 52.6 F16 (1.9x) | 14.5 | 1.0 GB |
-| Llama-3.2-3B | 3.2B | 45.5 F16 (2.6x) | 7.9 | 1.9 GB |
-| Ministral-3-3B | 3.4B | 39.8 F16 (2.4x) | 7.7 | 2.0 GB |
-| Phi-4-mini | 3.8B | 39.8 F16 (2.6x) | 7.0 | 2.3 GB |
-| Ministral-3-8B | 8.5B | 21.4 F16 (3.1x) | 3.8 | 4.8 GB |
-| Qwen3.5-9B | 9.0B | 24.9 F16 (3.5x) | 3.6 | 5.3 GB |
-| Gemma-4-12B | 11.9B | 15.0 F16 (3.2x) | 2.5 | 6.9 GB |
-| Phi-4 (14B) | 14.7B | 16.7 Q4 (3.1x) | 2.2 | 8.3 GB |
-| DeepSeek-V2-Lite (MoE+MLA) | 15.7B | 34.1 Q4 (1.44x) | 7.8 | 9.7 GB |
-| gpt-oss-20b (MoE) | 20.9B | 30.2 MXFP4 (1.90x) | 7.2 | 11.3 GB |
-| Qwen3.6-27B (hybrid) | 27.3B | 9.6 Q4 (3.2x) | 1.1 | 15.9 GB |
+| Model | Params | Prefill NPU t/s @pp2048 | xCPU @pp2048 | Decode Q4 t/s | Fits Q4 |
+|---|---:|---:|---:|---:|---:|
+| SmolVLM2-2.2B (multimodal) | 1.8B | 52.6 F16 | 1.9x | 14.5 | 1.0 GB |
+| Llama-3.2-3B | 3.2B | 56.0 F16 † | 2.6x † | 7.9 | 1.9 GB |
+| Ministral-3-3B | 3.4B | 48.3 F16 † | 2.4x † | 7.7 | 2.0 GB |
+| Phi-4-mini | 3.8B | 50.2 F16 † | 2.6x † | 7.0 | 2.3 GB |
+| Ministral-3-8B | 8.5B | 21.4 F16 | 3.1x | 3.8 | 4.8 GB |
+| Qwen3.5-9B | 9.0B | 24.9 F16 | 3.5x | 3.6 | 5.3 GB |
+| Gemma-4-12B | 11.9B | 20.0 F16 † | 3.2x † | 2.5 | 6.9 GB |
+| Phi-4 (14B) | 14.7B | 16.7 Q4 | 3.1x | 2.2 | 8.3 GB |
+| DeepSeek-V2-Lite (MoE+MLA) | 15.7B | 34.1 Q4 ‡ | 1.44x ‡ | 7.8 | 9.7 GB |
+| gpt-oss-20b (MoE) | 20.9B | 30.2 MXFP4 ‡ | 1.90x ‡ | 7.2 | 11.3 GB |
+| Qwen3.6-27B (hybrid) | 27.3B | 9.6 Q4 | 3.2x | 1.1 | 15.9 GB |
+
+† The t/s is a later build: llama.cpp b10558, 2026-08-29 for the 3B
+rows and 2026-09-02 for Gemma-4-12B. The xCPU is the 2026-07 pair, in which the NPU read 45.5,
+39.8, 39.8 and 15.0 t/s. No CPU arm ran against the later build.
+
+‡ The 2026-09-29 build. A 2026-10-09 A/B of the current expert route against the build before it
+reads 1.09-1.10x on gpt-oss-20b at pp512 and 1.09-1.14x on DeepSeek-V2-Lite at pp2048. The same
+A/B halved DeepSeek's one-time expert ingest, which `llama-bench`'s timed reps partly carry. That is
+the NPU arm only, governor `ondemand`, and the CPU ratios are not re-measured.
 
 The MoE rows are smaller because a MoE keeps more of its prefill on the CPU: the router, the
 attention path and the expert gathers. The experts themselves run on the NPU by default.
@@ -88,6 +98,10 @@ interactive turn you feel. RK3588, 8-core, NPU at 600 MHz, warm.
 | Q8_0   | 6.9 -> 17.4 (2.5x) | 6.7 -> 19.3 (2.9x) | 6.4 -> 17.7 (2.8x) |
 | Q4_K_M | 6.5 -> 17.0 (2.6x) | 6.4 -> 19.1 (3.0x) | 6.0 -> 17.4 (2.9x) |
 
+The table is a 2026-07-01 session, F16 at the default `-b` and `-ub` and the quants at
+`-b 2048 -ub 2048`. Its quantized rows' CPU ran without llama.cpp's weight repack. Against a
+repacked CPU, Q4_K_M at pp2048 reads 9.81 -> 19.33 t/s, 2.0x [HW sweep 2026-07-17, 8 threads].
+
 **Decode (generation), t/s, CPU ~ NPU.** It runs off the NPU and is bandwidth-bound. It therefore
 scales with the quant rather than the backend: F16 1.4 -> Q8_0 2.5 -> Q4_K_M 3.8 t/s.
 
@@ -104,8 +118,9 @@ scales with the quant rather than the backend: F16 1.4 -> Q8_0 2.5 -> Q4_K_M 3.8
 On a long prompt the NPU cuts time-to-first-token ~3x and nearly halves the turn. On a short
 chatty turn the wall is decode-bound, so the NPU barely moves it and quantization is the lever.
 
-For most boards Q4_K_M + NPU is the sweet spot: ~2.9x prefill and a 2.8x-faster stream than F16,
-in 4.83 GB, which fits an 8 GB board. F16 is the max-prefill option when RAM is ample.
+For most boards Q4_K_M + NPU is the sweet spot, in 4.83 GB, which fits an 8 GB board. It reads
+~2.0x a repacked CPU's prefill at pp2048, with a 2.8x-faster stream than F16. F16 is the
+max-prefill option when RAM is ample.
 
 ## What runs on the NPU
 
@@ -115,14 +130,15 @@ The backend offloads the ops that dominate prefill and leaves the rest on the CP
   aligns (`K%32`, `N%16`, `K>=64`, `N>=64`). Quantized weights (`Q8_0` / `Q4_K` / `Q6_K` / …) also
   offload, dequantized to fp16 on the fly. Decode (`M=1` GEMV) is forced to the CPU.
 - **`FLASH_ATTN_EXT`**: prefill attention, on the NPU by default when `n_kv >= 1024`. It is
-  bit-faithful and submit-chained: 1.07x at 4K, 1.50x at 8K, 1.25x at 16K, and parity below.
-  [HW sweep, F16, 600 MHz]
+  bit-faithful and submit-chained. On Gemma-4-12B F16 it read 1.07x the CPU at 4K, 1.50x at 8K,
+  1.25x at 16K, and parity below [HW sweep 2026-06, 600 MHz]. Those ratios are from an earlier
+  build of the attention path and are not re-measured.
 - **`MUL_MAT_ID`**: MoE routed experts, on the NPU by default for a **quantized** expert stack
   meeting two conditions. A residency pre-flight must fit an estimate of the whole
   `[K, N, n_expert]` stack's footprint in the budget up front. The per-expert GEMM must also pay
-  for its own dispatch. Worth **1.9x the CPU** at
-  pp2048 on gpt-oss-20b, against a CPU with its weight repack on. A stack that does not qualify is left on the CPU rather than
-  half-ingested, so the default never falls below the experts-on-CPU baseline.
+  for its own dispatch. Worth **1.9x the CPU** at pp2048 on gpt-oss-20b, against a CPU with its
+  weight repack on [HW sweep 2026-09-29]. A stack that does not qualify is left on the CPU rather
+  than half-ingested, so the default never falls below the experts-on-CPU baseline.
 - **Opt-in datapaths**: native int8 (`ROCKET_INT8=1`), int4 (`ROCKET_INT4=1`), and bf16
   (`ROCKET_BF16=1`). Each is numerically faithful, and the [knob table](API.md#runtime-knobs) has
   the detail.
@@ -142,12 +158,14 @@ The envelope, all HW-validated on the RK3588 and PPL-faithful to the CPU backend
   Decode (M=1 GEMV) stays on the CPU, ~82x slower on the NPU.
 - **Quantization buys RAM and model-fit rather than prefill speed** at this operating point.
   Resident matmul is ~460 GOP/s across precisions, DMA/dispatch-bound rather than MAC-bound. A
-  quantized GGUF wants `-b 2048 -ub 2048`. That is bottleneck-conditional rather than a permanent
-  property, and [API.md](API.md#why-quantization-does-not-speed-prefill) has the detail.
+  quantized GGUF whose fp16 image fits RAM wants `ROCKET_QUANT_RESIDENT=auto` at the default
+  `-ub`, and one that does not fit wants `-b 2048 -ub 2048`. That is bottleneck-conditional rather
+  than a permanent property, and [API.md](API.md#why-quantization-does-not-speed-prefill) has the
+  detail.
 - **MoE routed experts are worth 1.9x the CPU at pp2048** on gpt-oss-20b, MXFP4,
-  `-b 2048 -ub 2048`, against a CPU with its weight repack on. Against an unrepacked CPU it read
-  ~1.8x at pp512, winning at every prefill length, and ~1.6x to 1.7x over experts-on-CPU at the
-  llama.cpp default `-ub 512`.
+  `-b 2048 -ub 2048`, against a CPU with its weight repack on (2026-09-29 build). Against an
+  unrepacked CPU it read ~1.8x at pp512, winning at every prefill length (2026-08-27 build). Over
+  experts-on-CPU at the llama.cpp default `-ub 512` it read ~1.6x to 1.7x.
 
   The lever is **residency rather than quantization**. A quantized expert on the naive route is
   dequantized on the host *every micro-batch*. That decode does not shrink with the row count, so
@@ -193,7 +211,7 @@ Accuracy taken off the device is **1.011x wikitext-2 perplexity** against that s
 That is over eight chunks whose own error bar is +-0.59 [HW sweep].
 
 **Read a `pp512` figure on this part as a calibration measurement** rather than as the route. At
-that length every call is still a calibration forward. The route, its twelve `ROCKET_RK3576_*`
+that length every call is still a calibration forward. The route, its thirteen `ROCKET_RK3576_*`
 knobs, and what each is measured against are in [API.md](API.md#the-rk3576-second-target).
 
 ## Requirements
@@ -391,10 +409,16 @@ GGML_BACKEND_PATH=$PWD/build-dl/libggml-rocket.so \
 K-accum is the best-prefill operating mode, with DATA_REUSE following, and it is on by default.
 Cap `-c` so the weights and KV fit RAM.
 
-A bigger `-b` and `-ub`, which is M, means better NPU utilization. For a quantized GGUF run
-`-b 2048 -ub 2048`, because its per-micro-batch dequant roughly halves prefill at the llama.cpp
-`-ub 512` default. Gemma-4's chat template needs `--jinja`, or use `llama-completion -no-cnv` for
-raw prompt completion.
+A quantized GGUF dequantizes to fp16 per micro-batch, and two settings cut that cost. If its fp16
+image fits RAM, set `ROCKET_QUANT_RESIDENT=auto` and keep the default `-ub`. That reads 1.35-1.75x
+over the default configuration on seven 1.8-11.9 B models. Stacked on `-b 2048 -ub 2048` it reads
+1.00-1.66x [HW sweep 2026-08, 600 MHz, three rotated passes each].
+
+If the fp16 image does not fit, run `-b 2048 -ub 2048`. That is 0.91-1.53x over the `-ub 512`
+default, model-dependent and negative on two models of eleven, so measure it.
+
+Gemma-4's chat template needs `--jinja`, or use `llama-completion -no-cnv` for raw prompt
+completion.
 
 Two more things shape a run:
 
@@ -426,10 +450,10 @@ shows `ggml-rocket: op ordinal N is X in this .so and Y in the host's ggml` foll
 
 The fix is to rebuild against that host checkout's ggml headers, and to re-check on every ggml
 bump. This backend is checked against `GGML_BACKEND_API_VERSION` 2 and 3, and another version
-builds with a warning. It builds against the ggml of whisper.cpp 1.8.6 through 1.9.4 and of
-llama.cpp b10558 through b11401. llama.cpp moved to
-version 3 at b11351 and still labels that ggml 0.25.3. Read a host's API version from its
-`ggml/src/ggml-backend-impl.h`, not from the ggml version.
+builds with a warning. It builds against the ggml of whisper.cpp 1.8.6 through 1.9.5 and of
+llama.cpp b10558 through b11539. llama.cpp moved to version 3 at b11351, and b11351 through b11401
+label that ggml 0.25.3. Read a host's API version from its `ggml/src/ggml-backend-impl.h`, not
+from the ggml version.
 
 If the device appears but runs zero matmuls, the backend was built without a working `offload_op`.
 See [implementation notes](API.md#implementation-notes).
@@ -442,14 +466,19 @@ matching the target's glibc.
 
 ## The rocket NPU stack
 
-This backend is one frontend of an open source stack for Rockchip NPUs, three userspace projects
-plus a set of optional kernel patches:
+This backend is one frontend of an open source stack for Rockchip NPUs. The stack is a driver
+library, three frontends, a submit provider for the vendor kernel, and a set of optional kernel
+patches:
 
 - **[`rocket-userspace`](https://github.com/gregordinary/rocket-userspace)** (`librocketnpu`): the
   userspace driver, matmul, and on-NPU op library. It is the dependency, and usable on its own.
 - **`ggml-rocket`** (this project): a ggml backend `.so` for `llama.cpp` and `whisper.cpp`.
 - **[`tflite-rocket`](https://github.com/gregordinary/tflite-rocket)**: a TFLite external delegate
   for detection models, linking the same driver.
+- **[`ort-rocket`](https://github.com/gregordinary/ort-rocket)**: an ONNX Runtime execution
+  provider for transformer encoders and per-layer convolutions, linking the same driver.
+- **[`rknpu-submit`](https://github.com/gregordinary/rknpu-submit)**: a submit provider that runs
+  `librocketnpu` on the vendor `rknpu` BSP kernel driver instead of mainline `rocket`.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional out-of-tree
   kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock from its 200 MHz
   boot default to 600 MHz, and the prefill numbers here assume them.
