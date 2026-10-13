@@ -1026,8 +1026,8 @@ static bool rocket_quant_resident_on(void) {
 // default -- so the big LLM weights (attn/FFN, K in {3072,8192,...}) pay their weight
 // scatter (packB) ONCE and reuse it across every later micro-batch / prefill instead of
 // re-scattering per call (the streaming tax). Measured net win over the fused-streaming
-// default [HW sweep, Llama-3.2-3B-F16, pp2048 -ub512, 600 MHz: resident 41.9 vs default 39.9
-// t/s = +5%; the pure packB delta with fusion held off is +10.6%]. QKV/gate-up fusion is KEPT
+// default [HW sweep 2026-08-29, pp2048 at the default -ub, 600 MHz, three rotated passes:
+// 1.078-1.084x on Llama-3.2-3B, Ministral-3-3B and Phi-4-mini F16]. QKV/gate-up fusion is KEPT
 // (see rocket_fuse_on): a fusable group routes through ggml_backend_rocket_mul_mat_group_resident
 // (one resident combined-N weight), stacking the packB-once win with fusion's shared packA +
 // single submit -- both levers, not a trade.
@@ -4646,8 +4646,10 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
 // activation as a constant split input, so we just bucket the split's MUL_MATs by
 // src[1] and write each member's own dst -- no consumer rewiring, no hazards.
 //
-// Runs on the STREAMING path only (whisper's prepacked path would need a composite
-// per-group cache key -- deferred). ROCKET_NO_FUSE=1 disables for clean A/B.
+// Runs in the streaming regime only (K > 2048, see the fusable predicate below): streaming-
+// fused by default, or with ROCKET_F16_RESIDENT resident-fused under a composite per-group
+// cache key (ggml_backend_rocket_mul_mat_group_resident). The default K<=2048 prepacked
+// weights (whisper's encoder) are not fused. ROCKET_NO_FUSE=1 disables for clean A/B.
 // ---------------------------------------------------------------------------
 static bool rocket_fuse_on(void) {
     static const int v = [] {

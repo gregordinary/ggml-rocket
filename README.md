@@ -19,9 +19,9 @@ whisper.cpp, and other ggml-based hosts (e.g. transcribe.cpp, a multi-model STT 
 backend. It runs the Whisper encoder end to end and the prefill of Gemma-4,
 Qwen3.5 / 3.6, Llama-3.2, Phi-4, Ministral and more on the NPU. Decode stays on the CPU: it is
 small-M work, and below `ROCKET_MIN_M` (default 32 rows) the per-call dispatch and weight packing
-outweigh the NPU's per-row advantage. That covers llama.cpp's single-row GEMV decode (~82x slower
-on the NPU) and also **batched** decode: whisper.cpp's default beam search presents 5 rows per
-step, still far below the crossover.
+outweigh the NPU's per-row advantage. That covers llama.cpp's single-row GEMV decode, which is
+bound by the DDR bandwidth the NPU shares with the CPU. It also covers **batched** decode:
+whisper.cpp's default beam search presents 5 rows per step, still far below the crossover.
 
 This is a separate project from the driver. `rocket-userspace`, the `librocketnpu` dependency,
 builds and runs on its own, and this backend links it.
@@ -155,7 +155,8 @@ The backend offloads the ops that dominate prefill and leaves the rest on the CP
 The envelope, all HW-validated on the RK3588 and PPL-faithful to the CPU backend:
 
 - **Prefill engine.** The NPU accelerates prefill, a batched GEMM, and the Whisper encoder.
-  Decode (M=1 GEMV) stays on the CPU, ~82x slower on the NPU.
+  Decode (M=1 GEMV) stays on the CPU. It is bound by DDR bandwidth, which the NPU shares with the
+  CPU, so offloading it adds only dispatch overhead.
 - **Quantization buys RAM and model-fit rather than prefill speed** at this operating point.
   Resident matmul is ~460 GOP/s across precisions, DMA/dispatch-bound rather than MAC-bound. A
   quantized GGUF whose fp16 image fits RAM wants `ROCKET_QUANT_RESIDENT=auto` at the default
