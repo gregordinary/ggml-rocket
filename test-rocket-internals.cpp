@@ -3,7 +3,8 @@
 /*
  * test-rocket-internals.cpp — host-only gate for the backend's internal contracts that no
  * device run can see: the FA dump's file handling, the MB-budget parser, the weight cache's
- * identity, the MoE residency ledger across two live backends, the H60 table's one-time
+ * identity, the MoE residency ledger across two live backends, the resident-weight budget
+ * each residency variable sets at init, the H60 table's one-time
  * build under concurrent first use, and the device-route circuit breaker.
  *
  * It includes ggml-rocket.cpp directly, so every `static` helper is in reach without a test
@@ -225,6 +226,54 @@ static void test_moe_ledger(void) {
 }
 
 // ---------------------------------------------------------------------------
+// The resident-weight budget at init: the variable that turned residency on sizes it, and only
+// an accepted ROCKET_CACHE_MB overrides it. One child per case, because the on/off readers
+// cache the environment for the life of the process.
+static const size_t BUDGET_AUTO = SIZE_MAX;   // want_mb marker: the auto branch ran
+struct budget_case { const char * cache_mb, * f16, * quant; size_t want_mb; const char * what; };
+
+static int test_init_budget_child(const budget_case & c) {
+    const char * names[] = { "ROCKET_CACHE_MB", "ROCKET_F16_RESIDENT", "ROCKET_QUANT_RESIDENT",
+                             "ROCKET_QUANT_RESIDENT_RESERVE_MB" };
+    for (const char * n : names) unsetenv(n);
+    if (c.cache_mb) setenv("ROCKET_CACHE_MB", c.cache_mb, 1);
+    if (c.f16)      setenv("ROCKET_F16_RESIDENT", c.f16, 1);
+    if (c.quant)    setenv("ROCKET_QUANT_RESIDENT", c.quant, 1);
+    ggml_backend_t be = ggml_backend_rocket_init();
+    const auto * ctx = (const ggml_backend_rocket_context *)be->context;
+    if (c.want_mb == BUDGET_AUTO)
+        CHECK(ctx->resident_floor_bytes == rocket_auto_budget_reserve(), c.what);
+    else
+        CHECK(ctx->cache_budget == c.want_mb << 20, c.what);
+    ggml_backend_free(be);
+    return g_fails;
+}
+
+static void test_init_budget(void) {
+    printf("-- resident-weight budget at init\n");
+    const budget_case cases[] = {
+        { nullptr, nullptr, nullptr, 2048, "with nothing set the budget is the 2 GB default" },
+        { nullptr, "1",     nullptr, 2048, "ROCKET_F16_RESIDENT=1 keeps the default budget" },
+        { nullptr, "",      "3000",  3000, "an empty ROCKET_F16_RESIDENT leaves ROCKET_QUANT_RESIDENT's budget" },
+        { nullptr, "0",     "3000",  3000, "ROCKET_F16_RESIDENT=0 leaves ROCKET_QUANT_RESIDENT's budget" },
+        { nullptr, "",      "auto",  BUDGET_AUTO,
+          "an empty ROCKET_F16_RESIDENT leaves ROCKET_QUANT_RESIDENT=auto's budget and floor" },
+        { nullptr, "3000",  "5000",  3000, "ROCKET_F16_RESIDENT's budget wins when both are on" },
+        { "",      "3000",  nullptr, 3000, "an empty ROCKET_CACHE_MB does not override the residency budget" },
+        { "abc",   "3000",  nullptr, 3000, "a refused ROCKET_CACHE_MB does not override the residency budget" },
+        { "4096",  "3000",  nullptr, 4096, "an accepted ROCKET_CACHE_MB overrides the residency budget" },
+    };
+    for (const auto & c : cases) {
+        fflush(stdout);
+        const pid_t pid = fork();
+        if (pid == 0) { const int f = test_init_budget_child(c); fflush(stdout); _exit(f ? 1 : 0); }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) g_fails++;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // H60: concurrent first callers all see the finished table.
 static void test_h60(void) {
     printf("-- H60 one-time build under concurrent first use\n");
@@ -274,6 +323,7 @@ int main(void) {
     test_parser();
     test_weight_key();
     test_moe_ledger();
+    test_init_budget();
     test_h60();
     test_breaker();
     printf("%s\n", g_fails ? "FAIL" : "PASS");

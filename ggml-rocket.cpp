@@ -321,6 +321,11 @@ struct ggml_backend_rocket_context {
                              // T=3 7.15 / T=4 8.06 / T=5 8.24 / T=6 8.27 t/s — hard
                              // knee at 5 (3 cores + 2 to fill pack/read idle bubbles);
                              // 6+ is noise. ROCKET_N_THREADS overrides (1..8).
+                             // Six later measured better on both residency routes:
+                             // 1.022x at pp2048 on gpt-oss-20b's experts, and the most
+                             // f16 weights placed on a 12 B F16 at -p 512 (293 against
+                             // 286 at 5). The default stays 5 because the published
+                             // figures were measured at 5.
 
     // Pack-weights-once cache: a persistent device context (worker fds) +
     // one resident weight handle per static F16 weight tensor. Created lazily on
@@ -450,7 +455,7 @@ struct ggml_backend_rocket_context {
     // budget and a device BO spends that RAM too.
     size_t rk76_resident_bytes = 0;
     int    rk76_ncal   = -1;   // ROCKET_RK3576_NCAL:   calibration forwards (default 2)
-    float  rk76_calsafe = 0.0f; // ROCKET_RK3576_CALSAFE: colmax safety factor (default 2)
+    float  rk76_calsafe = 0.0f; // ROCKET_RK3576_CALSAFE: colmax safety factor (default 3.0)
     float  rk76_bootmargin = 0.0f; // ROCKET_RK3576_BOOTMARGIN (default 1.5)
     int    rk76_arow   = -1;   // ROCKET_RK3576_AROW: per-ROW activation scale (default 0;
                                // 1 = every offloaded GEMM, 2 = only K-split ones)
@@ -582,15 +587,16 @@ struct ggml_backend_rocket_context {
     // before anything reads them.
     std::vector<ggml_fp16_t> fa_Qd, fa_Kd, fa_Vd, fa_Md, fa_Od;
 
-    // MUL_MAT_ID (MoE routed-expert FFN) path, OPT-IN via ROCKET_MOE=1 (default off --
-    // quant-MoE offload is dequant-bound, a net loss; see rocket_moe_on). llama.cpp
+    // MUL_MAT_ID (MoE routed-expert FFN) path. Claimed by default where the pre-flight can
+    // reserve the expert stack resident; ROCKET_MOE=1 claims every op the handler can
+    // compute and ROCKET_MOE=0 none (see rocket_moe_mode). llama.cpp
     // routes every expert gate/up/down GEMM through GGML_OP_MUL_MAT_ID; the handler
     // buckets (slot,token) rows by expert id, runs each expert's [M_e,K]x[N,K]^T on the
-    // NPU (fanned across worker fds via rocket_matmul_fp16_mt, weight dequant->fp16 like
-    // the dense path), and scatters the rows back. All buffers grow-only (high-water
+    // NPU (resident int8 codes on the native-quant route; a streamed expert is dequantized
+    // to fp16 like the dense path and fanned across worker fds via rocket_matmul_fp16_mt),
+    // and scatters the rows back. All buffers grow-only (high-water
     // mark), fully overwritten before read, so reuse is bit-identical to a fresh
-    // allocation. Only touched by graph_compute (serial per backend). moe_mode = -1 unqueried.
-    int moe_mode = -1;
+    // allocation. Only touched by graph_compute (serial per backend).
     std::vector<float>       moe_Af32;    // gathered [M_e,K] f32 activations (per expert)
     std::vector<ggml_fp16_t> moe_A16;     // packed [Mp_e,K] fp16 activations
     std::vector<ggml_fp16_t> moe_B16;     // dequantized [N,K] fp16 expert weight
@@ -768,7 +774,7 @@ static inline void rk_f16_stop(ggml_backend_rocket_context * ctx, const char * f
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    ctx->f16_stop_why      = buf;
+    ctx->f16_stop_why.append(buf);       // empty here; not operator=, see glibc_compat.c
     ctx->f16_stop_resident = ctx->resident_bytes;
 }
 
@@ -954,7 +960,7 @@ static int rocket_moe_group_env(void) {
 // up onto (default 64 rows). See rocket_moe_bucket_m for why bucketing is mandatory rather than a
 // tuning knob, and for the ladder itself. Rounded up to a power of two: the ladder puts its
 // intermediate rung at 1.5x each power, so a power-of-two floor is what keeps every rung on the
-// M%4 hardware contract.
+// M%4 rule of librocketnpu's resident int8 planner (a library rule; the silicon computes any M).
 // Cached like every other knob here, and now it matters: the placement gate reads this per
 // MoE node per graph split (the per-expert row floor), not just once per context at bucket
 // time, so an uncached getenv would sit on a path the scheduler walks every micro-batch.
@@ -1227,10 +1233,15 @@ static void rocket_fatiming_dump(void) {
 //
 // WHY IT LIVES HERE AND NOT IN A GATE. A wrong split computes a full, correctly sized, entirely
 // plausible surface, and the end-to-end instruments cannot see it: a greedy continuation absorbs
-// a small difference and prints the same text, and llama-perplexity does not reach this handler
-// at all on the shapes measured here. llama-bench does reach it, and llama-bench reports no
-// number that depends on the arithmetic -- so without this knob the one tool that exercises the
-// code has no observable that would notice it breaking.
+// a small difference and prints the same text, and llama-perplexity, which does reach this
+// handler (Ministral-3-3B F16 at -c 2048 -fa on [HW sweep 2026-09-07]), shows a split error only
+// as a perplexity change it cannot attribute to an op. llama-bench reaches it too and reports no
+// number that depends on the arithmetic -- so without this knob neither tool has an observable
+// that names the handler.
+//
+// READ IT UNDER llama-bench -v. The checksum prints from an atexit handler, and a tool built on
+// llama.cpp's common_init, llama-perplexity among them, installs an asynchronous log that
+// discards messages once its worker has paused, so the line never appears there.
 //
 // The hash is over the RAW dst bytes, which is what bit-identical means. dst is contiguous by the
 // supports_op gate, so ggml_nbytes covers exactly the surface written. Off by default and read
@@ -1240,9 +1251,12 @@ static void rocket_fatiming_dump(void) {
 // chunk count only if the handler is reproducible at a FIXED chunk count -- and on gemma4-12b F16
 // at pp2048 it is not: two runs differing in nothing disagreed twice in seven on one build, same
 // graph, same 288 ops and 2818572288 bytes [HW 2026-09-07, RK1]. Six runs under level 2 were then
-// identical in all 288 op lines, so no op has been named and the rate is not bounded. Until it
-// is, an equality across k measures the split PLUS whatever the handler does on its own. Run the
-// null arm against itself first, the way a paired A/B does for time.
+// identical in all 288 op lines. A replay of the dumped op named the cause: the RK3588's three
+// cores do not compute fp16 identically on output lane 0 of each 16-channel group (n%16==0), and
+// the rocket driver places each job on a core by load. The replay gave the odd value in 7-91% of
+// trials at 5 workers and in none of 200 at 1 [HW sweep 2026-09-26/27, RK1]. So an equality
+// across k measures the split PLUS the core each job ran on. Run the null arm against itself
+// first, the way a paired A/B does for time, or compare the hashes at ROCKET_N_THREADS=1.
 //
 // ROCKET_FA_CHECKSUM=2 ADDS PER-OP LINES, AND THAT IS WHAT LOCALIZES A MOVING HASH. One
 // aggregate hash says a run differed; it cannot say where, and the two candidates -- one op
@@ -2137,10 +2151,12 @@ static int ggml_backend_rocket_mul_mat_int8(
 // RK3576 W8A8. A DIFFERENT ROUTE, not a parameterization of the one above.
 //
 // The RK3588 int8 entry hands back a raw int32 accumulator and the host applies both
-// scales. The RK3576's writes int8: any output element wider than one byte poisons that
-// part's NEXT submit across processes, so the int32 sibling is not a route a frontend
-// takes. What the part gives instead is a per-output-COLUMN requant in the DPU epilogue,
-// and the whole port hangs off supplying its scale.
+// scales. The RK3576's writes int8, with a per-output-COLUMN requant in the DPU epilogue,
+// and the whole port hangs off supplying its scale. It was built that way because the
+// int32 sibling's older writers corrupted the part's NEXT submit across processes. The
+// dense writer, now that entry's default, leaves the next submit
+// unaffected [HW sweep, H96 MAX M9, rocket 1.6.0, 2026-09-30]; this handler still does not
+// call it.
 //
 // THE ROUTE, and every piece of it is load-bearing on the two models measured:
 //
@@ -2150,21 +2166,23 @@ static int ggml_backend_rocket_mul_mat_int8(
 //      WORSE on one model of two and 1.08x better on the other — so the per-tensor
 //      activation scale is the measured choice, not the lazy one.
 //   3. per-column output requant, whose scale is frozen from a calibration pass and
-//      divided by a safety factor near 2 (see rocket_rk3576_weight).
+//      divided by a safety factor, ROCKET_RK3576_CALSAFE, 3.0 by default (see where
+//      ggml_backend_rocket_mul_mat_rk3576 reads it, and rocket_rk3576_weight).
 //   4. host dequantize by the scale the entry was ASKED for, not the gain its integer
 //      ramp delivered. The two differ by `worst_rel_err` (0.5-0.9% median on a real
 //      model's shapes); de-quantizing by the achieved gain instead is a measured WASH and
 //      is deliberately not done.
 //
 // Composed, that route measures 1.008x / 1.020x wikitext-2 perplexity against fp32 on
-// Qwen2.5-1.5B and SmolLM2-1.7B, with the frozen scale and the safety factor — against
+// Qwen2.5-1.5B and SmolLM2-1.7B, with the frozen scale and the safety factor (SmolLM2's
+// figure at 2.0, the factor's earlier default) — against
 // 1.11x / 2.26x for the per-tensor output scale this replaces.
 // [host arithmetic over two models, 2026-08-10; the DEVICE composition of the route is
 //  gated separately — nothing here was measured on the part]
 //
-// M carries NO constraint on this part (M=1 computes), which is the opposite of the
-// RK3588, where rows are the conv's spatial height and height < 4 mis-computes. So there
-// is deliberately no rocket_pad_m() here.
+// M carries NO constraint on this part (M=1 computes). The RK3588 route pads M to 4s
+// because librocketnpu's planners take rows in fours (a library rule; its generators compute
+// any M). So there is deliberately no rocket_pad_m() here.
 //
 // WHERE THIS CODE AND THAT INSTRUMENT KNOWINGLY DIFFER, so a device-vs-host comparison is
 // read against the right reference: rocket_q8() clamps to [-127, 127] and the simulator
@@ -2327,9 +2345,12 @@ static int rk76_rotate(float * row, int K) {
 // cut.
 //
 // One thing puts a K out of reach of one device call: the library refuses K >= 6176 —
-// past there its single-task planner cannot fit an output tile — and the int32 K-split
-// route that would run it wedges the part until it is rebooted, so that is not a route a
-// frontend takes.
+// past there its single-task planner cannot fit an output tile. Its int32 K-split entry
+// (rocket_matmul_int8_rk3576_i32) wedged the part until a reboot on the older narrow writer,
+// once, at M=512 K=8192 N=2048 under rocket 1.5.0. The dense writer, that entry's default,
+// runs the same shape in 345.7 ms with no redo [HW sweep, H96 MAX M9, rocket 1.6.0,
+// 2026-09-30]. This handler does not call it: it splits K on the host instead, off by
+// default (rk76_ksplit).
 //
 // The K at which an int8 matmul job used to stall at a fixed output channel (320 at
 // K=2240) are NOT a frontend concern. Where a job stops is a rule on the weight slice and
@@ -2800,8 +2821,10 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         ctx->rk76_resident_bytes += est;
         if (rocket_debug_on()) {
             std::string cuts;
-            for (size_t c = 0; c < kc.size(); c++)
-                cuts += (c ? "+" : "") + std::to_string(kc[c]);
+            for (size_t c = 0; c < kc.size(); c++) {   // appended, not prepended: glibc_compat.c
+                if (c) cuts += '+';
+                cuts += std::to_string(kc[c]);
+            }
             GGML_LOG_DEBUG("[rk3576-cache] +%-22s N=%6d K=%6d (%zu chunk(s): %s)  "
                            "resident=%zuMB\n", key.c_str(), N, K, kc.size(), cuts.c_str(),
                            ctx->rk76_resident_bytes >> 20);
@@ -4445,8 +4468,10 @@ static void ggml_backend_rocket_mul_mat(ggml_backend_rocket_context * ctx, ggml_
     }
 
     // Fast path: static F16 weight, plain 2D (no batch broadcast). Pack once,
-    // reuse across forward passes. Falls through to the per-call mt path on miss.
-    // ROCKET_NO_PREPACK=1 disables it entirely (force the mt path).
+    // reuse across forward passes. Falls through to the per-call path on a miss: the
+    // streaming context (rocket_matmul_fp16_stream) first, rocket_matmul_fp16_mt when
+    // ROCKET_NO_STREAM is set or the stream fails. ROCKET_NO_PREPACK=1 disables the fast
+    // path entirely, so the per-call path takes every op.
     //
     // Prepacked is CORRECT for all K. Coherence rests on two choices that close the
     // cache-aliasing class: the cache keys on the weight NAME [rocket_weight_key], not
@@ -4968,11 +4993,12 @@ static void ggml_backend_rocket_free(ggml_backend_t backend) {
         // GEMM that shrinks with M. So the streamed remainder's share of the wall clock grows as
         // the prefill shortens, and the route falls off a cliff rather than degrading smoothly:
         // measured on gpt-oss at pp512, 99% resident is 17.6 t/s and 82% resident is 12.2 --
-        // below the 14.1 you get by simply leaving the experts on the CPU. Residency is not a
+        // below the 14.1 you get by simply leaving the experts on the CPU [HW sweep 2026-07-14]. Residency is not a
         // nice-to-have for this route; it IS the route.
-        // 80%, and the threshold is CONSERVATIVE rather than measured at its edge: 91%
-        // resident was the fastest arm on this board, 52% read below the experts-on-CPU
-        // baseline at pp512, and nothing has bracketed the crossover between them. So this
+        // 80%, and the threshold is CONSERVATIVE rather than measured at its edge: on the
+        // 2026-08-27 build 91% resident was the fastest arm on this board, 52% read below the
+        // experts-on-CPU baseline at pp512, and nothing has bracketed the crossover between
+        // them. So this
         // warns over a range that includes configurations which are still a win -- the right
         // direction for a warning whose subject is a silent 0.97x.
         if (res_pct < 80.0)
@@ -5765,8 +5791,10 @@ static int rocket_moe_pick_group(int K, int N) {
 // stacks than ROCKET_MOE=1 holds, and CPU-placing a whole stack turns out to be dearer than
 // streaming a few experts: gpt-oss-20b on a 31 GiB board reads 20.8/24.8 (pp512/pp2048)
 // against 24.5/32.9 forced, which streams 9% [HW sweep 2026-08-27]. **"Any streaming is a
-// cliff" is too strong** -- 91% resident was the fastest arm measured. The crossover is
-// somewhere between 52% and 82%, and no run has bracketed it more tightly than that.
+// cliff" is too strong** -- 91% resident was the fastest arm measured. On this build the
+// crossover is somewhere between 52% and 91%, and no run has bracketed it more tightly than
+// that. (The 82% that measured below the CPU is the 2026-07-14 build's; see
+// rocket_moe_expert_resident.)
 //
 // The trade is therefore SIGN for PEAK, and it is the right one for a default: this is never
 // below the experts-on-CPU baseline at any budget (1.47-1.81x above it on a 31 GiB board,
@@ -6164,9 +6192,9 @@ static void rk_moe_preflight_set_workers(int n_workers) {
 //   in full and the cap matters.
 //
 // This REPLACES an adaptive granule that doubled whenever the distinct-slot count neared the
-// cap, and that design had a fatal RATCHET. The slot set never shrinks -- the driver's scratch
-// slots are permanent, it has no eviction -- so once the set passed the cap, the "do we still
-// have headroom" test could never become true again. Every subsequent new bucket therefore
+// cap, and that design had a fatal RATCHET. The slot set it counted never shrinks -- moe_slots
+// records every shape ever requested, whatever librocketnpu has since recycled -- so once the
+// set passed the cap, the "do we still have headroom" test could never become true again. Every subsequent new bucket therefore
 // doubled the granule, in a loop, until it hit its 4096 ceiling on the very first overflow.
 // After that a 356-row expert computed 4096 rows: 88% of every expert GEMM was padding, and the
 // native route measured 6.11 t/s at pp2048 where it should be several times that. The bug was
@@ -6183,26 +6211,30 @@ static int rocket_moe_bucket_m(ggml_backend_rocket_context * ctx, int M, int K, 
     if (M > g) {
         Mb = (M + 3) & ~3;                          // absurd M: fall through, still M%4-legal
         for (int p = g; p <= (1 << 22); p *= 2) {
-            // The 1.5x rung between p and 2p, rounded up onto the M%4 HW contract. That
-            // rounding is load-bearing at a small granule: at g=4 the raw rung would be 6,
-            // which the driver rejects (-1) and the expert would silently fall back to fp16.
+            // The 1.5x rung between p and 2p, rounded up onto the resident int8 planner's
+            // M%4 rule. That rounding is load-bearing at a small granule: at g=4 the raw rung
+            // would be 6, which the planner refuses (-1) and the expert would silently fall
+            // back to fp16.
             const int mid = (p + p / 2 + 3) & ~3;
             if (M <= mid)   { Mb = mid;   break; }
             if (M <= p * 2) { Mb = p * 2; break; }
         }
     }
 
-    // Track the distinct (M,K,N) slots we have asked the driver for. Purely diagnostic now that
-    // the ladder bounds them -- but warn once if we ever near the table, because the failure it
-    // would cause (rki_ctx_scratch returns NULL, the expert degrades to fp16) reads as "the win
-    // didn't materialize" rather than as a fault. Shapes past 2^21 cannot be packed into the
+    // Track the distinct (M,K,N) slots we have asked librocketnpu for. Purely diagnostic now
+    // that the ladder bounds them -- but warn once if we ever near its 32-slot table. Past it the
+    // library recycles the least recently used slot (rocket_slot_get), so shapes that cycle
+    // through more than 32 slots free and re-allocate scratch BOs on every miss, and an
+    // allocation that fails (rki_ctx_scratch returns NULL) degrades that expert to fp16. Both
+    // read as "the win didn't materialize" rather than as a fault. Shapes past 2^21 cannot be packed into the
     // key; they are far outside any real model, so skip the accounting rather than mis-key it.
     if (K < (1 << 21) && N < (1 << 21)) {
         ctx->moe_slots.insert(rk_moe_slot_key(Mb, K, N));
         if (ctx->moe_slots.size() == 28)
-            GGML_LOG_WARN("[moe-int8] %zu distinct (M,K,N) scratch slots, near the driver's 32 "
-                          "-- further shapes will fall back to the fp16 route. Raise "
-                          "ROCKET_MOE_M_BUCKET to collapse them.\n", ctx->moe_slots.size());
+            GGML_LOG_WARN("[moe-int8] %zu distinct (M,K,N) scratch slots, near librocketnpu's 32 "
+                          "-- past them it recycles the least recently used, re-allocating "
+                          "scratch on every miss. Raise ROCKET_MOE_M_BUCKET to collapse them.\n",
+                          ctx->moe_slots.size());
     }
     return Mb;
 }
@@ -6242,7 +6274,8 @@ static const rocket_moe_i8_expert * rocket_moe_expert_resident(
     // would serve expert 0's tiles for every expert's matmul -- correct arithmetic on the
     // wrong weights.
     if (base.empty()) return nullptr;                  // no stable identity -> fp16 route
-    const std::string key = base + "/e" + std::to_string((long long)e);
+    std::string key = base + "/e";
+    key += std::to_string((long long)e);               // appended, not prepended: glibc_compat.c
 
     auto it = ctx->moe_i8_cache.find(key);
     if (it != ctx->moe_i8_cache.end()) {
@@ -7063,10 +7096,11 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             // generators refuse on that part by construction, so an op accepted here and
             // then declined by the W8A8 entry does not fall back — it fails at compute
             // time. So the gate is exactly what that entry can run, and nothing wider.
-            // The library refuses K >= 6176 (no single-task plan) and the int32 K-split
-            // route that would run it wedges the part until it is rebooted. The handler can
-            // instead split K on the HOST, one whole W8A8 GEMM per chunk with the f32
-            // partials summed, so the claim is "a chunking exists" rather than a depth
+            // The library refuses K >= 6176 (no single-task plan). Its int32 K-split entry
+            // wedged the part on the older narrow writer and runs on the dense writer, its
+            // default (345.7 ms at M=512 K=8192 N=2048), but this handler does not call it.
+            // The handler can instead split K on the HOST, one whole W8A8 GEMM per chunk with
+            // the f32 partials summed, so the claim is "a chunking exists" rather than a depth
             // bound. That is OFF by default and ROCKET_RK3576_KSPLIT=1 turns it on: it is
             // fast and exact, and it costs the one model measured 1.60x perplexity, because
             // what it reaches is the FFN down-projection and the route's per-tensor
@@ -7226,10 +7260,14 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
             //
             // AND THE BAR IS MATERIALITY, NOT > 1.00, because the one-time expert ingest is charged
             // ONLY IF THIS GATE ACCEPTS -- so the gate is the one place it can be avoided. An offload
-            // at ratio r saves 1 - 1/r of prefill wall against a fixed ~32 s, so the 1.049x cell does
-            // not repay its own admission until ~16600 tokens of prefill at that micro-batch size,
-            // against ~4800 at 1.22x and ~2100 at gpt-oss's 1.64x. A workload that really does prefill
-            // that much at 768-1250 tokens a micro-batch sets ROCKET_MOE_MIN_WORK=240 and takes it.
+            // at ratio r saves 1 - 1/r of prefill wall against a fixed ingest. When this was fitted
+            // the ingest was ~32 s, and the 1.049x cell did not repay its own admission until
+            // ~16600 tokens of prefill at that micro-batch size, against ~4800 at 1.22x and ~2100
+            // at gpt-oss's 1.64x. The faster ingest (~18 s on DeepSeek-V2-Lite, ~21 s on
+            // gpt-oss-20b, 0.47x and 0.51x the earlier pack) scales those to ~7700, ~2300 and
+            // ~1100 [host-computed]. The bar is unchanged: a workload that really does prefill
+            // that much at 768-1250 tokens a micro-batch sets ROCKET_MOE_MIN_WORK=240 and takes
+            // it.
             //
             // The FORM is derived; the NUMBER is fitted on two architectures, and it is where a
             // third one gets tested. What the form does not carry is rate_cpu: gpt-oss at
@@ -7601,8 +7639,16 @@ static size_t rocket_meminfo_bytes(const char * field) {
 // The reserve the auto budget modes hold back: KV cache, activations, general headroom,
 // and -- for F16 residency -- the still-mapped GGUF the resident tiles duplicate. The
 // board has no swap, so an over-commit is a hard kill and the reserve is deliberately
-// generous. ONE rule, because the dense and MoE budgets are drawn from the same
-// MemAvailable: two copies of it that drift apart are a double-spend, not two policies.
+// generous. The dense residency routes (ROCKET_F16_RESIDENT, ROCKET_QUANT_RESIDENT) use this
+// rule. The MoE expert budget keeps only its 6 GiB arm (rocket_moe_budget_reserve, which
+// says why), and ROCKET_QUANT_RESIDENT_RESERVE_MB overrides both. The two budgets are sized
+// independently, from the same MemAvailable at init, and the MoE pre-flight charges expert
+// stacks only, so together they can promise more than is there: on gpt-oss-20b (MXFP4) on a
+// 31 GiB board, with ROCKET_QUANT_RESIDENT=auto, both read 19930MB and budgeted 13786MB (MoE)
+// and 10394MB (dense), 4250MB past it. That run placed no measurable dense resident bytes --
+// MemAvailable's minimum matched the MoE route alone within 16 MiB, and pp512 was unchanged
+// [HW sweep 2026-10-29] -- so on a model whose dense route does place weights, they come out
+// of the MoE route's headroom [hypothesis: no run has had both routes fill].
 static size_t rocket_auto_budget_reserve(void) {
     const char * fields[1] = { "MemTotal" };
     size_t total = 0;
@@ -7625,9 +7671,13 @@ ggml_backend_t ggml_backend_rocket_init(void) {
         int v = atoi(e);
         if (v >= 1 && v <= 8) ctx->n_threads = v;
     }
-    // ROCKET_CACHE_MB: resident packed-weight budget in MB (0 = unlimited).
-    if (const char * e = getenv("ROCKET_CACHE_MB")) {
-        size_t b; if (rocket_parse_mb_budget("ROCKET_CACHE_MB", e, &b)) ctx->cache_budget = b;
+    // ROCKET_CACHE_MB: resident packed-weight budget in MB (0 = unlimited). Only a value the
+    // parser accepts overrides the residency modes' budget below: an empty one is unset, and
+    // a refused one leaves the budget to them rather than pinning it at the 2 GB default.
+    bool cache_mb_set = false;
+    if (const char * e = getenv("ROCKET_CACHE_MB"); e && *e) {
+        size_t b;
+        if (rocket_parse_mb_budget("ROCKET_CACHE_MB", e, &b)) { ctx->cache_budget = b; cache_mb_set = true; }
     }
     // ROCKET_QUANT_RESIDENT / ROCKET_F16_RESIDENT budget modes (on/off gates are
     // rocket_quant_resident_on / rocket_f16_resident_on). Both size the SAME resident-weight
@@ -7646,11 +7696,18 @@ ggml_backend_t ggml_backend_rocket_init(void) {
     // is weight-encounter (~layer) order, which is optimal here: LLM prefill uses every weight
     // once per micro-batch, so per-layer "hotness" is uniform and only total resident bytes
     // (hence the budget) sets the fraction of the packB / dequant tax removed.
-    const char * rez = getenv("ROCKET_F16_RESIDENT");
-    const char * rez_name = "ROCKET_F16_RESIDENT";
-    if (!rez) { rez = getenv("ROCKET_QUANT_RESIDENT"); rez_name = "ROCKET_QUANT_RESIDENT"; }
+    // The budget comes from the variable that turned residency on, ROCKET_F16_RESIDENT first.
+    // Testing for the variable's presence instead let an empty or "0" ROCKET_F16_RESIDENT
+    // hide ROCKET_QUANT_RESIDENT=auto's budget while its on/off gate still read it as on.
+    const char * rez = nullptr;
+    const char * rez_name = nullptr;
+    if (rocket_f16_resident_on()) {
+        rez = getenv("ROCKET_F16_RESIDENT");   rez_name = "ROCKET_F16_RESIDENT";
+    } else if (rocket_quant_resident_on()) {
+        rez = getenv("ROCKET_QUANT_RESIDENT"); rez_name = "ROCKET_QUANT_RESIDENT";
+    }
     if (rez) {
-        if (!getenv("ROCKET_CACHE_MB")) {                 // explicit budget overrides
+        if (!cache_mb_set) {                              // explicit budget overrides
             const size_t reserve = rocket_auto_budget_reserve();
             if (strcmp(rez, "auto") == 0) {
                 const size_t avail = rocket_meminfo_bytes("MemAvailable");

@@ -45,8 +45,10 @@ option(GGML_ROCKET_DIAGNOSTICS "Compile in the heavy per-op recompute/trace diag
 # with a warning by default. CI turns this ON so an unaudited version fails the job instead.
 option(GGML_ROCKET_STRICT_ABI "Fail the build on an unaudited GGML_BACKEND_API_VERSION (CI)" OFF)
 
-# Portability: internalize the glibc 2.38 __isoc23_* symbols so libggml-rocket.so loads on
-# an older-glibc runtime (e.g. a Debian-bookworm container) even when built on a newer host.
+# Portability: internalize the symbols a newer glibc versions above 2.34 (glibc 2.38's
+# __isoc23_* parsers, glibc 2.43's sqrtf) so libggml-rocket.so loads on an older-glibc runtime
+# (e.g. a Debian-bookworm container) even when built on a newer host, and check that it needs
+# no libstdc++ newer than bookworm's GCC 12 one.
 # Off by default -- a normal build is byte-unchanged. Declared here rather than inside the
 # DL branch so it appears in `cmake -LH` either way; it only has an EFFECT in DL mode,
 # because the shim exists for the shipped .so and a static standalone build has no loader
@@ -147,11 +149,25 @@ if(GGML_ROCKET_DL)
     endif()
 
     # The glibc shim itself (option declared at top level). It must be C11 so its own
-    # strtol/scanf aren't redirected back into the symbols it is replacing.
+    # strtol/scanf aren't redirected back into the symbols it is replacing, and built
+    # without math errno so its sqrtf is the instruction rather than a call to itself.
     if(GGML_ROCKET_PORTABLE_GLIBC)
         target_sources(ggml-rocket PRIVATE glibc_compat.c)
-        set_source_files_properties(glibc_compat.c PROPERTIES COMPILE_OPTIONS "-std=gnu11")
+        set_source_files_properties(glibc_compat.c PROPERTIES COMPILE_OPTIONS "-std=gnu11;-fno-math-errno")
         message(STATUS "ggml-rocket: PORTABLE_GLIBC on -> libggml-rocket.so floors at glibc 2.34")
+        # A glibc reference with no forwarder in the shim, or a libstdc++ symbol newer than
+        # Debian 12's GCC 12 provides, links cleanly and then fails to load on the older
+        # runtime. So check the linked .so for any import versioned above GLIBC_2.34,
+        # GLIBCXX_3.4.30 or CXXABI_1.3.13, rather than trust the shim's list. Without objdump
+        # the check could not read the imports and would pass, so its absence stops here.
+        set(_portable_objdump "${CMAKE_OBJDUMP}")
+        if(NOT _portable_objdump)
+            message(FATAL_ERROR "ggml-rocket: PORTABLE_GLIBC checks the .so's imports with "
+                                "objdump, and none was found. Install binutils.")
+        endif()
+        add_custom_command(TARGET ggml-rocket POST_BUILD
+            COMMAND sh -c "syms=$(\"$1\" -T \"$2\") || exit 1; if printf '%s\\n' \"$syms\" | grep UND | grep -E 'GLIBC_2[.](3[5-9]|[4-9][0-9])|GLIBCXX_3[.]4[.](3[1-9]|[4-9][0-9])|CXXABI_1[.]3[.](1[4-9]|[2-9][0-9])'; then echo 'ggml-rocket: PORTABLE_GLIBC: the .so needs a glibc above 2.34 or a libstdc++ above GCC 12 for the symbols above; forward a glibc one in glibc_compat.c, and change the source that needs a libstdc++ one' >&2; exit 1; fi" sh ${_portable_objdump} $<TARGET_FILE:ggml-rocket>
+            VERBATIM)
     endif()
 else()
     # =======================================================================
