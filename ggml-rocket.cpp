@@ -6747,7 +6747,118 @@ static bool rocket_diag_serialize(void) {
     return v;
 }
 
+
+// ---------------------------------------------------------------------------
+// Repacked-weight sources (ggml-cpu CPU_REPACK coexistence)
+// ---------------------------------------------------------------------------
+// ggml-cpu's repack extra buffer type keeps quantized weights in an interleaved,
+// non-host CPU_REPACK buffer for its fast decode kernels. The NPU cannot read that
+// layout. A model loader that still holds the original (GGUF, mmapped) bytes of such a
+// tensor registers them here, through the "ggml_backend_rocket_register_weight_source"
+// proc address; the loader must keep those bytes mapped for the tensor's lifetime.
+//
+// supports_buft then also accepts CPU_REPACK, supports_op declines any op one of whose
+// sources lives in a non-host buffer with no registered source, and graph_compute
+// points each such source's ->data at the registered bytes for the duration of the
+// split (restored on return), so every read of weight data in this backend -- the
+// fp16/int8/int4/MoE/CPU-fallback paths alike -- sees the original layout. Decode
+// (M < rocket_min_m) is declined by supports_op and stays on the CPU's repacked copy.
+struct rocket_wsrc_entry {
+    const void * data;
+    size_t       nbytes;
+    std::string  name;
+};
+static std::mutex g_wsrc_mu;
+static std::unordered_map<const ggml_tensor *, rocket_wsrc_entry> g_wsrc;
+static std::atomic<size_t> g_wsrc_count{0};
+
+static void ggml_backend_rocket_register_weight_source(const ggml_tensor * t, const void * data, size_t nbytes) {
+    if (!t) return;
+    std::lock_guard<std::mutex> lk(g_wsrc_mu);
+    if (data == nullptr) {
+        g_wsrc.erase(t);
+    } else {
+        g_wsrc[t] = rocket_wsrc_entry{ data, nbytes, std::string(t->name) };
+    }
+    g_wsrc_count.store(g_wsrc.size(), std::memory_order_release);
+}
+
+static bool rocket_buft_is_repack(ggml_backend_buffer_type_t buft) {
+    if (!buft) return false;
+    const char * n = ggml_backend_buft_name(buft);
+    return n && strcmp(n, "CPU_REPACK") == 0;
+}
+
+// The tensor (or the tensor it views) lives in a buffer whose bytes this backend cannot
+// read directly.
+static bool rocket_tensor_needs_source(const ggml_tensor * t) {
+    const ggml_tensor * base = t->view_src ? t->view_src : t;
+    return base->buffer && !ggml_backend_buffer_is_host(base->buffer);
+}
+
+// Registered original bytes for t (offset for a view), or nullptr. The entry must still
+// describe the same tensor (name and size), so a stale registration from an earlier
+// model whose tensor struct was reused never hands out a dangling pointer.
+static const void * rocket_tensor_source(const ggml_tensor * t) {
+    const ggml_tensor * base = t->view_src ? t->view_src : t;
+    const size_t offs = t->view_src ? t->view_offs : 0;
+    if (g_wsrc_count.load(std::memory_order_acquire) == 0) return nullptr;
+    std::lock_guard<std::mutex> lk(g_wsrc_mu);
+    auto it = g_wsrc.find(base);
+    if (it == g_wsrc.end()) return nullptr;
+    if (it->second.nbytes != ggml_nbytes(base) || it->second.name != base->name) return nullptr;
+    if (offs + ggml_nbytes(t) > it->second.nbytes) return nullptr;
+    return (const char *)it->second.data + offs;
+}
+
+static bool rocket_op_sources_readable(const ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const ggml_tensor * s = op->src[i];
+        if (!s) continue;
+        if (rocket_tensor_needs_source(s) && !rocket_tensor_source(s)) return false;
+    }
+    return true;
+}
+
+static enum ggml_status ggml_backend_rocket_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph);
+
 static enum ggml_status ggml_backend_rocket_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if (g_wsrc_count.load(std::memory_order_acquire) == 0) {
+        return ggml_backend_rocket_graph_compute_impl(backend, cgraph);
+    }
+    std::vector<std::pair<ggml_tensor *, void *>> swapped;
+    std::unordered_set<const ggml_tensor *> seen;
+    auto restore = [&]() {
+        for (auto it = swapped.rbegin(); it != swapped.rend(); ++it) it->first->data = it->second;
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * s = node->src[j];
+            if (!s || !seen.insert(s).second) continue;
+            if (!rocket_tensor_needs_source(s)) continue;
+            const void * p = rocket_tensor_source(s);
+            if (!p) {
+                if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW
+                    || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+                    continue;   // no-op nodes never read their source's bytes here
+                }
+                GGML_LOG_ERROR("[rocket] %s: source %s of %s (%s) lives in a %s buffer with no registered "
+                               "original bytes\n", __func__, s->name, node->name, ggml_op_name(node->op),
+                               ggml_backend_buffer_name(s->view_src ? s->view_src->buffer : s->buffer));
+                restore();
+                return GGML_STATUS_FAILED;
+            }
+            swapped.emplace_back(s, s->data);
+            s->data = const_cast<void *>(p);
+        }
+    }
+    const enum ggml_status st = ggml_backend_rocket_graph_compute_impl(backend, cgraph);
+    restore();
+    return st;
+}
+
+static enum ggml_status ggml_backend_rocket_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rocket_context * ctx = (ggml_backend_rocket_context *)backend->context;
     std::unique_lock<std::mutex> diag_lk(g_diag_mu, std::defer_lock);
     if (rocket_diag_serialize()) diag_lk.lock();
@@ -7064,7 +7175,16 @@ static bool rocket_prec_declines(const ggml_tensor * op) {
     return false;
 }
 
+static bool ggml_backend_rocket_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op);
+
+// A weight in a buffer this backend cannot read directly (CPU_REPACK) is only usable
+// through its registered original bytes; without them the op stays on the CPU.
 static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (!rocket_op_sources_readable(op)) return false;
+    return ggml_backend_rocket_device_supports_op_impl(dev, op);
+}
+
+static bool ggml_backend_rocket_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op) {
     (void)dev;
     switch (op->op) {
         case GGML_OP_NONE:
@@ -7444,7 +7564,10 @@ static bool ggml_backend_rocket_device_supports_op(ggml_backend_dev_t dev, const
 // use_extra_bufts, or a GGML_CPU_REPACK=OFF build. The runtime flag leaves a CPU-only run its
 // repack, worth 1.3-1.7x on quantized prefill. F16 weights are never repacked.
 static bool ggml_backend_rocket_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    (void)dev; return ggml_backend_buft_is_host(buft);
+    // CPU_REPACK is accepted too: an op on a repacked weight is still declined by
+    // supports_op unless the loader registered the weight's original bytes (see
+    // ggml_backend_rocket_register_weight_source), and graph_compute reads those.
+    (void)dev; return ggml_backend_buft_is_host(buft) || rocket_buft_is_repack(buft);
 }
 
 // The scheduler only pulls a CPU/host-resident op onto an accel device when the
@@ -7502,6 +7625,16 @@ static const char * ggml_backend_rocket_reg_get_name(ggml_backend_reg_t reg) {
 static size_t ggml_backend_rocket_reg_get_device_count(ggml_backend_reg_t reg) {
     (void)reg; return 1;
 }
+// "ggml_backend_rocket_register_weight_source":
+//   void (*)(const struct ggml_tensor * t, const void * data, size_t nbytes)
+// data == nullptr unregisters t. See the repacked-weight sources note above.
+static void * ggml_backend_rocket_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    (void)reg;
+    if (name && strcmp(name, "ggml_backend_rocket_register_weight_source") == 0) {
+        return (void *)ggml_backend_rocket_register_weight_source;
+    }
+    return nullptr;
+}
 static ggml_backend_dev_t ggml_backend_rocket_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     GGML_ASSERT(index == 0);
     static ggml_backend_device device = {
@@ -7517,6 +7650,7 @@ static const ggml_backend_reg_i rocket_reg_i = {
     .get_name         = ggml_backend_rocket_reg_get_name,
     .get_device_count = ggml_backend_rocket_reg_get_device_count,
     .get_device       = ggml_backend_rocket_reg_get_device,
+    .get_proc_address = ggml_backend_rocket_reg_get_proc_address,
 };
 ROCKET_VTABLE_END
 
