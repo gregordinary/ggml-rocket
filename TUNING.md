@@ -132,7 +132,8 @@ A quantized GGUF prefills on the fp16 route. The backend dequantizes each weight
 is used, one `[K]` row at a time, to the exact values ggml's CPU backend computes. It holds no
 whole-model F16 copy. The model stays compact in RAM, and decode runs on the CPU from the
 quantized weights. The host's weight repack must be off, as the README's
-[Quick start](README.md#quick-start) cautions.
+[Quick start](README.md#quick-start) cautions, unless the host registers the original weight
+bytes ([Repacked weights](API.md#repacked-weights)).
 
 The dequantization runs on every micro-batch, so a streamed quantized prefill depends on the
 micro-batch size. Where the fp16 form fits RAM, residency removes it, as

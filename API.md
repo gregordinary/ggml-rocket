@@ -272,6 +272,29 @@ of an out-of-tree backend. Its buffers and its placement work as follows:
   and logs a warning. The graph continues. A matmul fallback computes in fp64.
   `ggml_backend_rocket_cpu_fallbacks` counts them.
 
+### Repacked weights
+
+ggml-cpu's repack moves quantized weights into a non-host `CPU_REPACK` buffer, in an interleaved
+layout the backend can't read. Turning the repack off costs decode its repacked kernels. A host
+can instead keep both:
+
+- The registry's `get_proc_address` returns `ggml_backend_rocket_register_weight_source`, of type
+  `void (*)(const struct ggml_tensor * t, const void * data, size_t nbytes)`. The host calls it
+  for each repacked weight with the weight's original bytes, typically its range in the mmapped
+  GGUF, and keeps those bytes mapped while the tensor lives. `data == NULL` unregisters `t`.
+- `supports_buft` then also accepts `CPU_REPACK`. `supports_op` declines an op whose source is in
+  a non-host buffer with no registered bytes, so an unregistered weight stays on the CPU.
+- `graph_compute` points each such source's `data` at its registered bytes for the duration of
+  the split and restores it afterwards, so every route reads the original layout. Decode
+  (`M` below the offload threshold) stays on the CPU's repacked copy.
+- An entry is used only while its name and size still match the tensor, so a tensor struct
+  reused by a later model never reads a stale pointer.
+
+The cost is the repacked copy in RAM beside the mapped original. With gemma-4 E2B (Ollama's gemma4:e2b) on an
+RK3588 under Ollama, a 2,000-token prompt prefilled at 80.6 tok/s and decoded at 11.9-12.7 tok/s,
+against 71-75 and 6.2-8.2 with `--no-repack`. The prefill figure also used `ROCKET_DEQUANT_CACHE_MB=2048`.
+Resident memory rose by about 3 GB.
+
 ### ggml version compatibility
 
 The backend fills ggml's vtables, `ggml_backend_i` and the rest, with C++20 designated

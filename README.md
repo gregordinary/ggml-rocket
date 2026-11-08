@@ -89,6 +89,10 @@ so convert it once with `llama-quantize in.gguf out.gguf f16`.
 > built with `-DGGML_CPU_REPACK=OFF` also works, but it removes the repack from CPU-only runs
 > too, where it is worth 1.3-1.7x on quantized prefill. Confirm the offload with
 > `ROCKET_MM_PROFILE=1`.
+>
+> A host that keeps the GGUF mapped can leave the repack on instead. It registers each
+> repacked weight's original bytes with the backend, and the NPU reads those for prefill while
+> CPU decode keeps its repacked copy. [API.md](API.md#repacked-weights) describes the call.
 
 Gemma-4's chat template needs `--jinja`, or use `llama-completion -no-cnv` for raw prompt
 completion. [TUNING.md](TUNING.md) gives the settings for each workload.
