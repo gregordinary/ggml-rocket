@@ -452,7 +452,7 @@ patches:
 
 ## License and credits
 
-`ggml-rocket` is GPL-3.0-or-later (it links the GPL-3 `rocket-userspace` driver library). It
-builds on [ggml](https://github.com/ggml-org/ggml) (MIT) as an out-of-tree, runtime-loadable
-backend, modeled on ggml's own BLAS backend, and on the `rocket-userspace` driver for NPU access.
+`ggml-rocket` is MIT-licensed; see [LICENSE](LICENSE). It builds on
+[ggml](https://github.com/ggml-org/ggml) (MIT) as an out-of-tree, runtime-loadable backend, modeled
+on ggml's own BLAS backend, and on the `rocket-userspace` driver for NPU access.
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) carries ggml's license notice.

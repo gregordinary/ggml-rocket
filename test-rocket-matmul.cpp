@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ggml-rocket authors
 /*
  * test-rocket-matmul.cpp — validate the rocket ggml backend's MUL_MAT against the

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ggml-rocket authors
 /*
  * test-rk3576-w8a8.cpp — the RK3576 W8A8 route against the CPU backend.

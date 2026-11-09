@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ggml-rocket authors
 /*
  * test-hadamard-neon.c — test for the NEON Hadamard rotation.

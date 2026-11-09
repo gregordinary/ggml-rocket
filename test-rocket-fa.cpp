@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ggml-rocket authors
 /*
  * test-rocket-fa.cpp — the FLASH_ATTN_EXT handler against the CPU backend, including a q.k

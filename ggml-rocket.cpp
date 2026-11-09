@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The ggml-rocket authors
 /*
  * ggml-rocket.cpp — RK3588 NPU (rocket) ggml backend. ACCEL device modeled on
