@@ -90,9 +90,9 @@ so convert it once with `llama-quantize in.gguf out.gguf f16`.
 > too, where it is worth 1.3-1.7x on quantized prefill. Confirm the offload with
 > `ROCKET_MM_PROFILE=1`.
 >
-> A host that keeps the GGUF mapped can leave the repack on instead. It registers each
-> repacked weight's original bytes with the backend, and the NPU reads those for prefill while
-> CPU decode keeps its repacked copy. [API.md](API.md#repacked-weights) describes the call.
+> A host that registers each repacked weight's original bytes with the backend can leave the
+> repack on, but llama.cpp and whisper.cpp do not register them.
+> [API.md](API.md#repacked-weights) describes the call.
 
 Gemma-4's chat template needs `--jinja`, or use `llama-completion -no-cnv` for raw prompt
 completion. [TUNING.md](TUNING.md) gives the settings for each workload.
@@ -333,7 +333,7 @@ of inferring it from the output:
 | `test-rk3576-w8a8` | The RK3576 route against the CPU backend. `Skipped` on any other part |
 | `test-rocket-placement` | The `supports_op` and `offload_op` contract |
 | `test-rocket-fa` | `FLASH_ATTN_EXT` against a double-precision reference, including the logits fp16 cannot hold |
-| `test-rocket-internals` | Host-only: the weight cache's identity, the MoE residency ledger across two live backends, the budget parser, the FA dump's file handling, the device-route circuit breaker |
+| `test-rocket-internals` | Host-only: the weight cache's identity, the MoE residency ledger across two live backends, the budget parser, the FA dump's file handling, the device-route circuit breaker, the registered sources of repacked weights |
 | `test-hadamard-neon`, `test-hadamard-quant` | The Hadamard rotation construction |
 
 `test-common.h` holds the graph and comparison code the tests share.
@@ -452,7 +452,7 @@ patches:
 
 ## License and credits
 
-`ggml-rocket` is GPL-3.0-or-later (it links the GPL-3 `rocket-userspace` driver library, whose NPU
-register headers are the GPL-3 reverse-engineering by Jasbir Matharu). It builds on
-[ggml](https://github.com/ggml-org/ggml) (MIT) as an out-of-tree, runtime-loadable backend, modeled
-on ggml's own BLAS backend, and on the `rocket-userspace` driver for NPU access.
+`ggml-rocket` is GPL-3.0-or-later (it links the GPL-3 `rocket-userspace` driver library). It
+builds on [ggml](https://github.com/ggml-org/ggml) (MIT) as an out-of-tree, runtime-loadable
+backend, modeled on ggml's own BLAS backend, and on the `rocket-userspace` driver for NPU access.
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) carries ggml's license notice.

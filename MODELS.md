@@ -198,8 +198,24 @@ every norm, softmax and GELU.
 `ROCKET_INT8=1` runs the RK3588's offloaded matmuls as W8A8, with the weights and the activations
 quantized to int8. With the Hadamard rotation on (`ROCKET_INT8_HADAMARD=1`), the output is
 coherent and character-identical to fp16. `ROCKET_INT8_RESIDENT=1` holds the int8 weights
-[resident](README.md#terms). Resident int8 prefill measures 0.60x fp16, so the route is for a
-model that must fit in less RAM.
+[resident](README.md#terms). Resident int8 prefill measures 0.95-0.99x resident fp16 on two 3 B
+models and about resident fp16's rate on an 8 B model ([TUNING.md](TUNING.md#quantization-and-prefill-speed)).
+
+Wikitext perplexity over 8 chunks of 512 rises with the int8 route as follows:
+
+| Model, F16 GGUF | int8, no rotation | int8, `ROCKET_INT8_HADAMARD=1` |
+|---|---:|---:|
+| Llama-3.2-3B-Instruct | +1.5% | not measured |
+| Ministral-3-8B-Instruct | +0.73% | +0.93% |
+| Qwen3.5-9B | +2.83% | +0.97% |
+
+**Conditions:** the resident int8 route against fp16 on the same GGUF, RK1, NPU at 928 MHz,
+llama.cpp b11539. The 3 B row was measured 2026-11-06 against resident fp16 (11.0729 against
+10.9114), and the 8-9 B rows 2026-11-07 against the default fp16 route.
+
+The rotation applies only to a projection whose `K` is a power of two or 60 times one. On these
+8-9 B models it therefore skips the FFN down projection. It lowers Qwen3.5-9B's perplexity at every
+chunk and does not lower Ministral-3-8B-Instruct's, so measure a model before choosing it.
 
 On the RK3576, `ROCKET_INT8=1` selects [the RK3576 route](README.md#terms) instead, which
 [RK3576.md](RK3576.md) describes.

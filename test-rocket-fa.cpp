@@ -21,10 +21,10 @@
  *              accuracy where nothing overflows.
  *   scaled     the overflow construction with Q at 500*sqrt(head_dim) and K from 140 up, so
  *              the SCALED logits start at 70000 at every head dim: past 65504 even with the
- *              scale folded in. The
- *              NPU's fp16 score surface saturates there (it does not read inf), so the case
- *              must leave the NPU: the library flags the saturated score and the handler runs
- *              its full-precision host reference. Scored on the same oracle, and it must be
+ *              scale folded in. The NPU's fp16 score surface writes inf there (from 65520;
+ *              65504 between 65504 and 65519), so the case must leave the NPU: the library
+ *              flags the overflowed score and the handler runs its full-precision host
+ *              reference. Scored on the same oracle, and it must be
  *              that reference that computed it (a fallback, not the "fa" route).
  *   q range    Q at 1e6, so the scaled Q itself (125000 at head_dim 64) does not fit fp16;
  *              the gather catches it before the NPU is asked, and the same reference runs.

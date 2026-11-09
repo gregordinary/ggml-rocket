@@ -31,7 +31,7 @@ Two groups read an empty value differently:
 | `ROCKET_REUSE` | auto with K-accumulation on, `0` with it off | (read by `librocketnpu`) Forces the [CBUF](README.md#terms) operand reuse mode: `0` off, `1` weight reuse, `2` data reuse. Auto picks, per shape, the operand with the longer reuse run, and data reuse on a tie |
 | `ROCKET_MM_STREAM` | on | (read by `librocketnpu`) CBUF weight streaming: the fp16 planner streams each weight slice through the CBUF, so one NPU task covers up to 4096 output columns. `=0`, or any `ROCKET_MM_MT`, `ROCKET_MM_NT` or `ROCKET_MM_KT` override, selects the whole-tile plan |
 | `ROCKET_MM_ASYM` | on | (read by `librocketnpu`) Asymmetric tiling in the whole-tile plan, for a shape that tiles both `N` and `K`: the tile's `N` halves to 128, and its `K` grows from 384 to 512. `=0` forces the symmetric plan, whose fp16 output can differ because the `K` partials round at different points |
-| `ROCKET_N_THREADS` | 5 | The number of NPU workers, 1 to 8, each with its own [IOVA window](README.md#terms), and a value outside that range is ignored. Set 6 for the native-quant MoE route and the F16 residency route. The default stays 5 because the dense fp16 route gains nothing past five workers ([MOE.md](MOE.md#worker-count)) |
+| `ROCKET_N_THREADS` | 5 | The number of NPU workers, 1 to 8, each with its own [IOVA window](README.md#terms), and a value outside that range is ignored. Set 6 for the native-quant MoE route, and for the F16 residency route where the IOVA window binds ([TUNING.md](TUNING.md#f16-weights)). The default stays 5 because the dense fp16 route gains nothing past five workers ([MOE.md](MOE.md#worker-count)) |
 | `ROCKET_MIN_M` | 32 | The fewest rows (`M`) an unquantized weight's `MUL_MAT` needs to offload, and a value below 4 is raised to 4. Set 16 for a CTC or transducer encoder on short utterances ([TUNING.md](TUNING.md#offload-threshold)) |
 | `ROCKET_MIN_M_QUANT` | 512 | The fewest rows a quantized weight's `MUL_MAT` needs to offload, never below `ROCKET_MIN_M`. A shorter quantized prefill stays on the CPU, where it is faster ([TUNING.md](TUNING.md#quantized-ggufs)) |
 | `ROCKET_DEQUANT_THREADS` | auto | The number of CPU threads that dequantize a quantized weight on each micro-batch. Auto, which `0` also selects, is the A76 big-core count, or the core count capped at 8 where no big cluster is found. `1` forces one thread |
@@ -56,7 +56,7 @@ Two groups read an empty value differently:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ROCKET_INT8` | off | `1` selects the W8A8 int8 route, which on the RK3588 is slower than fp16 ([MODELS.md](MODELS.md#int8-w8a8)). On the RK3576 it is required, because [the RK3576 route](README.md#terms) is the only matmul route there |
+| `ROCKET_INT8` | off | `1` selects the W8A8 int8 route. On the RK3588, with `ROCKET_INT8_RESIDENT=1`, it prefills at 0.95-0.99x resident fp16 ([TUNING.md](TUNING.md#quantization-and-prefill-speed)). On the RK3576 it is required, because [the RK3576 route](README.md#terms) is the only matmul route there |
 | `ROCKET_INT8_HADAMARD` | off | `1` adds a Hadamard rotation to the RK3588 int8 route, and with it the route's output is coherent. The RK3576 route always rotates and ignores it |
 | `ROCKET_INT8_RESIDENT` | off | With `ROCKET_INT8=1` on the RK3588, `1` holds the int8 weights resident, within `ROCKET_INT8_CACHE_MB` |
 | `ROCKET_INT8_CACHE_MB` | 4096 | The resident int8 weight budget in MB, `0` for unlimited, counted against the weights' actual NPU buffer size. A weight over the budget takes the fp16 route |
@@ -233,11 +233,14 @@ through one kernel. For F16 K and V, that kernel narrows Q to fp16 and accumulat
 NPU, and runs the soft-cap, mask and softmax in fp32 on the host. It holds the scaled Q, the
 scores, P and the output in fp16, so its rounding is the reference's.
 
-The NPU's fp16 scores saturate at 65504 instead of becoming inf, so an overflowed logit ties with
-every other saturated key. The softmax then returns a finite output of the right size with wrong
-values [HW sweep 2026-10-09]. `ROCKET_FA_QSCALE` moves that limit. The handler folds the op's
-scale into Q as it converts Q to fp16, so the scores hold `scale*q.k`. They then overflow only
-past `65504/scale`, 8x further at head_dim 64 and 16x at 256. The score is the same function either
+The NPU writes the scores in fp16. A score from 65504 to 65519 is written as 65504, and one of
+65520 or more as inf [HW sweep 2026-11-07]. That holds whether one product or a sum passes the
+range. An overflowed logit therefore either ties with every other key at the limit or turns its
+row's softmax into NaN.
+
+`ROCKET_FA_QSCALE` moves that limit. The handler folds the op's scale into Q as it converts Q to
+fp16, so the scores hold `scale*q.k`. They then overflow only past `65504/scale`, 8x further at
+head_dim 64 and 16x at 256. The score is the same function either
 way, `softcap*tanh(scale*q.k/softcap) + mask`, with one fp16 rounding of Q.
 
 The backend also guards the range at both ends. A scaled Q element past 65504 is caught as Q is
@@ -274,26 +277,39 @@ of an out-of-tree backend. Its buffers and its placement work as follows:
 
 ### Repacked weights
 
-ggml-cpu's repack moves quantized weights into a non-host `CPU_REPACK` buffer, in an interleaved
-layout the backend can't read. Turning the repack off costs decode its repacked kernels. A host
-can instead keep both:
+ggml-cpu's weight repack moves a quantized weight into a non-host `CPU_REPACK` buffer, in an
+interleaved layout for its own kernels. The backend declines an op on such a weight, so with the
+repack on, prefill stays on the CPU. A host that still holds each weight's original bytes, such as
+its range in the mapped GGUF, can register them. The NPU then prefills from those bytes, and
+decode keeps the CPU's repacked kernels. llama.cpp and whisper.cpp do not register them.
 
-- The registry's `get_proc_address` returns `ggml_backend_rocket_register_weight_source`, of type
-  `void (*)(const struct ggml_tensor * t, const void * data, size_t nbytes)`. The host calls it
-  for each repacked weight with the weight's original bytes, typically its range in the mmapped
-  GGUF, and keeps those bytes mapped while the tensor lives. `data == NULL` unregisters `t`.
-- `supports_buft` then also accepts `CPU_REPACK`. `supports_op` declines an op whose source is in
-  a non-host buffer with no registered bytes, so an unregistered weight stays on the CPU.
-- `graph_compute` points each such source's `data` at its registered bytes for the duration of
-  the split and restores it afterwards, so every route reads the original layout. Decode
-  (`M` below the offload threshold) stays on the CPU's repacked copy.
-- An entry is used only while its name and size still match the tensor, so a tensor struct
-  reused by a later model never reads a stale pointer.
+The registration works as follows:
 
-The cost is the repacked copy in RAM beside the mapped original. With gemma-4 E2B (Ollama's gemma4:e2b) on an
-RK3588 under Ollama, a 2,000-token prompt prefilled at 80.6 tok/s and decoded at 11.9-12.7 tok/s,
-against 71-75 and 6.2-8.2 with `--no-repack`. The prefill figure also used `ROCKET_DEQUANT_CACHE_MB=2048`.
-Resident memory rose by about 3 GB.
+- The registry's `get_proc_address` returns `ggml_backend_rocket_register_weight_source` for that
+  name. Its type is `void (*)(const struct ggml_tensor * t, const void * data, size_t nbytes)`,
+  and `data == NULL` unregisters `t`.
+- `supports_buft` accepts `CPU_REPACK`. `supports_op` claims an op on a repacked weight only while
+  the weight has registered bytes whose size and tensor name match it.
+- `graph_compute` points each such weight's `data` at its registered bytes for the duration of
+  the split, and restores it on return. Every route reads the original layout.
+- An op below the [offload threshold](TUNING.md#offload-threshold), decode included, is declined
+  and runs on the CPU's repacked copy.
+- The ggml scheduler places an op on a repacked weight by the weight's buffer, without asking
+  `offload_op`. `--no-op-offload` therefore does not keep a registered weight's op on the CPU.
+
+The repacked copy stays in RAM beside the mapped original. Leaving the repack on therefore costs
+about the size of the repacked weights in RAM. [MEASUREMENTS.md](MEASUREMENTS.md#api) gives one
+host's prefill, decode and memory figures.
+
+> [!CAUTION]
+> The host must keep the registered bytes mapped while the tensor lives, and must unregister
+> the tensor before it frees it. The name and size check does not detect the same model
+> reloaded into a reused tensor.
+>
+> The host must not compute another graph that reads the same weights while the backend's split
+> runs. The backend points the shared tensor's `data` at the original bytes for that split, so a
+> CPU kernel that reads it meanwhile computes wrong output. One ggml scheduler runs its splits one
+> at a time.
 
 ### ggml version compatibility
 

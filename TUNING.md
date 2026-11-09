@@ -19,6 +19,7 @@ needs an environment variable. Add the settings the table gives for the workload
 | Agentic, RAG or long prompts | Quantized GGUF whose fp16 form fits RAM, wholly or partly | `ROCKET_QUANT_RESIDENT=auto`, at the default `-ub` | 1.35-1.75x the default configuration's prefill on seven dense models of 1.8-11.9 B. Needs free RAM of about the fp16 model size |
 | Agentic, RAG or long prompts | Quantized GGUF whose fp16 form does not fit | `-b 2048 -ub 2048` | 0.91-1.53x the default `-ub 512`, by model, so measure it |
 | Agentic or RAG, repeated prefill | F16, with RAM for ~2x the model | `ROCKET_F16_RESIDENT=auto` and `ROCKET_N_THREADS=6` | 1.08x the default configuration's prefill on three 3-4 B models |
+| Agentic or RAG, repeated prefill | F16, with RAM for ~1.5x the model | `ROCKET_INT8=1 ROCKET_INT8_RESIDENT=1`, and above 4 B a `ROCKET_INT8_CACHE_MB` that holds the int8 weights | 1.11-1.12x the default configuration's prefill on two 3 B models and at least 1.05-1.07x on two 8-9 B models ([Quantization and prefill speed](#quantization-and-prefill-speed)), at a wikitext perplexity 0.7-2.8% above fp16. At the default 4 GB budget the weights past it run on the fp16 route, 1-5% slower at 8-9 B |
 | Medium or long prompts | MoE whose experts offload (gpt-oss, DeepSeek-V2-Lite) | `-b 2048 -ub 2048` and `ROCKET_N_THREADS=6` | 1.25-1.32x the default `-ub` at `pp2048`. [MOE.md](MOE.md) has the rest |
 | Model too large at F16 | Any | A `Q4_K_M` GGUF, or `ROCKET_INT4=1` with an F16 GGUF | Reduces the footprint at a slower prefill than fp16 |
 | Transcription service (`whisper-server` fed fixed-length chunks) | F16 Whisper | `-nt -sns`, `-ac 50*(chunk_s+4)` capped at 1500, and `temperature_inc=0` as a request field | 0.70x the server defaults' CPU core-seconds per second of audio on 20 s chunks, at better WER |
@@ -62,9 +63,10 @@ therefore needs RAM for about twice the F16 model.
 **Conditions:** llama.cpp b10558, `pp2048` at the default `-b` and `-ub`, every weight resident
 [HW sweep 2026-08-29].
 
-`ROCKET_N_THREADS=6` places the most weights on this route. On Gemma-4-12B F16, six workers placed
-293 weights in the [IOVA window](README.md#terms), against 286 at the default five and 274 at
-seven [HW sweep 2026-09-02].
+`ROCKET_N_THREADS=6` places the most weights on this route where the [IOVA window](README.md#terms)
+binds. On Gemma-4-12B F16 at `pp512`, six workers placed 293 weights, against 286 at the default
+five and 274 at seven [HW sweep 2026-09-02]. At `pp2048` the `MemAvailable` minimum binds before
+the window, and six workers placed 284 against five's 286 [HW sweep 2026-09-03].
 
 ### Quantized weights
 
@@ -155,18 +157,51 @@ That run predates pinning the threads to the A76 cores. With the threaded dequan
 
 ## Quantization and prefill speed
 
-Quantization saves RAM and lets a larger model fit, but it does not raise prefill speed at this
-operating point. The prefill matmul is limited by DMA and dispatch rather than by the MAC array.
-int8's 2x and int4's 4x MAC rates therefore do not reach the prefill time.
+Quantization saves RAM and lets a larger model fit. At equal residency it does not raise prefill
+speed at this operating point. The prefill matmul is limited by DMA and dispatch rather than by
+the MAC array. int8's 2x and int4's 4x MAC rates therefore do not reach the prefill time.
 
-The resident whole-tile matmul runs at 386-461 GOP/s: fp16 461, int8 386 and int4 413 GOP/s, with the NPU at ~15% of its MAC peak. In a model, resident int8 prefill measures 0.60x fp16
-and resident int4 0.53x. Both read back int32 partials that fp16 accumulates on the NPU instead,
-because the backend has no integer [K-accumulation](README.md#terms).
+The resident int8 route prefills at 0.95-0.99x resident fp16 on 3 B models, with half the
+resident weight bytes. On an 8 B model it prefills at about resident fp16's rate. Against the default configuration, which
+converts and scatters each weight on every call, it is 1.11-1.16x at 3 B and 1.05-1.07x at
+8-9 B:
 
-**Conditions:** resident weights, the whole-tile program (`ROCKET_MM_STREAM=0`).
+| Model, F16 GGUF | Test | Default, t/s | `ROCKET_F16_RESIDENT=auto`, t/s | Resident int8, t/s | Resident int8 against resident fp16 |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-3B-Instruct | `pp512` | 95.6-96.1 | 113.2-113.8 | 107.5-109.5 | 0.948-0.967x |
+| Llama-3.2-3B-Instruct | `pp2048` | 84.4-84.7 | 97.0-97.6 | 94.1-94.8 | 0.964-0.978x |
+| Ministral-3-3B-Instruct | `pp512` | 85.8-86.3 | 101.1-101.8 | 98.8-100.1 | 0.971-0.990x |
+| Ministral-3-3B-Instruct | `pp2048` | 74.4-74.9 | 85.1-86.1 | 83.3-83.7 | 0.968-0.984x |
+| Ministral-3-8B-Instruct | `pp512` | 43.8-44.0 | 51.7-52.0 | 46.2-46.8 | 0.893-0.899x |
+| Ministral-3-8B-Instruct | `pp2048` | 39.5-39.6 | 45.7-46.2 | 42.0-42.1 | 0.908-0.921x |
+| Qwen3.5-9B | `pp512` | 36.0-36.4 | 41.3-41.8 | 38.2-38.3 | 0.914-0.927x |
+| Qwen3.5-9B | `pp2048` | 35.5-35.9 | 39.7-40.8 | 37.6-37.7 | 0.921-0.949x |
 
-Use the int8 and int4 routes, and a quantized GGUF, to fit a model in less RAM.
-[MODELS.md](MODELS.md#precisions) gives each route's accuracy.
+**Conditions:** RK3588, NPU at 928 MHz (the 900 MHz request), llama.cpp b11539,
+`llama-bench -n 0 -r 3 -t 8` at the default `-b` and `-ub`, governor `performance`. Resident int8
+is `ROCKET_INT8=1 ROCKET_INT8_RESIDENT=1` without the Hadamard rotation, with every weight resident.
+The 8-9 B rows set `ROCKET_INT8_CACHE_MB=0` for that. The 3 B rows were measured 2026-11-06 and
+the 8-9 B rows 2026-11-07.
+
+Resident int8 reads back an int32 partial for each K pass, which fp16 accumulates on the NPU
+instead, because the backend has no integer [K-accumulation](README.md#terms). `librocketnpu`
+streams the int8 weights through the CBUF, which deepens each pass and removes most of them. The
+passes left grow with `K`.
+
+The table's 8-9 B int8 rows summed the passes in an int64 accumulator.
+`librocketnpu` now adds each pass straight into the output, with unchanged output. The int8 route
+then runs Ministral-3-8B-Instruct 1.07-1.12x faster than in the table, and Llama-3.2-3B-Instruct
+1.01-1.03x [HW sweep 2026-11-07]. That is 51.5-52.0 t/s at `pp512` on the 8 B model, resident fp16's rate.
+
+The default `ROCKET_INT8_CACHE_MB` of 4096 holds 58-62% of an 8-9 B model's int8 weights, and the
+rest take the fp16 route. That costs 3-5% of the prefill rate on Ministral-3-8B-Instruct and 1-3%
+on Qwen3.5-9B against a budget that holds them all. With
+its whole-tile plan (`ROCKET_MM_STREAM_INT8=0`) the same route measures 0.61-0.66x resident fp16.
+Resident int4 has no streamed plan and measured 0.53x fp16 at ~816 MHz.
+
+Use the int8 route to hold a model's weights resident in half the RAM resident fp16 takes. Use
+int4 and a quantized GGUF to fit a model in less RAM. [MODELS.md](MODELS.md#precisions) gives
+each route's accuracy.
 
 ## Gains from the defaults
 

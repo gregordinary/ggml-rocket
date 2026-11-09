@@ -5,7 +5,8 @@
  * device run can see: the FA dump's file handling, the MB-budget parser, the weight cache's
  * identity, the MoE residency ledger across two live backends, the resident-weight budget
  * each residency variable sets at init, the H60 table's one-time
- * build under concurrent first use, and the device-route circuit breaker.
+ * build under concurrent first use, the device-route circuit breaker, and the registered
+ * sources of weights ggml-cpu repacked.
  *
  * It includes ggml-rocket.cpp directly, so every `static` helper is in reach without a test
  * seam in the shipped backend, and links ggml, ggml-cpu and rocketnpu in place of the
@@ -318,6 +319,100 @@ static void test_breaker(void) {
     CHECK(rk_breaker_allow(b) && rk_breaker_allow(b), "a successful probe closes the breaker");
 }
 
+// ---------------------------------------------------------------------------
+// Repacked-weight sources: a weight in ggml-cpu's CPU_REPACK buffer is claimed only through its
+// registered original bytes, and its weight key is one key whether supports_op computes it (data
+// at the repacked copy) or compute does (data pointed at the registered bytes). The MoE
+// pre-flight reserves a stack under the first and compute claims it under the second.
+static void test_repacked_sources(void) {
+    printf("-- repacked-weight sources\n");
+    ggml_backend_reg_t cpu_reg = ggml_backend_cpu_reg();
+    auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+    ggml_backend_buffer_type_t repack = nullptr;
+    for (ggml_backend_buffer_type_t * bt = get_extra ? get_extra(ggml_backend_reg_dev_get(cpu_reg, 0)) : nullptr;
+         bt && *bt; bt++) {
+        if (rocket_buft_is_repack(*bt)) repack = *bt;
+    }
+    if (!repack) { printf("  [SKIP] this ggml-cpu has no CPU_REPACK buffer type\n"); return; }
+
+    const int K = 256, N = 64;
+    ggml_init_params wp = { 4 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * wctx = ggml_init(wp);
+    ggml_tensor * w = ggml_new_tensor_2d(wctx, GGML_TYPE_Q4_0, K, N);
+    ggml_set_name(w, "blk.0.ffn_down.weight");
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, repack);
+    if (!wbuf || !w->extra) {                           // no repack for this CPU and shape
+        printf("  [SKIP] this CPU repacks no Q4_0 weight of %dx%d\n", K, N);
+        if (wbuf) ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        return;
+    }
+    // The original bytes, as a GGUF holds them, then the repacked copy ggml-cpu makes of them.
+    std::vector<float> f((size_t)K * N);
+    for (size_t i = 0; i < f.size(); i++) f[i] = (float)((i * 2654435761u) % 2001) / 1000.0f - 1.0f;
+    std::vector<uint8_t> orig(ggml_nbytes(w));
+    ggml_quantize_chunk(GGML_TYPE_Q4_0, f.data(), orig.data(), 0, N, K, nullptr);
+    ggml_backend_tensor_set(w, orig.data(), 0, orig.size());
+    CHECK(memcmp(w->data, orig.data(), orig.size()) != 0, "ggml-cpu stores the weight in another layout");
+
+    ggml_init_params op = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * octx = ggml_init(op);
+    ggml_tensor * b  = ggml_new_tensor_2d(octx, GGML_TYPE_F32, K, rocket_min_m_quant());
+    ggml_tensor * mm = ggml_mul_mat(octx, w, b);
+    const bool fp16_route = !rocket_rk3576_selected();  // the RK3576 route declines quantized weights
+
+    CHECK(ggml_backend_rocket_device_supports_buft(nullptr, repack), "supports_buft accepts CPU_REPACK");
+    CHECK(rocket_tensor_needs_source(w) && !rocket_tensor_source(w)
+          && !ggml_backend_rocket_device_supports_op(nullptr, mm),
+          "an unregistered repacked weight's MUL_MAT is declined");
+
+    ggml_backend_rocket_register_weight_source(w, orig.data(), orig.size());
+    CHECK(rocket_tensor_source(w) == orig.data(), "a registered weight reads its registered bytes");
+    if (fp16_route) {
+        CHECK(ggml_backend_rocket_device_supports_op(nullptr, mm), "a registered weight's MUL_MAT is claimed");
+    }
+
+    const std::string k_place = rocket_weight_key(w);
+    void * repacked = w->data;
+    w->data = orig.data();                              // what graph_compute does for the split
+    const std::string k_compute = rocket_weight_key(w);
+    w->data = repacked;
+    CHECK(!k_place.empty() && k_place == k_compute,
+          "the weight key is the same in supports_op and in compute");
+
+    char name[GGML_MAX_NAME];
+    snprintf(name, sizeof name, "%s", w->name);
+    ggml_set_name(w, "blk.1.ffn_down.weight");
+    CHECK(!rocket_tensor_source(w), "a renamed tensor does not use the old registration");
+    ggml_set_name(w, name);
+    ggml_backend_rocket_register_weight_source(w, orig.data(), orig.size() - 1);
+    CHECK(!rocket_tensor_source(w), "a registration of another size is not used");
+
+    // A view node ahead of a node that reads the weight directly. The view reads no bytes, and it
+    // must not mark the weight as checked: unregistered, the split fails before any route reads
+    // the repacked layout. A second registration keeps the registry non-empty, so the check runs.
+    ggml_backend_rocket_register_weight_source(w, nullptr, 0);
+    ggml_backend_rocket_register_weight_source(b, f.data(), 0);
+    ggml_tensor * v   = ggml_view_2d(octx, w, K, N / 2, w->nb[1], 0);
+    ggml_tensor * mm2 = ggml_mul_mat(octx, w, b);
+    ggml_cgraph * gf  = ggml_new_graph(octx);
+    ggml_build_forward_expand(gf, v);
+    ggml_build_forward_expand(gf, mm2);
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) _exit(ggml_backend_rocket_graph_compute(nullptr, gf) == GGML_STATUS_FAILED ? 0 : 1);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "an unregistered weight behind a view node fails the split");
+
+    ggml_backend_rocket_register_weight_source(b, nullptr, 0);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(octx);
+    ggml_free(wctx);
+}
+
 int main(void) {
     test_fadump();
     test_parser();
@@ -326,6 +421,7 @@ int main(void) {
     test_init_budget();
     test_h60();
     test_breaker();
+    test_repacked_sources();
     printf("%s\n", g_fails ? "FAIL" : "PASS");
     return g_fails ? 1 : 0;
 }

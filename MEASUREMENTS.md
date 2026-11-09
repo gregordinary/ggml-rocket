@@ -167,6 +167,25 @@ of a 97.8 s pinned prefill, 3.46 s gathering and 1.98 s scattering. The thread-c
 three configurations in three rotated passes. A fit of `G_k = A/k + B` to the table leaves a
 fixed 0.55 s, which bounds what workers past four can save.
 
+The quantization table's four configurations ran on one build, selected by environment alone.
+Each process followed a memory reset and a discarded warm-up process. Three passes ran with the
+order rotated, and each ratio pairs two configurations within one pass [HW sweep 2026-11-06].
+The whole-tile int8 figure is the same build under `ROCKET_MM_STREAM_INT8=0`: 69.4-70.5 t/s on
+Llama-3.2-3B-Instruct at `pp512`. It reproduces the 0.60x of the earlier record, Gemma-4-12B F16
+at `pp2048` at ~816 MHz. The int8 route's perplexity is the same on both plans at every chunk,
+11.0729.
+
+The table's 8-9 B rows ran the same way on a later build of the same sources [HW sweep
+2026-11-07]. Ministral-3-8B-Instruct ran five configurations: the four, plus the int8 route at the
+default 4096 MB budget. Qwen3.5-9B ran four, without the whole-tile plan. All 27 processes
+completed. The whole-tile int8 plan ran Ministral-3-8B-Instruct at 31.7-31.8 t/s at `pp512`,
+0.610-0.615x resident fp16. Resident fp16 places at these sizes because a prefill-only process
+drops each F16 source page once its weight is resident.
+
+The perplexity rows in [MODELS.md](MODELS.md#int8-w8a8) are 8 chunks of 512 of wikitext-2 test.
+Each arm's error estimate is ~5%, so the sign of each difference rests on the per-chunk running
+estimates. int8 is above fp16 at every chunk on both 8-9 B models.
+
 ## MODELS
 
 The Ministral-3-8B and Gemma-4-12B tables replaced 2026-07-01 and 2026-07-02 sessions at ~816 MHz.
@@ -242,6 +261,12 @@ sit an order of magnitude outside that spread. The work minimum's form is derive
 is fitted on two architectures. Qwen3-30B-A3B confirms its direction but not its position: halving
 the work per dispatch at matched residency lowered `ROCKET_MOE=1` from 0.834x to 0.661x.
 
+Qwen3-30B-A3B's `ROCKET_MOE=1` figure in [MOE.md](MOE.md), 0.800x at 62% resident, is three
+rotated passes with a memory reset before every configuration [HW sweep 2026-08-30]. The 0.834x
+above, at 62.4% resident, is three process pairs with the configurations alternated and the page
+cache dropped first [HW sweep 2026-08-27]. It stays here because its series also ran `-ub` 1024,
+which gives the matched-residency comparison.
+
 The DeepSeek-V2-Lite perplexity differences at `-c 2048` are paired per-chunk differences over 8
 chunks. The absolute error bar, ±2.5%, would resolve none of them, and pairing on the same chunks
 cancels the variance both configurations share.
@@ -283,7 +308,8 @@ per-pair ratios behind the 1.31x are 1.30, 1.34 and 1.30. At `pp2048` the route'
 3.5%). At `pp512` llama-bench reports ±1.8 t/s (15%) across one process's reps, against ±0.01 t/s
 for both CPU configurations. A `pp512 -r 1` run reports 332 of 332 calls as calibration forwards.
 In a longer run the first timed rep calibrates and the later reps run converged. The `pp512`
-11.78 t/s, 2.01x and 1.02x against the two CPU configurations, averages the two regimes.
+11.78 t/s, 2.01x and 1.02x against the two CPU configurations, averages the two regimes [HW sweep
+2026-08-11].
 
 ## API
 
@@ -299,3 +325,24 @@ thread counts is therefore no evidence about the split.
 
 **Not characterized:** whether the attention output is bit-identical at every `ROCKET_FA_THREADS`
 value.
+
+The [Repacked weights](API.md#repacked-weights) figures were reported by the contributor of the
+registration, from Ollama's `llama-server` registering the sources from its model loader. They
+were not reproduced on the RK1. With gemma-4 E2B (Ollama's `gemma4:e2b`) and a 2,000-token prompt:
+
+| Configuration | Prefill, t/s | Decode, t/s |
+|---|---:|---:|
+| `--no-repack` | 71-75 | 6.2-8.2 |
+| Repack on, original bytes registered, `ROCKET_DEQUANT_CACHE_MB=2048` | 80.6 | 11.9-12.7 |
+
+`ROCKET_DEQUANT_CACHE_MB` removes the per-micro-batch dequantization, and only the second
+configuration set it. The prefill ratio therefore does not isolate the registration. The decode
+gain is ggml-cpu's repacked kernels. Resident memory rose by about 3 GB with the repack on. The
+output matched the `--no-repack` configuration at temperature 0.
+
+**Conditions:** RK3588 with 32 GB of RAM, the vendor `rknpu` 0.9.7 driver through `rknpu-submit`,
+Ollama's `llama-server` with 4 threads on the A76 cores, reported 2026-11-08. The NPU clock, the
+`-b` and `-ub` settings and the run counts were not reported.
+
+**Not characterized:** the registration on the RK1 with the `rocket` driver, and how much
+residency `ROCKET_QUANT_RESIDENT=auto` loses to the repacked copy's RAM.

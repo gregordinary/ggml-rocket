@@ -3920,9 +3920,18 @@ static void rocket_trace(const ggml_tensor * dst, const char * path) {
 // tensor (the whole tensor when it is smaller than that), mixed with its byte size and type.
 // Sixteen cache lines per call, so it is cheap enough for the per-op key, and it changes when
 // a weight is replaced; a weight changed only between the windows keeps its fingerprint.
+//
+// A weight ggml-cpu repacked is sampled from its registered original bytes (see the
+// repacked-weight sources), never from t->data: supports_op sees data at the repacked copy and
+// graph_compute sees it pointed at the original, and the MoE pre-flight takes the key in the
+// first and claims it in the second. Sampling data would make those two keys, and the stack
+// reserved in supports_op would never be claimed. test-rocket-internals checks they are one.
+static bool rocket_tensor_needs_source(const ggml_tensor * t);
+static const void * rocket_tensor_source(const ggml_tensor * t);
 static uint64_t rocket_weight_fingerprint(const ggml_tensor * t) {
     const size_t n = ggml_nbytes(t);
-    const unsigned char * p = (const unsigned char *)t->data;
+    const void * src = rocket_tensor_needs_source(t) ? rocket_tensor_source(t) : nullptr;
+    const unsigned char * p = (const unsigned char *)(src ? src : t->data);
     uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint64_t)n ^ ((uint64_t)t->type << 56);
     auto mix = [&h](uint64_t x) { h ^= x; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; };
     auto span = [&](size_t off, size_t len) {
@@ -5169,11 +5178,11 @@ static inline void rk_fa_walk(int nc, int64_t n, F && job) {
 // both contractions in fp32 on the NPU and runs the soft-cap, mask and softmax in fp32 on the
 // host; what it keeps in fp16 is Q (scaled), the score surface between the contractions, P,
 // and the output. Rounding there is what the declaration's own reference implementation
-// also does. RANGE is not: a scaled logit past 65504 SATURATES the fp16 score surface --
-// measured on the RK3588, it is not written as inf -- so the softmax ties the keys past the
-// limit and returns a full, finite, wrong surface. So range is guarded, both ends: a scaled
-// Q that does not fit fp16 is caught at the gather, and the library flags a saturated score
-// (ROCKET_E_RANGE). Either sends the op to rocket_fa_ref_f32, which needs no fp16 surface.
+// also does. RANGE is not: a scaled logit past 65504 overflows the fp16 score surface --
+// measured on the RK3588, a score from 65504 to 65519 is written as 65504 and one of 65520
+// or more as inf, from one product or a sum -- so the softmax either ties the keys at the
+// limit or goes NaN. So range is guarded, both ends: a scaled Q that does not fit fp16 is
+// caught at the gather, and the library flags an overflowed score (ROCKET_E_RANGE). Either sends the op to rocket_fa_ref_f32, which needs no fp16 surface.
 
 // The full-precision reference for one FLASH_ATTN_EXT op, written straight into dst: Q read as
 // the op's F32 (not narrowed), K, V and the mask from the dense fp16 tiles (exactly the op's
@@ -6755,7 +6764,8 @@ static bool rocket_diag_serialize(void) {
 // non-host CPU_REPACK buffer for its fast decode kernels. The NPU cannot read that
 // layout. A model loader that still holds the original (GGUF, mmapped) bytes of such a
 // tensor registers them here, through the "ggml_backend_rocket_register_weight_source"
-// proc address; the loader must keep those bytes mapped for the tensor's lifetime.
+// proc address. The loader must keep those bytes mapped while the tensor lives, and must
+// unregister the tensor (data == nullptr) before it frees it.
 //
 // supports_buft then also accepts CPU_REPACK, supports_op declines any op one of whose
 // sources lives in a non-host buffer with no registered source, and graph_compute
@@ -6763,6 +6773,15 @@ static bool rocket_diag_serialize(void) {
 // split (restored on return), so every read of weight data in this backend -- the
 // fp16/int8/int4/MoE/CPU-fallback paths alike -- sees the original layout. Decode
 // (M < rocket_min_m) is declined by supports_op and stays on the CPU's repacked copy.
+//
+// That swap writes the model's own tensor, which every context on the model shares. A host
+// must not compute another graph that reads the same weights while this split runs: its CPU
+// split would read the original bytes through the repacked kernels. One ggml-backend-sched
+// runs its splits one at a time, so a single context is safe.
+//
+// The scheduler reaches a repacked weight's op through its weight branch, which asks
+// supports_buft + supports_op and never op_offload (op_offload is only consulted for a host
+// buffer). So `--no-op-offload` does not keep a registered weight's matmul on the CPU.
 struct rocket_wsrc_entry {
     const void * data;
     size_t       nbytes;
@@ -6797,8 +6816,9 @@ static bool rocket_tensor_needs_source(const ggml_tensor * t) {
 }
 
 // Registered original bytes for t (offset for a view), or nullptr. The entry must still
-// describe the same tensor (name and size), so a stale registration from an earlier
-// model whose tensor struct was reused never hands out a dangling pointer.
+// describe the same tensor (name and size). That catches a tensor struct reused for a
+// DIFFERENT weight. It cannot catch the same model reloaded into a reused struct, whose names
+// and sizes all match, which is why the host must unregister before it frees.
 static const void * rocket_tensor_source(const ggml_tensor * t) {
     const ggml_tensor * base = t->view_src ? t->view_src : t;
     const size_t offs = t->view_src ? t->view_offs : 0;
@@ -6833,16 +6853,18 @@ static enum ggml_status ggml_backend_rocket_graph_compute(ggml_backend_t backend
     };
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        // A no-op node never reads its sources' bytes here, so it is skipped before its
+        // sources are marked seen: a later node that does read one is still checked. A view
+        // of a weight is swapped where it is read, through its own view_src and offset.
+        if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW
+            || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             ggml_tensor * s = node->src[j];
-            if (!s || !seen.insert(s).second) continue;
-            if (!rocket_tensor_needs_source(s)) continue;
+            if (!s || !rocket_tensor_needs_source(s) || !seen.insert(s).second) continue;
             const void * p = rocket_tensor_source(s);
             if (!p) {
-                if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW
-                    || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
-                    continue;   // no-op nodes never read their source's bytes here
-                }
                 GGML_LOG_ERROR("[rocket] %s: source %s of %s (%s) lives in a %s buffer with no registered "
                                "original bytes\n", __func__, s->name, node->name, ggml_op_name(node->op),
                                ggml_backend_buffer_name(s->view_src ? s->view_src->buffer : s->buffer));
@@ -7504,7 +7526,7 @@ static bool ggml_backend_rocket_device_supports_op_impl(ggml_backend_dev_t dev, 
             // the host. Its fp16 rounding is the reference's; its fp16 RANGE is guarded: a
             // scaled Q element or a scaled logit past 65504 sends the op to the full-precision
             // host reference (see ggml_backend_rocket_flash_attn), because the score surface
-            // saturates there rather than reading inf. test-rocket-fa scores a raw q.k of
+            // writes 65504 or inf there. test-rocket-fa scores a raw q.k of
             // 60000-135000 on the NPU and a scaled logit past 65504 on that reference, both
             // against a double oracle.
             float max_bias = 0.0f;
@@ -7552,21 +7574,19 @@ static bool ggml_backend_rocket_device_supports_op_impl(ggml_backend_dev_t dev, 
 // dropped. We still only run MUL_MAT (supports_op) and still hand out cpu buffers
 // (get_buffer_type), so this changes whether inputs are copied, not op placement.
 //
-// CONSEQUENCE FOR QUANTIZED WEIGHTS: the scheduler only assigns a weight's
-// matmul to this backend when the weight's buffer is host (it picks the highest-prio
-// backend whose supports_buft + supports_op both accept it, then falls back to the CPU's
-// op_offload, which also gates on is_host). With ggml-cpu's repack extra-buffer-type
-// enabled (the GGML_CPU_REPACK build option, on by default), quantized weights are loaded
-// into a non-host "CPU_REPACK" buffer for the CPU's fast repacked kernels, so this returns
-// false for them and their prefill stays on the CPU. To prefill a quantized GGUF on the NPU
-// (dequant->fp16, see rocket_weight_to_fp16), turn the host's repack off so the weights stay in
-// a host (CPU_Mapped) buffer: `-nr` / `--no-repack` (llama-bench `--repack 0`), which sets
-// use_extra_bufts, or a GGML_CPU_REPACK=OFF build. The runtime flag leaves a CPU-only run its
-// repack, worth 1.3-1.7x on quantized prefill. F16 weights are never repacked.
+// QUANTIZED WEIGHTS AND THE CPU REPACK: with ggml-cpu's repack extra-buffer-type enabled
+// (the GGML_CPU_REPACK build option, on by default), quantized weights are loaded into a
+// non-host "CPU_REPACK" buffer, in an interleaved layout for the CPU's repacked kernels. This
+// accepts that buffer type, but supports_op declines an op on such a weight unless the host
+// registered the weight's original bytes (ggml_backend_rocket_register_weight_source, see the
+// repacked-weight sources), and graph_compute then reads those. No stock host registers
+// them, so with llama.cpp the prefill of a repacked weight stays on the CPU. To prefill a
+// quantized GGUF on the NPU there (dequant->fp16, see rocket_weight_to_fp16), turn the host's
+// repack off so the weights stay in a host (CPU_Mapped) buffer: `-nr` / `--no-repack`
+// (llama-bench `--repack 0`), which sets use_extra_bufts, or a GGML_CPU_REPACK=OFF build. The
+// runtime flag leaves a CPU-only run its repack, worth 1.3-1.7x on quantized prefill. F16
+// weights are never repacked.
 static bool ggml_backend_rocket_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    // CPU_REPACK is accepted too: an op on a repacked weight is still declined by
-    // supports_op unless the loader registered the weight's original bytes (see
-    // ggml_backend_rocket_register_weight_source), and graph_compute reads those.
     (void)dev; return ggml_backend_buft_is_host(buft) || rocket_buft_is_repack(buft);
 }
 

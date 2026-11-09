@@ -221,7 +221,7 @@ MACs.
 Qwen3-30B-A3B, a third architecture, routes 8 of 128 experts of 2048×768. At `-ub 2048` its `M_e`
 is 128 and its work 201 million MACs, so the bucket minimum accepts it and the work minimum
 declines it. The default measures 1.000x its own `ROCKET_MOE=0` configuration and ingests nothing.
-`ROCKET_MOE=1` measures 0.834x.
+`ROCKET_MOE=1` measures 0.800x [HW sweep 2026-08-30].
 
 The work minimum sits above a 1.00x offload because of the [ingest](README.md#terms): ~18 s per
 `llama_context` on DeepSeek-V2-Lite and ~21 s on gpt-oss-20b. An offload `r` times as fast as the
