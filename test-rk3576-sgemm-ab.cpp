@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 The ggml-rocket authors
 /* test-rk3576-sgemm-ab — does this part's int8 GEMM beat ggml's own CPU MUL_MAT?
  *
  * The question a port has to answer BEFORE it is written: at LLM PREFILL shapes (M at

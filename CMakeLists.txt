@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The ggml-rocket authors
 # ggml-rocket — RK3588 NPU backend for ggml (separate project; links the
 # standalone rocket-userspace driver library).
 #
