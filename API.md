@@ -60,11 +60,13 @@ Two groups read an empty value differently:
 | `ROCKET_INT8_HADAMARD` | off | `1` adds a Hadamard rotation to the RK3588 int8 route, and with it the route's output is coherent. The RK3576 route always rotates and ignores it |
 | `ROCKET_INT8_RESIDENT` | off | With `ROCKET_INT8=1` on the RK3588, `1` holds the int8 weights resident, within `ROCKET_INT8_CACHE_MB` |
 | `ROCKET_INT8_CACHE_MB` | 4096 | The resident int8 weight budget in MB, `0` for unlimited, counted against the weights' actual NPU buffer size. A weight over the budget takes the fp16 route |
+| `ROCKET_NO_ACT_REUSE` | off | `1` makes the RK3588 int8 route quantize every matmul's activation afresh. By default, the matmuls of one scheduler split that read one activation, such as `ffn_gate` and `ffn_up`, quantize it once. The output is the same either way |
 | `ROCKET_INT4` | off | `1` selects the W4A4 int4 route from an F16 GGUF, with group-wise scales and a Hadamard rotation ([MODELS.md](MODELS.md#int4-w4a4)) |
 | `ROCKET_INT4_RESIDENT` | off | With `ROCKET_INT4=1`, `1` holds the int4 weights resident at ~¼ of the fp16 footprint. It needs group-wise scales. A per-channel weight, or one over the budget or past a full IOVA window, takes the per-call int4 route |
 | `ROCKET_INT4_GROUP` | 128 | The number of `K` elements that share one int4 scale, which must divide `K` and be a multiple of 32, and `0` selects per-channel scales. A smaller group is more accurate and reads back more partials |
 | `ROCKET_INT4_HADAMARD` | 1 | The int4 route's Hadamard rotation, which raises per-matmul cosine from ~0.79 to ~0.98. `0` turns it off |
 | `ROCKET_INT4_CACHE_MB` | 4096 | The int4 weight budget in MB, `0` for unlimited, which caps both the per-call route's host cache and the resident total. A weight over the budget falls back to fp16 |
+| `ROCKET_CONVERT_THREADS` | auto | The number of CPU threads for the host conversions around each offloaded matmul: the fp16 route's activation scaling and output unscaling, the int8 and int4 routes' activation quantization, rotation and int8 dequantization, and the int4 weights' quantization at load. Auto, which `0` also selects, is the `ROCKET_DEQUANT_THREADS` pool's width, and a conversion under 64 rows uses one thread. `1` forces one thread, with the same output ([TUNING.md](TUNING.md#quantization-and-prefill-speed)) |
 | `ROCKET_BF16` | off | `1` selects the exact bf16 route, which writes its fp32 result straight to `dst`. Without it, a bf16 weight converts to fp16 and takes the fp16 route |
 | `ROCKET_BF16_CACHE_MB` | off | A host cache, in MB, of the bf16 route's fp32 weights, `0` for unlimited. It removes the per-micro-batch bf16-to-fp32 conversion, the route's largest host cost, at twice the bf16 weight's size in RAM |
 
@@ -324,15 +326,21 @@ buffer type. Any other version builds with a warning, because a new slot that gg
 one change naming cannot see. `-DGGML_ROCKET_STRICT_ABI=ON` turns that warning into an error.
 
 The README's [Troubleshooting](README.md#rocket-device-not-listed-at-startup) lists the host
-versions it builds against. It builds with `-DGGML_ROCKET_STRICT_ABI=ON` against llama.cpp b11539 and whisper.cpp v1.9.5, both at version 3.
-On both, the NPU's greedy completion and transcripts are byte-identical to the CPU's [HW sweep
-2026-10-09].
+versions it builds against. It builds with `-DGGML_ROCKET_STRICT_ABI=ON` against llama.cpp
+b11539 and whisper.cpp v1.9.5, both at version 3. On both, the NPU's greedy completion and
+transcripts are byte-identical to the CPU's [HW sweep 2026-10-09]. The source also compiles with
+that flag against ggml 1.0.0 (llama.cpp v1.0.0), still version 3 [host-computed 2026-11-14].
+It has not been run there.
 
 ### Op numbering check
 
 At load, the backend checks the host's op numbering. ggml numbers its ops by position in an
-enum, and inserting one shifts every op after it without moving `GGML_BACKEND_API_VERSION`. ggml
-0.15 inserted `COL2IM_1D`, so `FLASH_ATTN_EXT` moved from 73 to 74 while `MUL_MAT` stayed at 29.
+enum, and inserting or removing one shifts every op after it without moving
+`GGML_BACKEND_API_VERSION`. ggml 0.15 inserted `COL2IM_1D`, so `FLASH_ATTN_EXT` moved from 73 to
+74 while `MUL_MAT` stayed at 29. ggml 1.0.0 removed `ADD1` ahead of `MUL_MAT`, and
+`DIAG_MASK_INF` and `DIAG_MASK_ZERO` ahead of `FLASH_ATTN_EXT`. `MUL_MAT` moved from 29 to 28,
+`MUL_MAT_ID` from 30 to 29 and `FLASH_ATTN_EXT` from 74 to 71. Unchecked, a `.so` built before
+1.0.0 would offload the host's `MUL_MAT_ID` as a `MUL_MAT`.
 
 The load entry asks the host's `ggml_op_name` to name each op number the backend handles, and
 returns `NULL` on a mismatch. The loader reports that as `ggml_backend_init returned NULL` and

@@ -182,6 +182,40 @@ completed. The whole-tile int8 plan ran Ministral-3-8B-Instruct at 31.7-31.8 t/s
 0.610-0.615x resident fp16. Resident fp16 places at these sizes because a prefill-only process
 drops each F16 source page once its weight is resident.
 
+The `ROCKET_CONVERT_THREADS` figures are four configurations on one build, on Qwen3.5-9B F16 with
+every int8 weight resident. Rotated and unrotated each ran with the host conversions spread over
+the A76 cores and on one thread (`ROCKET_CONVERT_THREADS=1 ROCKET_NO_ACT_REUSE=1`). The governor
+was `performance`. Three passes ran with the order rotated, and a memory reset and a discarded
+warm-up process came before every configuration [HW sweep 2026-11-11]. Each ratio pairs two
+configurations within one pass.
+
+Rotated, the spread conversions ran at 41.38-42.03 t/s against 35.92-36.02 on one thread.
+Unrotated, they ran at 42.94-43.65 t/s against 41.51-42.03. The one-thread unrotated rate matches
+the serial build's of the day before, 41.7-42.0 t/s. The one-thread rotated rate is 2-3% under
+that build's 36.6-37.0, because its rotation took 4.47 s against 4.11 over two `pp512` runs.
+Against the previous build the rotated gain is 1.12-1.15x.
+
+Perplexity over 4 chunks of 512 of wikitext-2 test was the same at every chunk within each pair
+[HW sweep 2026-11-10]. The `ROCKET_MM_PROFILE` processes put the rotated activation conversions
+at 5.31 s of caller time on one thread and 1.23 s spread, over two `pp512` runs. The unrotated
+ones took 0.95 s and 0.32 s. The dequantization fell from 0.80-0.93 s to 0.53 s. The NPU wait and
+the packing did not change.
+
+The fp16 conversion figures are Ministral-3-8B-Instruct F16 at `pp512` on one build [HW sweep
+2026-11-11]. They cover resident fp16 weights (`ROCKET_F16_RESIDENT=auto`) and the default route,
+each against `ROCKET_CONVERT_THREADS=1`, under the protocol above. Resident, the spread
+conversions ran at 52.70-52.88 t/s against 51.48-52.03. On the default route they ran at
+44.28-44.44 against 43.79-43.84. In the `ROCKET_MM_PROFILE` processes the activation scaling fell from 733 to
+331 ms over two runs and the output unscaling from 529 to 413 ms. The library's own activation
+pack rose from 746 to 906 ms, taking back part of the saving.
+
+The Gemma-4-12B rotated rate is the current build against the build before its 60-point
+rotation was restructured, in one series [HW sweep 2026-11-11]. The two builds' rotations give the
+same bits. Over three passes in alternating order the current one ran at 31.77-31.93 t/s against
+29.09-29.24, 1.090-1.093x. Its `ROCKET_MM_PROFILE` process put the rotated conversions at 3.50 s
+over two `pp512` runs, against 6.35 s for the earlier build. The fp16 route's 25.48-25.93 t/s comes
+from a series earlier that day under the same protocol.
+
 The perplexity rows in [MODELS.md](MODELS.md#int8-w8a8) are 8 chunks of 512 of wikitext-2 test.
 Each arm's error estimate is ~5%, so the sign of each difference rests on the per-chunk running
 estimates. int8 is above fp16 at every chunk on both 8-9 B models.

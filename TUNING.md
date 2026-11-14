@@ -193,6 +193,32 @@ The table's 8-9 B int8 rows summed the passes in an int64 accumulator.
 then runs Ministral-3-8B-Instruct 1.07-1.12x faster than in the table, and Llama-3.2-3B-Instruct
 1.01-1.03x [HW sweep 2026-11-07]. That is 51.5-52.0 t/s at `pp512` on the 8 B model, resident fp16's rate.
 
+`ROCKET_INT8_HADAMARD=1` costs prefill speed. The rotation and the int8 quantization and
+dequantization run on the host for every matmul, spread over the A76 cores
+(`ROCKET_CONVERT_THREADS`). Matmuls in one scheduler split that read the same activation convert it
+once. On Qwen3.5-9B the rotated route then runs at 41.4-42.0 t/s at `pp512`, 0.951-0.972x its
+unrotated rate, against 0.855-0.867x with the conversions on one thread. The threads raise the
+rotated route's rate 1.15-1.17x and the unrotated route's 1.02-1.04x, with unchanged output. On that
+model the rotation also brings the perplexity cost from +2.83% to +0.97%
+([MODELS.md](MODELS.md#int8-w8a8)).
+
+**Conditions:** CPU governor `performance`, a memory reset and a discarded warm-up process before
+every configuration, three passes in rotated order. One backend build, with one thread selected by
+`ROCKET_CONVERT_THREADS=1 ROCKET_NO_ACT_REUSE=1` [HW sweep 2026-11-11].
+
+At 12 B the int8 route gains more. On Gemma-4-12B-it F16, with every int8 weight resident
+(`ROCKET_INT8_CACHE_MB=0`), it runs at 1.35-1.37x the default fp16 route at `pp512` and 1.30-1.32x
+at `pp2048`. Unrotated output is far from fp16's on that model, so set `ROCKET_INT8_HADAMARD=1`
+there ([MODELS.md](MODELS.md#int8-w8a8)). Rotated, the route runs at 31.8-31.9 t/s at `pp512`,
+against 25.5-25.9 t/s for the fp16 route. The rotation is the difference: its `K` 3840 and 15360
+take the 60-point construction, which costs about 1.6 s a 512-row micro-batch.
+
+**Conditions:** CPU governor `performance`, a memory reset and a discarded warm-up process before
+every configuration, three passes in rotated order [HW sweep 2026-11-11]. The rotated and fp16
+rates come from two series run the same day.
+
+**Not characterized:** the rotated route at `pp2048` with the current rotation.
+
 The default `ROCKET_INT8_CACHE_MB` of 4096 holds 58-62% of an 8-9 B model's int8 weights, and the
 rest take the fp16 route. That costs 3-5% of the prefill rate on Ministral-3-8B-Instruct and 1-3%
 on Qwen3.5-9B against a budget that holds them all. With
@@ -324,6 +350,17 @@ GGUFs, 1.32-1.33x, and most on the small and MoE ones, up to 4.22x on DeepSeek-V
 
 A CPU-only prefill is the exception: it runs 4-10% faster at 8 threads than at 4 [HW 2026-11-01],
 so the README's CPU baseline uses 8.
+
+The backend's host conversions around each offloaded matmul run on a pool of A76 threads
+(`ROCKET_CONVERT_THREADS`), between device calls while the NPU is idle. On the fp16 route these
+are the activation's row scaling and the output's unscaling. Spread over the A76 cores they raise
+Ministral-3-8B F16 at `pp512` 1.016-1.024x with resident fp16 weights and 1.010-1.014x on the
+default route, with unchanged output. The output pass writes 4 bytes for each 2 it reads. It
+already runs near the DRAM rate on one core, so more threads gain little there.
+
+**Conditions:** CPU governor `performance`, a memory reset and a discarded warm-up process before
+every configuration, three passes in rotated order. The baseline is `ROCKET_CONVERT_THREADS=1` in
+the same build [HW sweep 2026-11-11].
 
 ## Speech
 

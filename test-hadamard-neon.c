@@ -62,22 +62,43 @@ static void fwht_simd(float *v,int n){
             vst1q_f32(v+j,vaddq_f32(a,b)); vst1q_f32(v+j+len,vsubq_f32(a,b)); }
 #endif
         for(;j<i+len;j++){ float a=v[j],b=v[j+len]; v[j]=a+b; v[j+len]=a-b; } } }
+#ifdef HAVE_NEON
+/* The H_60 block matvec: eight outputs (then four) at a time, each output accumulated in the
+ * same order as a one-output loop, so it is bit-identical to one. */
+static void h60_block_simd(float *blk){ float32x4_t b[15]; float out[60]; int o=0;
+    for(int k=0;k<15;k++) b[k]=vld1q_f32(blk+4*k);
+    for(;o+8<=60;o+=8){ float32x4_t a[8];
+        for(int u=0;u<8;u++) a[u]=vdupq_n_f32(0.0f);
+        for(int k=0;k<15;k++) for(int u=0;u<8;u++) a[u]=vfmaq_f32(a[u],vld1q_f32(g_H60[o+u]+4*k),b[k]);
+        for(int u=0;u<8;u++) out[o+u]=vaddvq_f32(a[u]); }
+    for(;o<60;o+=4){ float32x4_t a[4];
+        for(int u=0;u<4;u++) a[u]=vdupq_n_f32(0.0f);
+        for(int k=0;k<15;k++) for(int u=0;u<4;u++) a[u]=vfmaq_f32(a[u],vld1q_f32(g_H60[o+u]+4*k),b[k]);
+        for(int u=0;u<4;u++) out[o+u]=vaddvq_f32(a[u]); }
+    memcpy(blk,out,sizeof out); }
+/* The FWHT across blocks, all 60 lanes at once: butterflies on whole 60-float blocks. */
+static void fwht_blocks60_simd(float *row,int B2){
+    for(int len=1;len<B2;len<<=1) for(int i=0;i<B2;i+=len<<1) for(int j=i;j<i+len;j++){
+        float *x=row+j*60,*y=row+(j+len)*60;
+        for(int l=0;l<60;l+=4){ float32x4_t a=vld1q_f32(x+l),c=vld1q_f32(y+l);
+            vst1q_f32(x+l,vaddq_f32(a,c)); vst1q_f32(y+l,vsubq_f32(a,c)); } } }
+#endif
 static void rotate_simd(float *row,int K){ const float inv=1.0f/sqrtf((float)K);
     if(rk_ispow2(K)) fwht_simd(row,K);
-    else { const int B2=K/60; float col[4096];
+    else { const int B2=K/60;
+#ifdef HAVE_NEON
+        for(int b=0;b<B2;b++) h60_block_simd(row+b*60);
+        fwht_blocks60_simd(row,B2);
+#else
+        float col[4096];
         for(int b=0;b<B2;b++){ float *blk=row+b*60,out[60];
             for(int o=0;o<60;o++){ const float *h=g_H60[o];
-#ifdef HAVE_NEON
-                float32x4_t acc=vdupq_n_f32(0.0f);
-                for(int k=0;k<60;k+=4) acc=vfmaq_f32(acc,vld1q_f32(h+k),vld1q_f32(blk+k));
-                out[o]=vaddvq_f32(acc);
-#else
-                float s=0; for(int k=0;k<60;k++) s+=h[k]*blk[k]; out[o]=s;
-#endif
-            }
+                float s=0; for(int k=0;k<60;k++) s+=h[k]*blk[k]; out[o]=s; }
             for(int o=0;o<60;o++) blk[o]=out[o]; }
         for(int lane=0;lane<60;lane++){ for(int b=0;b<B2;b++) col[b]=row[b*60+lane];
-            fwht_simd(col,B2); for(int b=0;b<B2;b++) row[b*60+lane]=col[b]; } }
+            fwht_simd(col,B2); for(int b=0;b<B2;b++) row[b*60+lane]=col[b]; }
+#endif
+    }
     int k=0;
 #ifdef HAVE_NEON
     const float32x4_t vinv=vdupq_n_f32(inv);

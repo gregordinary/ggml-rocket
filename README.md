@@ -383,6 +383,13 @@ b10558 through b11539. llama.cpp moved to version 3 at b11351, and b11351 throug
 that ggml 0.25.3. Read a host's API version from its `ggml/src/ggml-backend-impl.h`, not from
 the ggml version.
 
+ggml 1.0.0, the ggml of llama.cpp v1.0.0, keeps API version 3 but removes three ops. That
+renumbers the ops after them, `MUL_MAT` from 29 to 28. A 1.0.0 host refuses a `.so` built
+against an earlier ggml, and an earlier host refuses a 1.0.0 one. Both log the op-ordinal line
+above, and the cure is to rebuild against the host. The source needs no change: it compiles
+against ggml 1.0.0 with `-DGGML_ROCKET_STRICT_ABI=ON` [host-computed 2026-11-14]. It has not
+been run in a llama.cpp v1.0.0 host.
+
 If the device appears but runs zero matmuls, the backend was built without a working
 `offload_op`. See [Implementation notes](API.md#implementation-notes).
 
@@ -452,7 +459,7 @@ patches:
 
 ## License and credits
 
-`ggml-rocket` is MIT-licensed; see [LICENSE](LICENSE). It builds on
+`ggml-rocket` is MIT-licensed. See [LICENSE](LICENSE). It builds on
 [ggml](https://github.com/ggml-org/ggml) (MIT) as an out-of-tree, runtime-loadable backend, modeled
 on ggml's own BLAS backend, and on the `rocket-userspace` driver for NPU access.
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) carries ggml's license notice.

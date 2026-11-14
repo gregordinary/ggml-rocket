@@ -306,6 +306,19 @@ static inline void rk_breaker_note(rk_breaker & b, int rc, const char * route) {
                 route, b.fails, rc, b.skip);
 }
 
+// The RK3588 int8 route's last converted activation: its codes and per-row scales, and the
+// key they are valid for. rk_int8_act fills and reads it; src == nullptr means empty.
+struct rk_act_memo {
+    const ggml_tensor * src   = nullptr;   // the activation tensor the codes were made from
+    const void *        data  = nullptr;   // its data pointer then
+    uint64_t            epoch = 0;         // the graph_compute call they belong to
+    int64_t             M = 0, K = 0;
+    int                 Mp = 0;
+    bool                had = false;       // rotated
+    std::vector<int8_t> q;                 // [Mp,K]; pad rows zero
+    std::vector<float>  s;                 // [Mp]; pad entries unread
+};
+
 struct ggml_backend_rocket_context {
     // One breaker per device route (see rk_breaker).
     rk_breaker brk_stream;    // rocket_matmul_fp16_stream / _stream_fused
@@ -361,6 +374,11 @@ struct ggml_backend_rocket_context {
     std::vector<int8_t>      scratch_C8;     // [M,N] int8 readback (RK3576)
     std::vector<float>       scratch_dqf;    // [N] per-column dequant factors (RK3576)
     std::vector<ggml_fp16_t> rk76_prof_h16;  // [M,Kc] ROCKET_RK3576_PROF_CVT16's conversion target
+    // The RK3588 int8 route's activation, held for the rest of one graph_compute call so the
+    // projections that share an input convert it once (rk_int8_act). graph_epoch counts the
+    // calls; graph_compute bumps it on entry, which retires the memo of the previous one.
+    rk_act_memo act_memo;
+    uint64_t    graph_epoch = 0;
     // Keyed on the STABLE logical weight name, NOT src0->data. ggml-backend-sched
     // copies our weights into a small POOLED buffer (the model's mmapped weights
     // live in a buffer our supports_buft rejects), and it REUSES those slots across
@@ -1392,6 +1410,25 @@ static void rocket_fatiming_add(double gather_ms, double compute_ms, double scat
     if (n_kv > g_fatiming.max_kv) g_fatiming.max_kv = n_kv;
 }
 
+// Row fan-out for the per-call host converts: the fp16 route's activation scaling and output
+// unscaling (below), and the integer routes' activation quant, its rotation, the int32 dequant
+// and the group-wise int4 quant. Each of them computes a row from that row alone, so splitting
+// the rows over threads is bit-identical to the serial loop at any chunk count. They run on
+// the graph_compute thread before or after a device call, with the NPU idle and the big cores
+// free, so a serial loop here is prefill wall one for one.
+//
+// rk_rows_chunks(rows) is the chunk count to use: 1 (inline, on the calling thread) below
+// RK_ROWS_FANOUT_MIN rows, under ROCKET_CONVERT_THREADS=1, or with a one-worker pool;
+// otherwise the persistent big-core pool's width (rocket_dequant_pool, defined below with the
+// dequant that first needed it), or ROCKET_CONVERT_THREADS if that is smaller. rk_rows_fanout(nc, rows,
+// job) runs job(chunk, r0, r1) once per non-empty chunk and returns after all of them; chunk
+// is in [0, nc), so a caller can index per-chunk state with it. No caller of these runs
+// inside a pool job, so run() cannot nest.
+static constexpr int64_t RK_ROWS_FANOUT_MIN = 64;
+static int  rk_rows_chunks(int64_t rows);
+static void rk_rows_fanout(int nc, int64_t rows,
+                           const std::function<void(int, int64_t, int64_t)> & job);
+
 // ===========================================================================
 // Activation packing, fp16 scaling, and output unpacking
 // ===========================================================================
@@ -1409,37 +1446,42 @@ static void rocket_fatiming_add(double gather_ms, double compute_ms, double scat
 // matters more as prefill length grows. scales[] must hold M floats; the caller
 // leaves any pad rows beyond M zero (value-initialized). Weights are left as is
 // (bounded; the outlier problem is activations, per the quant findings).
+//
+// One row: returns the row's scale and writes its K fp16 values.
+static inline float rk_pack_act_row(const float * row, ggml_fp16_t * d, int64_t K) {
+    int64_t k = 0;
+    float amax = 0.0f;
+#ifdef ROCKET_NEON_FP16
+    // Pass 1: row max-abs, 4 lanes/instr.
+    float32x4_t vmax = vdupq_n_f32(0.0f);
+    for (; k + 4 <= K; k += 4) vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(row + k)));
+    amax = vmaxvq_f32(vmax);
+#endif
+    for (; k < K; k++) { const float v = fabsf(row[k]); if (v > amax) amax = v; }
+    const float s   = (amax > 0.0f) ? amax : 1.0f;
+    const float inv = 1.0f / s;
+    k = 0;
+#ifdef ROCKET_NEON_FP16
+    // Pass 2: scale by 1/s and convert f32->f16, 4 lanes/instr. ggml_fp16_t is a
+    // 16-bit IEEE half; __fp16 store writes the same bit pattern (RNE, matching
+    // ggml_fp32_to_fp16's hardware path).
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    __fp16 * dh = (__fp16 *)d;
+    for (; k + 4 <= K; k += 4)
+        vst1_f16(dh + k, vcvt_f16_f32(vmulq_f32(vld1q_f32(row + k), vinv)));
+#endif
+    for (; k < K; k++) d[k] = ggml_fp32_to_fp16(row[k] * inv);
+    return s;
+}
+// The whole [M,K] activation, its rows fanned out over the big-core pool (rk_rows_fanout).
 static void rocket_pack_activations(const float * src, ggml_fp16_t * dst,
                                     int64_t M, int64_t K, float * scales) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++) {
-        const float * row = src + m * K;
-        int64_t k = 0;
-        float amax = 0.0f;
-#ifdef ROCKET_NEON_FP16
-        // Pass 1: row max-abs, 4 lanes/instr.
-        float32x4_t vmax = vdupq_n_f32(0.0f);
-        for (; k + 4 <= K; k += 4) vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(row + k)));
-        amax = vmaxvq_f32(vmax);
-#endif
-        for (; k < K; k++) { const float v = fabsf(row[k]); if (v > amax) amax = v; }
-        const float s   = (amax > 0.0f) ? amax : 1.0f;
-        const float inv = 1.0f / s;
-        ggml_fp16_t * d = dst + m * K;
-        k = 0;
-#ifdef ROCKET_NEON_FP16
-        // Pass 2: scale by 1/s and convert f32->f16, 4 lanes/instr. ggml_fp16_t is a
-        // 16-bit IEEE half; __fp16 store writes the same bit pattern (RNE, matching
-        // ggml_fp32_to_fp16's hardware path).
-        const float32x4_t vinv = vdupq_n_f32(inv);
-        __fp16 * dh = (__fp16 *)d;
-        for (; k + 4 <= K; k += 4)
-            vst1_f16(dh + k, vcvt_f16_f32(vmulq_f32(vld1q_f32(row + k), vinv)));
-#endif
-        for (; k < K; k++) d[k] = ggml_fp32_to_fp16(row[k] * inv);
-        scales[m] = s;
-    }
+    rk_rows_fanout(rk_rows_chunks(M), M, [&](int, int64_t m0, int64_t m1) {
+        for (int64_t m = m0; m < m1; m++)
+            scales[m] = rk_pack_act_row(src + m * K, dst + m * K, K);
+    });
     if (prof) rocket_convprof_add(rocket_now_ms() - t0, (double)M * K, false);
 }
 
@@ -1474,13 +1516,15 @@ static inline void rk_unpack_row(const ggml_fp16_t * src, float * dst, int64_t N
     for (; n < N; n++) dst[n] = ggml_fp16_to_fp32(src[n]) * s;
 }
 
-// The whole [M,N] tile: src/dst each hold M*N (N contiguous).
+// The whole [M,N] tile: src/dst each hold M*N (N contiguous). Rows fan out like the pack's.
 static void rocket_unpack_output(const ggml_fp16_t * src, float * dst,
                                  int64_t M, int64_t N, const float * scales) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++)
-        rk_unpack_row(src + m * N, dst + m * N, N, scales[m]);
+    rk_rows_fanout(rk_rows_chunks(M), M, [&](int, int64_t m0, int64_t m1) {
+        for (int64_t m = m0; m < m1; m++)
+            rk_unpack_row(src + m * N, dst + m * N, N, scales[m]);
+    });
     if (prof) rocket_convprof_add(rocket_now_ms() - t0, (double)M * N, true);
 }
 
@@ -1492,8 +1536,10 @@ static void rocket_unpack_output_seg(const ggml_fp16_t * src, int64_t src_stride
                                      int64_t M, int64_t Ni, const float * scales) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++)
-        rk_unpack_row(src + m * src_stride + col0, dst + m * Ni, Ni, scales[m]);
+    rk_rows_fanout(rk_rows_chunks(M), M, [&](int, int64_t m0, int64_t m1) {
+        for (int64_t m = m0; m < m1; m++)
+            rk_unpack_row(src + m * src_stride + col0, dst + m * Ni, Ni, scales[m]);
+    });
     if (prof) rocket_convprof_add(rocket_now_ms() - t0, (double)M * Ni, true);
 }
 
@@ -1504,15 +1550,24 @@ static void rocket_unpack_output_seg(const ggml_fp16_t * src, int64_t src_stride
 // widths: they are separate opt-in routes and never run in the same process. Same
 // ROCKET_MM_PROFILE knob, so graph_compute is serialized while it accumulates
 // (rocket_diag_serialize); own exit line.
-static struct { double act_rot, act_q, wt_rot, wt_q, dq;
-                long act_calls, wt_calls, dq_calls; } g_i8prof;
+//
+// The activation rows fan out over the big-core pool (rk_rows_fanout), so act_rotate and
+// act_quant SUM the chunks' intervals: core time, equal to the caller's time only when a
+// call runs serially. act_wall is the calling thread's elapsed time over the whole
+// activation convert, which is the part of it on the prefill's critical path. dequant is
+// also the calling thread's elapsed time. act_reused counts the calls served by the
+// activation memo (rk_int8_act), which convert nothing and are not in `act` calls.
+static struct { double act_rot, act_q, act_wall, wt_rot, wt_q, dq;
+                long act_calls, act_reused, wt_calls, dq_calls; } g_i8prof;
 static int g_i8prof_armed = 0;
 static void rocket_i8prof_dump(void) {
     ROCKET_LOGI(
         "ROCKET integer convert total(ms): act_rotate=%.0f act_quant=%.0f "
-        "wt_rotate=%.0f wt_quant=%.0f dequant=%.0f  (act %ld, wt %ld, dq %ld calls)\n",
+        "wt_rotate=%.0f wt_quant=%.0f dequant=%.0f  (act %ld, wt %ld, dq %ld calls)  "
+        "act_wall=%.0f act_reused=%ld\n",
         g_i8prof.act_rot, g_i8prof.act_q, g_i8prof.wt_rot, g_i8prof.wt_q, g_i8prof.dq,
-        g_i8prof.act_calls, g_i8prof.wt_calls, g_i8prof.dq_calls);
+        g_i8prof.act_calls, g_i8prof.wt_calls, g_i8prof.dq_calls,
+        g_i8prof.act_wall, g_i8prof.act_reused);
 }
 static inline void rocket_i8prof_arm(void) {
     if (!g_i8prof_armed) { atexit(rocket_i8prof_dump); g_i8prof_armed = 1; }
@@ -1689,10 +1744,21 @@ template <int QMAX>
 static void rk_quant_act(const float * src, int8_t * dst,
                          int64_t M, int64_t K, float * a_scale) {
     const bool prof = rocket_convprof_on();
-    const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++)
-        a_scale[m] = rk_quant_row<QMAX>(src + m * K, dst + m * K, K);
-    if (prof) { rocket_i8prof_arm(); g_i8prof.act_q += rocket_now_ms() - t0; g_i8prof.act_calls++; }
+    const double w0 = prof ? rocket_now_ms() : 0.0;
+    const int nc = rk_rows_chunks(M);
+    std::vector<double> qt(prof ? (size_t)nc : 0, 0.0);
+    rk_rows_fanout(nc, M, [&](int c, int64_t m0, int64_t m1) {
+        const double t0 = prof ? rocket_now_ms() : 0.0;
+        for (int64_t m = m0; m < m1; m++)
+            a_scale[m] = rk_quant_row<QMAX>(src + m * K, dst + m * K, K);
+        if (prof) qt[c] = rocket_now_ms() - t0;
+    });
+    if (prof) {
+        rocket_i8prof_arm();
+        for (double t : qt) g_i8prof.act_q += t;
+        g_i8prof.act_wall += rocket_now_ms() - w0;
+        g_i8prof.act_calls++;
+    }
 }
 
 // B[N,K] (f16 or f32) -> int [N,K] + per-channel scale b_scale[n] (= amax_row/QMAX).
@@ -1739,24 +1805,28 @@ static inline void rocket_quant_wt_int8(const void * src, bool f16, int8_t * dst
 // The lane form keeps the scalar's association -- ((float)v * as) * b_scale[n], two separate
 // multiplies in that order -- so it is bit-identical, not merely close. There is no add for
 // -ffp-contract to fold either side into, which is what makes that claim hold.
+// Rows fan out like the activation quant's (rk_rows_fanout): each output row reads its own
+// accumulator row and scale, so any split is bit-identical to the serial loop.
 static void rocket_dequant_int8(const int32_t * src, float * dst,
                                 int64_t M, int64_t N,
                                 const float * a_scale, const float * b_scale) {
     const bool prof = rocket_convprof_on();
     const double t0 = prof ? rocket_now_ms() : 0.0;
-    for (int64_t m = 0; m < M; m++) {
-        const float as = a_scale[m];
-        const int32_t * srow = src + m * N;
-        float * drow = dst + m * N;
-        int64_t n = 0;
+    rk_rows_fanout(rk_rows_chunks(M), M, [&](int, int64_t m0, int64_t m1) {
+        for (int64_t m = m0; m < m1; m++) {
+            const float as = a_scale[m];
+            const int32_t * srow = src + m * N;
+            float * drow = dst + m * N;
+            int64_t n = 0;
 #ifdef ROCKET_NEON_F32
-        const float32x4_t vas = vdupq_n_f32(as);
-        for (; n + 4 <= N; n += 4)
-            vst1q_f32(drow + n, vmulq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(srow + n)), vas),
-                                          vld1q_f32(b_scale + n)));
+            const float32x4_t vas = vdupq_n_f32(as);
+            for (; n + 4 <= N; n += 4)
+                vst1q_f32(drow + n, vmulq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(srow + n)), vas),
+                                              vld1q_f32(b_scale + n)));
 #endif
-        for (; n < N; n++) drow[n] = (float)srow[n] * as * b_scale[n];
-    }
+            for (; n < N; n++) drow[n] = (float)srow[n] * as * b_scale[n];
+        }
+    });
     if (prof) { rocket_i8prof_arm(); g_i8prof.dq += rocket_now_ms() - t0; g_i8prof.dq_calls++; }
 }
 
@@ -1817,12 +1887,66 @@ static void rk_fwht(float *v, int n) {
             for (; j < i + len; j++) { float a = v[j], b = v[j+len]; v[j] = a + b; v[j+len] = a - b; }
         }
 }
+#ifdef ROCKET_NEON_F32
+// The H_60 matvec of one 60-float block, in place. Eight outputs (then four) at a time, each
+// accumulated over k = 0..56 in steps of 4 and reduced by vaddvq exactly as a one-output loop
+// would, so the result is bit-identical to it; the interleave only gives the core eight
+// independent FMA chains where one output at a time leaves it waiting on one.
+static inline void rk_h60_block(float *blk) {
+    float32x4_t b[15];
+    for (int k = 0; k < 15; k++) b[k] = vld1q_f32(blk + 4 * k);
+    float out[60];
+    int o = 0;
+    for (; o + 8 <= 60; o += 8) {
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+        for (int k = 0; k < 15; k++) {
+            a0 = vfmaq_f32(a0, vld1q_f32(g_H60[o + 0] + 4 * k), b[k]);
+            a1 = vfmaq_f32(a1, vld1q_f32(g_H60[o + 1] + 4 * k), b[k]);
+            a2 = vfmaq_f32(a2, vld1q_f32(g_H60[o + 2] + 4 * k), b[k]);
+            a3 = vfmaq_f32(a3, vld1q_f32(g_H60[o + 3] + 4 * k), b[k]);
+            a4 = vfmaq_f32(a4, vld1q_f32(g_H60[o + 4] + 4 * k), b[k]);
+            a5 = vfmaq_f32(a5, vld1q_f32(g_H60[o + 5] + 4 * k), b[k]);
+            a6 = vfmaq_f32(a6, vld1q_f32(g_H60[o + 6] + 4 * k), b[k]);
+            a7 = vfmaq_f32(a7, vld1q_f32(g_H60[o + 7] + 4 * k), b[k]);
+        }
+        out[o + 0] = vaddvq_f32(a0); out[o + 1] = vaddvq_f32(a1);
+        out[o + 2] = vaddvq_f32(a2); out[o + 3] = vaddvq_f32(a3);
+        out[o + 4] = vaddvq_f32(a4); out[o + 5] = vaddvq_f32(a5);
+        out[o + 6] = vaddvq_f32(a6); out[o + 7] = vaddvq_f32(a7);
+    }
+    for (; o < 60; o += 4) {                          // 60 = 7*8 + 4
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+        for (int k = 0; k < 15; k++) {
+            a0 = vfmaq_f32(a0, vld1q_f32(g_H60[o + 0] + 4 * k), b[k]);
+            a1 = vfmaq_f32(a1, vld1q_f32(g_H60[o + 1] + 4 * k), b[k]);
+            a2 = vfmaq_f32(a2, vld1q_f32(g_H60[o + 2] + 4 * k), b[k]);
+            a3 = vfmaq_f32(a3, vld1q_f32(g_H60[o + 3] + 4 * k), b[k]);
+        }
+        out[o + 0] = vaddvq_f32(a0); out[o + 1] = vaddvq_f32(a1);
+        out[o + 2] = vaddvq_f32(a2); out[o + 3] = vaddvq_f32(a3);
+    }
+    memcpy(blk, out, sizeof out);
+}
+// The FWHT across the B2 blocks, every lane at once: each butterfly adds and subtracts two
+// whole 60-float blocks. Per lane it is the same additions in the same order as a gathered
+// per-lane FWHT, so it is bit-identical to one, without the strided gather and scatter.
+static inline void rk_fwht_blocks60(float *row, int B2) {
+    for (int len = 1; len < B2; len <<= 1)
+        for (int i = 0; i < B2; i += len << 1)
+            for (int j = i; j < i + len; j++) {
+                float *x = row + j * 60, *y = row + (j + len) * 60;
+                for (int l = 0; l < 60; l += 4) {
+                    const float32x4_t a = vld1q_f32(x + l), c = vld1q_f32(y + l);
+                    vst1q_f32(x + l, vaddq_f32(a, c));
+                    vst1q_f32(y + l, vsubq_f32(a, c));
+                }
+            }
+}
+#endif
 // Rotate row[0..K) in place by H_K/sqrt(K). Caller guarantees rk_hadamard_ok(K).
-// The H_60 block matvec, the FWHT, and the final scale are NEON-vectorized
-// (fp32) under ROCKET_NEON_F32; the scalar fallback (below each #ifdef) is bit-for-bit
-// the original. The H_60 entries are +/-1 floats, so the per-output dot is a plain
-// fmla-reduction over 60 (=15*4) lanes. (gather/scatter of the cross-block columns
-// stays scalar -- it's the smaller cost; the H_60 matvec is the FFN-K monster.)
+// The FWHT, the H_60 blocks, the FWHT across blocks and the final scale are NEON-vectorized
+// (fp32) under ROCKET_NEON_F32; the scalar fallback is bit-for-bit the original. The H_60
+// entries are +/-1 floats, so each output is a plain fmla-reduction over 60 (=15*4) lanes.
 // Returns 0, or <0 if K exceeds the col[] bound (rk_hadamard_ok guarantees it does
 // not on the offload path; the check degrades to the caller's CPU fallback instead
 // of GGML_ASSERT-aborting the host process from inside a loadable .so).
@@ -1833,19 +1957,16 @@ static int rk_hadamard_rotate(float *row, int K) {
     } else {
         const int B2 = K / 60;                       // power of 2, <= 256 for Gemma
         if (B2 > 4096) return -1;                     // col[] bound; rk_hadamard_ok guarantees it
+#ifdef ROCKET_NEON_F32
+        for (int b = 0; b < B2; b++) rk_h60_block(row + b * 60);
+        rk_fwht_blocks60(row, B2);
+#else
         float col[4096];                             // B2 lanes; ample for K up to 245760
         for (int b = 0; b < B2; b++) {               // H_60 within each 60-block
             float *blk = row + b*60, out[60];
             for (int o = 0; o < 60; o++) {
                 const float *h = g_H60[o];
-#ifdef ROCKET_NEON_F32
-                float32x4_t acc = vdupq_n_f32(0.0f);
-                for (int k = 0; k < 60; k += 4)      // 60 = 15*4, exact
-                    acc = vfmaq_f32(acc, vld1q_f32(h + k), vld1q_f32(blk + k));
-                out[o] = vaddvq_f32(acc);
-#else
                 float s = 0; for (int k = 0; k < 60; k++) s += h[k]*blk[k]; out[o] = s;
-#endif
             }
             for (int o = 0; o < 60; o++) blk[o] = out[o];
         }
@@ -1854,6 +1975,7 @@ static int rk_hadamard_rotate(float *row, int K) {
             rk_fwht(col, B2);
             for (int b = 0; b < B2; b++) row[b*60 + lane] = col[b];
         }
+#endif
     }
     int k = 0;
 #ifdef ROCKET_NEON_F32
@@ -1900,21 +2022,44 @@ static int rk_hadamard_rotate_blocks(float *row, int K) {
 // Hadamard variants of the quant kernels: rotate each row into `tmp` (K floats,
 // caller-owned, reused) then quantize. Same per-row / per-channel symmetric quant.
 // Return 0, or <0 if a row's K exceeds the rotation bound (caller -> CPU fallback).
+//
+// The activation form runs on every call, so its rows fan out over the big-core pool
+// (rk_rows_fanout). Chunk 0 rotates in the caller's `tmp` (the calling thread is blocked
+// in the pool meanwhile, or IS chunk 0 when the call runs inline); every other chunk in its
+// own K floats. The H_60 table is built before the fan-out, so no worker waits on its
+// once-flag. Each row's rotation and quantization read that row alone, so the codes and
+// scales are bit-identical to the serial loop's.
 template <int QMAX>
 static int rk_quant_act_had(const float * src, int8_t * dst,
                             int64_t M, int64_t K, float * a_scale, float * tmp) {
     const bool prof = rocket_convprof_on();
-    double rot = 0, qt = 0, t0 = 0;
-    for (int64_t m = 0; m < M; m++) {
-        const float * row = src + m * K;
-        if (prof) t0 = rocket_now_ms();
-        for (int64_t k = 0; k < K; k++) tmp[k] = row[k];
-        if (rk_hadamard_rotate(tmp, (int)K) < 0) return -1;
-        if (prof) { rot += rocket_now_ms() - t0; t0 = rocket_now_ms(); }
-        a_scale[m] = rk_quant_row<QMAX>(tmp, dst + m * K, K);
-        if (prof) qt += rocket_now_ms() - t0;
+    const double w0 = prof ? rocket_now_ms() : 0.0;
+    if (!rk_ispow2((int)K)) rk_build_H60();
+    const int nc = rk_rows_chunks(M);
+    std::vector<double> rot(prof ? (size_t)nc : 0, 0.0), qt(prof ? (size_t)nc : 0, 0.0);
+    std::atomic<bool> failed(false);
+    rk_rows_fanout(nc, M, [&](int c, int64_t m0, int64_t m1) {
+        std::vector<float> own;
+        float * t = tmp;
+        if (c > 0) { own.resize((size_t)K); t = own.data(); }
+        double t0 = 0;
+        for (int64_t m = m0; m < m1 && !failed.load(std::memory_order_relaxed); m++) {
+            const float * row = src + m * K;
+            if (prof) t0 = rocket_now_ms();
+            for (int64_t k = 0; k < K; k++) t[k] = row[k];
+            if (rk_hadamard_rotate(t, (int)K) < 0) { failed.store(true, std::memory_order_relaxed); return; }
+            if (prof) { rot[c] += rocket_now_ms() - t0; t0 = rocket_now_ms(); }
+            a_scale[m] = rk_quant_row<QMAX>(t, dst + m * K, K);
+            if (prof) qt[c] += rocket_now_ms() - t0;
+        }
+    });
+    if (failed.load()) return -1;
+    if (prof) {
+        rocket_i8prof_arm();
+        for (int c = 0; c < nc; c++) { g_i8prof.act_rot += rot[c]; g_i8prof.act_q += qt[c]; }
+        g_i8prof.act_wall += rocket_now_ms() - w0;
+        g_i8prof.act_calls++;
     }
-    if (prof) { rocket_i8prof_arm(); g_i8prof.act_rot += rot; g_i8prof.act_q += qt; g_i8prof.act_calls++; }
     return 0;
 }
 // `blocks` selects the block-diagonal construction for a K the two exact ones do not
@@ -2015,39 +2160,26 @@ static inline int rk_quant_int4_grouped_row(const float * srcf, const void * src
 }
 
 // GROUP-WISE int4 quant of `rows` weight/activation rows. The per-row Hadamard rotation
-// + group-quant of a 12B model's weights is the dominant resident-build cost; rows are
-// independent, so split them across CPU threads (each owns its own K-float scratch).
-// The result is bit-identical to the serial path (no cross-row state). `tmp` is only the
-// single-thread fallback's scratch. rk_hadamard_rotate is thread-safe (in-place on its
-// `row`, local stack buffers, read-only g_H60 built by the caller before this call).
+// + group-quant of a 12B model's weights is the dominant resident-build cost, and the
+// activation form runs on every call; rows are independent, so they fan out over the
+// big-core pool (rk_rows_fanout) like the int8 activation quant. Chunk 0 uses the caller's
+// `tmp`, every other chunk its own K floats. The result is bit-identical to the serial path
+// (no cross-row state). rk_hadamard_rotate is thread-safe (in-place on its `row`, local
+// stack buffers, read-only g_H60, built here before the fan-out).
 static int rocket_quant_int4_grouped(const float * srcf, const void * srcv, bool from_f32,
                                      bool f16, int8_t * dst, int64_t rows, int64_t K,
                                      int group, bool had, float * scale, float * tmp) {
     const int nG = (int)(K / group);
-    unsigned hw = std::thread::hardware_concurrency();
-    int nthr = (int)(hw ? hw : 1);
-    if (nthr > 8) nthr = 8;
-    if (rows < 64 || nthr <= 1) {                 // small: serial (use the caller's tmp)
-        for (int64_t r = 0; r < rows; r++)
-            if (rk_quant_int4_grouped_row(srcf, srcv, from_f32, f16, dst, r, K, group, nG, had, scale, tmp) < 0)
-                return -1;
-        return 0;
-    }
+    if (had && !rk_ispow2((int)K)) rk_build_H60();
     std::atomic<bool> failed(false);
-    auto worker = [&](int64_t r0, int64_t r1) {
-        std::vector<float> t((size_t)K);
+    rk_rows_fanout(rk_rows_chunks(rows), rows, [&](int c, int64_t r0, int64_t r1) {
+        std::vector<float> own;
+        float * t = tmp;
+        if (c > 0) { own.resize((size_t)K); t = own.data(); }
         for (int64_t r = r0; r < r1 && !failed.load(std::memory_order_relaxed); r++)
-            if (rk_quant_int4_grouped_row(srcf, srcv, from_f32, f16, dst, r, K, group, nG, had, scale, t.data()) < 0)
+            if (rk_quant_int4_grouped_row(srcf, srcv, from_f32, f16, dst, r, K, group, nG, had, scale, t) < 0)
                 failed.store(true, std::memory_order_relaxed);
-    };
-    std::vector<std::thread> th;
-    const int64_t per = (rows + nthr - 1) / nthr;
-    for (int i = 0; i < nthr; i++) {
-        int64_t r0 = (int64_t)i * per, r1 = r0 + per > rows ? rows : r0 + per;
-        if (r0 >= r1) break;
-        th.emplace_back(worker, r0, r1);
-    }
-    for (auto & t : th) t.join();
+    });
     return failed.load() ? -1 : 0;
 }
 
@@ -2060,6 +2192,53 @@ static void   rocket_meminfo_read(const char * const * fields, size_t * out, int
 static bool   rocket_parse_mb_budget(const char * name, const char * e, size_t * out_bytes);   // defined below (init)
 static size_t rocket_auto_budget_reserve(void);                            // defined below (init)
 static void   rk_moe_preflight_close(const std::unordered_map<std::string, int> & claims);   // defined below (MoE pre-flight)
+
+// ROCKET_NO_ACT_REUSE=1 converts the int8 route's activation on every call (rk_int8_act), the
+// A/B baseline for the memo. Read once.
+static bool rocket_act_reuse_on(void) {
+    static const int v = rocket_knob_int("ROCKET_NO_ACT_REUSE", 0);
+    return v == 0;
+}
+
+// The RK3588 int8 route's activation, for its one-shot and its resident handler alike:
+// A[M,K] f32 -> codes [Mp,K] (pad rows zero) + per-row scales [Mp] (pad entries unread),
+// rotated when `had`. Returns 0 with *qA and *a_scale set, or <0 if the rotation refused K
+// (the caller falls back).
+//
+// The projections that read one activation -- Q/K/V off the attention norm, gate/up off the
+// FFN norm -- would each convert (and rotate) it again; the fp16 route avoids that by fusing
+// them, and int8 does not fuse (rocket_fuse_on). So the codes are kept in ctx->act_memo and
+// served to every later MUL_MAT of the same graph_compute call that reads the same src1
+// tensor at the same data pointer, M, Mp, K and rotation. They cannot be stale there: a
+// call computes one scheduler split, whose nodes (matmuls, attention, no-op views) each write
+// only their own dst, and ggml-alloc does not hand src1's memory to another tensor while a
+// consumer of src1 is still to run -- the invariant the fused group runner already reads
+// src1 under. The call's epoch is part of the key, so the next call's input cannot match,
+// even in a reused graph whose tensors keep their addresses. The memo is emptied before a
+// fill, so a refused fill leaves nothing behind.
+static int rk_int8_act(ggml_backend_rocket_context * ctx, const ggml_tensor * src1,
+                       int64_t M, int Mp, int64_t K, bool had,
+                       const int8_t ** qA, const float ** a_scale) {
+    rk_act_memo & mm = ctx->act_memo;
+    if (rocket_act_reuse_on() && mm.src == src1 && mm.data == src1->data
+        && mm.epoch == ctx->graph_epoch && mm.M == M && mm.Mp == Mp && mm.K == K
+        && mm.had == had) {
+        *qA = mm.q.data(); *a_scale = mm.s.data();
+        if (rocket_convprof_on()) { rocket_i8prof_arm(); g_i8prof.act_reused++; }
+        return 0;
+    }
+    mm.src = nullptr;
+    int8_t * q = rk_scratch(mm.q, (size_t)Mp * K);
+    float  * s = rk_scratch(mm.s, (size_t)Mp);
+    if (Mp > M) memset(q + (size_t)M * K, 0, (size_t)(Mp - M) * K);
+    if (had) { float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
+               if (rocket_quant_act_int8_had((const float *)src1->data, q, M, K, s, tmp) < 0) return -1; }
+    else     { rocket_quant_act_int8((const float *)src1->data, q, M, K, s); }
+    mm.src = src1; mm.data = src1->data; mm.epoch = ctx->graph_epoch;
+    mm.M = M; mm.Mp = Mp; mm.K = K; mm.had = had;
+    *qA = q; *a_scale = s;
+    return 0;
+}
 
 // W8A8 int8 matmul for one plain 2D static-weight GEMM, via the one-shot tiled
 // int8 driver. Returns 0 (dst written) or <0 to fall through to the fp16 path.
@@ -2127,17 +2306,15 @@ static int ggml_backend_rocket_mul_mat_int8(
                     key.c_str(), N, K, (int)had, ctx->int8_resident_bytes >> 20);
     }
 
-    // ---- activations: always per call (cheap; M is small), out of reused context scratch.
-    // The quantizer writes rows 0..M-1, so qA's pad rows are cleared explicitly -- on a
-    // reused buffer they otherwise carry the previous call's codes into the computed
-    // surface. a_scale's pad entries need no such clear: the matmul does not read them and
-    // the dequant below reads only rows 0..M-1.
-    int8_t * qA      = rk_scratch(ctx->scratch_qA, (size_t)Mp * K);
-    float  * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)Mp);
-    if (Mp > M) memset(qA + (size_t)M * K, 0, (size_t)(Mp - M) * K);
-    if (had) { float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
-               if (rocket_quant_act_int8_had((const float *)src1->data, qA, M, K, a_scale, tmp) < 0) return -1; }
-    else     { rocket_quant_act_int8((const float *)src1->data, qA, M, K, a_scale); }
+    // ---- activations: converted per call, or served from this graph_compute call's memo
+    // when another projection already converted the same src1 (rk_int8_act). The quantizer
+    // writes rows 0..M-1 and rk_int8_act clears the pad rows of the codes -- on a reused
+    // buffer they otherwise carry the previous call's codes into the computed surface.
+    // a_scale's pad entries need no such clear: the matmul does not read them and the
+    // dequant below reads only rows 0..M-1.
+    const int8_t * qA      = nullptr;
+    const float  * a_scale = nullptr;
+    if (rk_int8_act(ctx, src1, M, Mp, K, had, &qA, &a_scale) < 0) return -1;
 
     int32_t * C32 = rk_scratch(ctx->scratch_C32, (size_t)Mp * N);
     int rc = rocket_matmul_int8(ctx->int8_fd, Mp, K, N, qA, qB, C32);
@@ -3381,15 +3558,12 @@ static int ggml_backend_rocket_mul_mat_int8_resident(
         }
     }
 
-    // ---- activations: per call (rotated when hadamard), int8 [Mp,K] out of reused context
-    // scratch. qA's pad rows M..Mp-1 are cleared explicitly (the quantizer writes only
-    // 0..M-1); a_scale's are not read -- see the one-shot int8 path for why.
-    int8_t * qA      = rk_scratch(ctx->scratch_qA, (size_t)Mp * K);
-    float  * a_scale = rk_scratch(ctx->scratch_ascale, (size_t)Mp);
-    if (Mp > M) memset(qA + (size_t)M * K, 0, (size_t)(Mp - M) * K);
-    if (had) { float * tmp = rk_scratch(ctx->scratch_rot, (size_t)K);
-               if (rocket_quant_act_int8_had((const float *)src1->data, qA, M, K, a_scale, tmp) < 0) return -1; }
-    else     { rocket_quant_act_int8((const float *)src1->data, qA, M, K, a_scale); }
+    // ---- activations: per call (rotated when hadamard), int8 [Mp,K], or this graph_compute
+    // call's memo when a projection sharing src1 already converted it (rk_int8_act). The pad
+    // rows' codes are zero; a_scale's are not read -- see the one-shot int8 path for why.
+    const int8_t * qA      = nullptr;
+    const float  * a_scale = nullptr;
+    if (rk_int8_act(ctx, src1, M, Mp, K, had, &qA, &a_scale) < 0) return -1;
 
     int32_t * C32 = rk_scratch(ctx->scratch_C32, (size_t)Mp * N);
     int rc = rocket_matmul_int8_prepacked(ctx->i8_dev, Mp, K, N, qA, C32, w);
@@ -3514,12 +3688,17 @@ static int ggml_backend_rocket_mul_mat_int4_resident(
       if (rocket_quant_int4_grouped((const float *)src1->data, nullptr, true, false,
                                     qA, M, K, group, had, a_scale, tmp) < 0) return -1; }
 
-    float * Cf = rk_scratch(ctx->scratch_Cf, (size_t)Mp * N);
+    // At an aligned M the library's row-major fp32 [Mp,N] output has dst's shape, so it is
+    // written into dst directly; a padded M goes through scratch and copies its first M rows.
+    // A failed call can leave dst partly written, and every route the caller falls back to
+    // (the one-shot int4, the fp16 route, the CPU) rewrites all of it.
+    float * Cf = (Mp == M) ? (float *)dst->data : rk_scratch(ctx->scratch_Cf, (size_t)Mp * N);
     int rc = rocket_matmul_int4_prepacked_gw(ctx->i4_dev, Mp, K, N, qA,
                                              a_scale, b_scale, Cf, w);
     rk_breaker_note(ctx->brk_i4, rc, "resident int4");
     if (rc != 0) return -1;
-    memcpy((float *)dst->data, Cf, (size_t)M * N * sizeof(float));  // first M rows
+    if (Cf != (float *)dst->data)
+        memcpy((float *)dst->data, Cf, (size_t)M * N * sizeof(float));  // first M rows
     return 0;
 }
 
@@ -3628,11 +3807,37 @@ private:
 };
 
 // Lazily-created, leaked-at-exit process-wide dequant pool (see rocket_dequant_pool).
-// First touched by the first quantized matmul that fans out; an F16-only model never
-// creates it.
+// First touched by the first host convert or quantized matmul that fans out (an fp16 matmul of
+// 64 or more rows is enough). Its idle workers block on a condition variable.
 static rocket_dequant_pool & rocket_get_dequant_pool(void) {
     static rocket_dequant_pool * pool = new rocket_dequant_pool(rocket_dequant_threads());
     return *pool;
+}
+
+// The host converts' row fan-out (declared before the fp16 activation pack). ROCKET_CONVERT_THREADS
+// caps its width: 1 runs every convert serially on the calling thread (the A/B baseline), unset
+// or 0 takes the pool's width. Read once.
+static int rocket_convert_threads(void) {
+    static const int v = rocket_knob_int("ROCKET_CONVERT_THREADS", 0);
+    return v;
+}
+static int rk_rows_chunks(int64_t rows) {
+    const int want = rocket_convert_threads();
+    if (want == 1 || rows < RK_ROWS_FANOUT_MIN) return 1;
+    const int have = rocket_get_dequant_pool().size();
+    return (want > 1 && want < have) ? want : have;
+}
+static void rk_rows_fanout(int nc, int64_t rows,
+                           const std::function<void(int, int64_t, int64_t)> & job) {
+    if (nc <= 1 || rows <= 0) { job(0, 0, rows); return; }
+    const int64_t per = (rows + nc - 1) / nc;
+    rocket_get_dequant_pool().run([&](int i) {
+        if (i >= nc) return;                     // pool wider than nc
+        const int64_t r0 = (int64_t)i * per;
+        if (r0 >= rows) return;
+        const int64_t r1 = r0 + per > rows ? rows : r0 + per;
+        job(i, r0, r1);
+    });
 }
 
 // Convert a static weight tensor's row-major [N,K] payload (any ggml type other than
@@ -6886,6 +7091,7 @@ static enum ggml_status ggml_backend_rocket_graph_compute_impl(ggml_backend_t ba
     if (rocket_diag_serialize()) diag_lk.lock();
     const int  n    = cgraph->n_nodes;
     const bool fuse = rocket_fuse_on();
+    ctx->graph_epoch++;   // retires the previous call's activation memo (rk_int8_act)
 
     // ROCKET_DEBUG_GRAPH=1: one line per graph_compute call (per scheduler split)
     // listing its MUL_MATs + src1 -- to see whether Q/K/V (or other projections)
@@ -8012,10 +8218,13 @@ void ggml_backend_rocket_set_n_threads(ggml_backend_t backend, int n_threads) {
 
 #ifdef GGML_BACKEND_DL
 // The op ORDINALS this .so was compiled with must name the same ops in the host's ggml, and
-// nothing else checks that. GGML_BACKEND_API_VERSION does not move when ggml inserts an op, and
-// an insert shifts every ordinal after it: ggml 0.15 added COL2IM_1D ahead of FLASH_ATTN_EXT
-// (73 -> 74), so a .so built against whisper.cpp 1.8.6 loads into 1.9.x, passes the version
-// check, keeps offloading MUL_MAT (29, unmoved) and never recognizes an attention op again.
+// nothing else checks that. GGML_BACKEND_API_VERSION does not move when ggml inserts or removes
+// an op, and either shifts every ordinal after it. ggml 0.15 added COL2IM_1D ahead of
+// FLASH_ATTN_EXT (73 -> 74), so a .so built against whisper.cpp 1.8.6 loads into 1.9.x, passes
+// the version check, keeps offloading MUL_MAT (29, unmoved there) and never recognizes an
+// attention op again. ggml 1.0.0 removed ADD1 ahead of MUL_MAT and DIAG_MASK_INF/ZERO ahead of
+// FLASH_ATTN_EXT, so MUL_MAT moves 29 -> 28 and FLASH_ATTN_EXT 74 -> 71: a .so built before it
+// would take the host's MUL_MAT_ID for MUL_MAT.
 // ggml_op_name reads the HOST's name table, so asking it to name our ordinals compares the two
 // enums at every op the backend switches on. (Every ordinal here is under 80 and every host
 // ggml this builds against has more ops than that, so the lookup stays in the host's table.)

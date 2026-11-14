@@ -213,9 +213,23 @@ Wikitext perplexity over 8 chunks of 512 rises with the int8 route as follows:
 llama.cpp b11539. The 3 B row was measured 2026-11-06 against resident fp16 (11.0729 against
 10.9114), and the 8-9 B rows 2026-11-07 against the default fp16 route.
 
+Perplexity under-reads the route's distance from fp16. The rotation cuts the KL divergence from
+the fp16 route's token distribution on all three models measured, including Ministral-3-8B, whose
+perplexity it does not lower. Gemma-4-12B-it needs the rotation:
+
+| Model, F16 GGUF | Mean KL divergence, no rotation | Mean KL divergence, `ROCKET_INT8_HADAMARD=1` | Same top token, no rotation | Same top token, rotated |
+|---|---:|---:|---:|---:|
+| Ministral-3-8B-Instruct | 0.0166 | 0.0063 | 93.7% | 96.7% |
+| Qwen3.5-9B | 0.0330 | 0.0084 | 92.0% | 95.8% |
+| Gemma-4-12B-it | 1.37 | 0.123 | 58.7% | 89.5% |
+
+**Conditions:** `llama-perplexity --kl-divergence` on wikitext-2, 8 chunks of 512, against the
+default fp16 route's logits, every int8 weight resident, RK1, NPU at 928 MHz, llama.cpp b11539.
+Gemma was measured 2026-11-10, the 8-9 B models 2026-11-11.
+
 The rotation applies only to a projection whose `K` is a power of two or 60 times one. On these
 8-9 B models it therefore skips the FFN down projection. It lowers Qwen3.5-9B's perplexity at every
-chunk and does not lower Ministral-3-8B-Instruct's, so measure a model before choosing it.
+chunk and does not lower Ministral-3-8B-Instruct's. On both it lowers the KL divergence above.
 
 On the RK3576, `ROCKET_INT8=1` selects [the RK3576 route](README.md#terms) instead, which
 [RK3576.md](RK3576.md) describes.

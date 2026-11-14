@@ -292,6 +292,247 @@ static void test_h60(void) {
 }
 
 // ---------------------------------------------------------------------------
+// The host converts' row fan-out: every converter that splits its rows over the big-core
+// pool returns exactly what a serial row loop returns, at row counts on both sides of the
+// fan-out threshold and at counts the chunking does not divide. The references below are the
+// loops as they stood before the fan-out, one row at a time over the same per-row kernels, so
+// what is under test is the partition, not the kernels (test-hadamard-neon gates those).
+static uint32_t g_lcg = 12345u;
+static float rk_test_rand(void) {   // uniform in [-1, 1)
+    g_lcg = g_lcg * 1664525u + 1013904223u;
+    return (float)((g_lcg >> 8) & 0xFFFFFF) / (float)0x800000 - 1.0f;
+}
+// Rows of noise with an outlier channel, one all-zero row (the scale-1 branch) and, for the
+// group-wise form, one all-zero group at the end of every row.
+static std::vector<float> rk_test_rows(int64_t M, int64_t K, int zero_group) {
+    std::vector<float> a((size_t)(M * K));
+    for (auto & v : a) v = rk_test_rand();
+    for (int64_t m = 0; m < M; m++) a[(size_t)(m * K + (m * 7) % K)] *= 40.0f;
+    if (M > 2) for (int64_t k = 0; k < K; k++) a[(size_t)(2 * K + k)] = 0.0f;
+    if (zero_group > 0)
+        for (int64_t m = 0; m < M; m++)
+            for (int64_t k = K - zero_group; k < K; k++) a[(size_t)(m * K + k)] = 0.0f;
+    return a;
+}
+template <int QMAX>
+static void rk_test_ref_act(const float * src, int8_t * dst, int64_t M, int64_t K, float * sc,
+                            bool had) {
+    std::vector<float> t((size_t)K);
+    for (int64_t m = 0; m < M; m++) {
+        if (!had) { sc[m] = rk_quant_row<QMAX>(src + m * K, dst + m * K, K); continue; }
+        for (int64_t k = 0; k < K; k++) t[(size_t)k] = src[m * K + k];
+        rk_hadamard_rotate(t.data(), (int)K);
+        sc[m] = rk_quant_row<QMAX>(t.data(), dst + m * K, K);
+    }
+}
+template <int QMAX>
+static bool rk_test_act_case(int64_t M, int64_t K, bool had) {
+    const std::vector<float> a = rk_test_rows(M, K, 0);
+    std::vector<int8_t> q0((size_t)(M * K)), q1((size_t)(M * K), 99);
+    std::vector<float>  s0((size_t)M), s1((size_t)M, -1.0f), tmp((size_t)K);
+    rk_test_ref_act<QMAX>(a.data(), q0.data(), M, K, s0.data(), had);
+    if (had) { if (rk_quant_act_had<QMAX>(a.data(), q1.data(), M, K, s1.data(), tmp.data()) != 0) return false; }
+    else     { rk_quant_act<QMAX>(a.data(), q1.data(), M, K, s1.data()); }
+    return q0 == q1 && memcmp(s0.data(), s1.data(), s0.size() * sizeof(float)) == 0;
+}
+static void test_convert_fanout(void) {
+    printf("-- host converts: the row fan-out against a serial row loop\n");
+    if (!rk_ispow2(3840)) rk_build_H60();
+    const int nc = rk_rows_chunks(517);
+    printf("  (pool width %d; a call fans out from %lld rows)\n", nc, (long long)RK_ROWS_FANOUT_MIN);
+    CHECK(nc > 1 || std::thread::hardware_concurrency() <= 1, "the fan-out engages on this host");
+    CHECK(rk_rows_chunks(RK_ROWS_FANOUT_MIN - 1) == 1, "a call below the threshold runs inline");
+
+    const int64_t Ms[] = { 1, 4, 63, 64, 65, 129, 517 };
+    const int64_t Ks[] = { 64, 3840, 4096 };
+    bool act8 = true, act8h = true, act4 = true, act4h = true;
+    for (int64_t M : Ms)
+        for (int64_t K : Ks) {
+            act8  &= rk_test_act_case<127>(M, K, false);
+            act8h &= rk_test_act_case<127>(M, K, true);
+            act4  &= rk_test_act_case<7>(M, K, false);
+            act4h &= rk_test_act_case<7>(M, K, true);
+        }
+    CHECK(act8,  "int8 activation quant: codes and scales bit-identical, M 1-517, K 64/3840/4096");
+    CHECK(act8h, "int8 rotated activation quant: bit-identical (FWHT and Paley K)");
+    CHECK(act4,  "int4 activation quant: bit-identical");
+    CHECK(act4h, "int4 rotated activation quant: bit-identical");
+
+    // The fp16 route's activation pack and output unpack (whole tile and a column slice of a
+    // wider fused output), each against a serial loop over the same per-row kernel.
+    bool pk = true, up = true, seg = true;
+    for (int64_t M : Ms)
+        for (int64_t K : Ks) {
+            const std::vector<float> a = rk_test_rows(M, K, 0);
+            std::vector<ggml_fp16_t> p0((size_t)(M * K)), p1((size_t)(M * K), 0x7c00);
+            std::vector<float> s0((size_t)M), s1((size_t)M, -1.0f);
+            for (int64_t m = 0; m < M; m++) s0[(size_t)m] = rk_pack_act_row(a.data() + m * K, p0.data() + m * K, K);
+            rocket_pack_activations(a.data(), p1.data(), M, K, s1.data());
+            pk &= memcmp(p0.data(), p1.data(), p0.size() * sizeof(ggml_fp16_t)) == 0
+               && memcmp(s0.data(), s1.data(), s0.size() * sizeof(float)) == 0;
+
+            // Unpack the packed tile as an [M,K] output with the pack's scales.
+            std::vector<float> u0((size_t)(M * K)), u1((size_t)(M * K), 7.0f);
+            for (int64_t m = 0; m < M; m++) rk_unpack_row(p0.data() + m * K, u0.data() + m * K, K, s0[(size_t)m]);
+            rocket_unpack_output(p0.data(), u1.data(), M, K, s0.data());
+            up &= memcmp(u0.data(), u1.data(), u0.size() * sizeof(float)) == 0;
+
+            // A column slice [col0, col0+Ni) of that tile, read as a fused output of width K.
+            const int64_t col0 = K / 4, Ni = K / 2;
+            std::vector<float> g0((size_t)(M * Ni)), g1((size_t)(M * Ni), 7.0f);
+            for (int64_t m = 0; m < M; m++)
+                rk_unpack_row(p0.data() + m * K + col0, g0.data() + m * Ni, Ni, s0[(size_t)m]);
+            rocket_unpack_output_seg(p0.data(), K, col0, g1.data(), M, Ni, s0.data());
+            seg &= memcmp(g0.data(), g1.data(), g0.size() * sizeof(float)) == 0;
+        }
+    CHECK(pk,  "fp16 activation pack: values and scales bit-identical, M 1-517, K 64/3840/4096");
+    CHECK(up,  "fp16 output unpack: bit-identical");
+    CHECK(seg, "fp16 fused-output column slice unpack: bit-identical");
+
+    // The int32 dequant: each output row from its own accumulator row and scale.
+    bool dq = true;
+    for (int64_t M : Ms) {
+        const int64_t N = 96;
+        std::vector<int32_t> c((size_t)(M * N));
+        for (auto & v : c) v = (int32_t)(rk_test_rand() * 2.0e9f);
+        std::vector<float> as((size_t)M), bs((size_t)N), d0((size_t)(M * N)), d1((size_t)(M * N), 7.0f);
+        for (auto & v : as) v = rk_test_rand() * 1e-3f;
+        for (auto & v : bs) v = rk_test_rand() * 1e-2f;
+        for (int64_t m = 0; m < M; m++)
+            for (int64_t n = 0; n < N; n++)
+                d0[(size_t)(m * N + n)] = (float)c[(size_t)(m * N + n)] * as[(size_t)m] * bs[(size_t)n];
+        rocket_dequant_int8(c.data(), d1.data(), M, N, as.data(), bs.data());
+        dq &= memcmp(d0.data(), d1.data(), d0.size() * sizeof(float)) == 0;
+    }
+    CHECK(dq, "int32 dequant: bit-identical to the scalar loop, M 1-517");
+
+    // The group-wise int4 quant, rotated and not, with an all-zero group closing every row.
+    bool g4 = true;
+    for (int64_t M : Ms)
+        for (int64_t K : { (int64_t)3840, (int64_t)4096 })
+            for (int group : { 32, 128 })
+                for (bool had : { false, true }) {
+                    const int nG = (int)(K / group);
+                    const std::vector<float> a = rk_test_rows(M, K, group);
+                    std::vector<int8_t> q0((size_t)(M * K)), q1((size_t)(M * K), 99);
+                    std::vector<float>  s0((size_t)M * nG), s1((size_t)M * nG, -1.0f), t((size_t)K);
+                    for (int64_t r = 0; r < M; r++)
+                        rk_quant_int4_grouped_row(a.data(), nullptr, true, false, q0.data(), r, K,
+                                                  group, nG, had, s0.data(), t.data());
+                    g4 &= rocket_quant_int4_grouped(a.data(), nullptr, true, false, q1.data(), M, K,
+                                                    group, had, s1.data(), t.data()) == 0
+                       && q0 == q1
+                       && memcmp(s0.data(), s1.data(), s0.size() * sizeof(float)) == 0;
+                }
+    CHECK(g4, "group-wise int4 quant: bit-identical, groups 32/128, zero groups, both rotations");
+}
+
+// The rotation's Paley path (K = 60 * 2^k) against its previous form, bit for bit: one H_60
+// output at a time, and the FWHT across blocks gathered per lane. Without NEON both are the
+// scalar form, so the check is meaningful on aarch64 (the RK1 runs it).
+static void rk_test_rotate_prev(float * row, int K) {
+    const float inv = 1.0f / sqrtf((float)K);
+    const int B2 = K / 60;
+    std::vector<float> col((size_t)B2);
+    for (int b = 0; b < B2; b++) {
+        float * blk = row + b * 60, out[60];
+        for (int o = 0; o < 60; o++) {
+            const float * h = g_H60[o];
+#ifdef ROCKET_NEON_F32
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            for (int k = 0; k < 60; k += 4) acc = vfmaq_f32(acc, vld1q_f32(h + k), vld1q_f32(blk + k));
+            out[o] = vaddvq_f32(acc);
+#else
+            float sum = 0; for (int k = 0; k < 60; k++) sum += h[k] * blk[k]; out[o] = sum;
+#endif
+        }
+        for (int o = 0; o < 60; o++) blk[o] = out[o];
+    }
+    for (int lane = 0; lane < 60; lane++) {
+        for (int b = 0; b < B2; b++) col[(size_t)b] = row[b * 60 + lane];
+        rk_fwht(col.data(), B2);
+        for (int b = 0; b < B2; b++) row[b * 60 + lane] = col[(size_t)b];
+    }
+    int k = 0;
+#ifdef ROCKET_NEON_F32
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    for (; k + 4 <= K; k += 4) vst1q_f32(row + k, vmulq_f32(vld1q_f32(row + k), vinv));
+#endif
+    for (; k < K; k++) row[k] *= inv;
+}
+static void test_rotate_prev(void) {
+#ifdef ROCKET_NEON_F32
+    printf("-- Hadamard rotation: the NEON Paley path against its previous form\n");
+#else
+    printf("-- Hadamard rotation: the Paley path against its previous form (scalar build)\n");
+#endif
+    rk_build_H60();
+    bool same = true;
+    for (int K : { 960, 3840, 7680, 15360 })
+        for (int r = 0; r < 8; r++) {
+            std::vector<float> a = rk_test_rows(1, K, 0), b = a;
+            if (r == 1) for (auto & v : a) v *= 1e30f;       // the scale's exponent range
+            b = a;
+            same &= rk_hadamard_rotate(a.data(), K) == 0;
+            rk_test_rotate_prev(b.data(), K);
+            same &= memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        }
+    CHECK(same, "Paley rotation bit-identical to the previous form, K 960/3840/7680/15360");
+}
+
+// The int8 route's activation memo (rk_int8_act): a later projection reading the same src1
+// in the same graph_compute call gets the codes already made; anything else converts afresh.
+static void test_act_memo(void) {
+    printf("-- int8 activation memo\n");
+    const int64_t M = 65, K = 4096;
+    const int Mp = rocket_pad_m((int)M);
+    ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * gctx = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * y = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, K, M);
+    std::vector<float> xa = rk_test_rows(M, K, 0), ya = rk_test_rows(M, K, 0);
+    x->data = xa.data(); y->data = ya.data();
+
+    ggml_backend_rocket_context c;
+    c.graph_epoch = 1;
+    const int8_t * q = nullptr; const float * s = nullptr;
+    const int8_t * q2 = nullptr; const float * s2 = nullptr;
+
+    // A fresh conversion is the serial reference, pad rows zero.
+    bool ok = rk_int8_act(&c, x, M, Mp, K, true, &q, &s) == 0;
+    std::vector<int8_t> r((size_t)Mp * K, 0); std::vector<float> rs((size_t)M);
+    rk_test_ref_act<127>(xa.data(), r.data(), M, K, rs.data(), true);
+    CHECK(ok && memcmp(q, r.data(), r.size()) == 0 && memcmp(s, rs.data(), rs.size() * sizeof(float)) == 0,
+          "a fresh conversion equals the serial rotated quant, pad rows zero");
+
+    ok = rk_int8_act(&c, x, M, Mp, K, true, &q2, &s2) == 0;
+    CHECK(ok && q2 == q && s2 == s, "the same src1 in the same call is served from the memo");
+
+    // Every key field that differs converts afresh. Scribbling over the memo's codes first
+    // shows whether a call reconverted: a reconversion writes the reference back.
+    auto reconverted = [&](const ggml_tensor * t, bool had, const std::vector<int8_t> & want) {
+        c.act_memo.q[0] ^= 0x55;
+        const int8_t * qq = nullptr; const float * ss = nullptr;
+        if (rk_int8_act(&c, t, M, Mp, K, had, &qq, &ss) != 0) return false;
+        return memcmp(qq, want.data(), (size_t)M * K) == 0;
+    };
+    std::vector<int8_t> rp((size_t)Mp * K, 0), ry((size_t)Mp * K, 0);
+    std::vector<float> tmp((size_t)M);
+    rk_test_ref_act<127>(xa.data(), rp.data(), M, K, tmp.data(), false);
+    rk_test_ref_act<127>(ya.data(), ry.data(), M, K, tmp.data(), true);
+    CHECK(reconverted(y, true, ry), "another src1 tensor converts afresh");
+    CHECK(reconverted(x, false, rp), "the same src1 without the rotation converts afresh");
+    rk_int8_act(&c, x, M, Mp, K, true, &q, &s);
+    c.graph_epoch++;
+    CHECK(reconverted(x, true, r), "the next graph_compute call converts afresh");
+    std::vector<float> xb = xa;               // same tensor, moved to another buffer
+    x->data = xb.data();
+    CHECK(reconverted(x, true, r), "the same tensor at another data pointer converts afresh");
+    x->data = xa.data();
+    ggml_free(gctx);
+}
+
+// ---------------------------------------------------------------------------
 // The circuit breaker: transient failures cost a retry, persistent ones are bypassed.
 static void test_breaker(void) {
     printf("-- device-route circuit breaker\n");
@@ -420,6 +661,9 @@ int main(void) {
     test_moe_ledger();
     test_init_budget();
     test_h60();
+    test_convert_fanout();
+    test_rotate_prev();
+    test_act_memo();
     test_breaker();
     test_repacked_sources();
     printf("%s\n", g_fails ? "FAIL" : "PASS");
