@@ -435,8 +435,9 @@ int main() {
         fails += run_moe_child(prec_int8_child);
         fails += run_moe_child(prec_int4_child);
     }
-    const int K = 256, N = 128, M = 256;   // valid F16/F32 shape (floor = rocket_min_m, default 32)
-    const int Mq = 512;                    // quantized floor = rocket_min_m_quant (default 512)
+    const int K = 256, N = 128, M = 256;   // valid F16/F32 shape (floor = rocket_min_m, default 24)
+    const int Mq = 256;                    // quantized floor = rocket_min_m_quant (default 256)
+    const int Mlo = 128;                   // above the F16 floor, below the quantized one
 
     // ACCEPT — the canonical static-weight GEMM we offload (F16, F32, and BF16 weights;
     // a BF16 weight is decoded to fp16 on the streaming/mt path, same as F32).
@@ -466,7 +467,7 @@ int main() {
     // REJECT — a quantized weight below the higher quant floor (but above the F16 floor):
     // the dequant doesn't amortize, so a short quant prefill stays on the CPU even at an M
     // that an F16 weight offloads at. Pins the rocket_min_m_quant > rocket_min_m gap.
-    CHECK( !mm_supported(dev, K, N, M, GGML_TYPE_Q4_K), "Q4_K leaf, M(256)<quant floor   -> CPU" );
+    CHECK( !mm_supported(dev, K, N, Mlo, GGML_TYPE_Q4_K), "Q4_K leaf, M(128)<quant floor   -> CPU" );
     // (A K-quant weight with K not a multiple of its 256-block is rejected by the
     // K%ggml_blck_size guard in supports_op, but ggml itself can't construct such a
     // tensor -- row_size truncates to a transposed-looking layout that aborts in

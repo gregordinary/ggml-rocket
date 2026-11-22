@@ -319,6 +319,10 @@ struct rk_act_memo {
     std::vector<float>  s;                 // [Mp]; pad entries unread
 };
 
+// The fixed int8 weight budget ROCKET_INT8_CACHE_MB had before its auto default, and the floor
+// the auto budget never goes below: 4096 MB.
+#define RK_INT8_BUDGET_BASE ((size_t)4096 << 20)
+
 struct ggml_backend_rocket_context {
     // One breaker per device route (see rk_breaker).
     rk_breaker brk_stream;    // rocket_matmul_fp16_stream / _stream_fused
@@ -450,11 +454,17 @@ struct ggml_backend_rocket_context {
     int  int8_fd       = -1;
     bool int8_failed   = false;
     // Resident rotated-int8 weight cache (keyed on stable weight name, like wcache).
-    // Budget ROCKET_INT8_CACHE_MB (default 4GB; 0 = unlimited). Over budget -> that
-    // weight re-quantizes per call. Host vectors, freed with the context.
+    // Budget ROCKET_INT8_CACHE_MB (default auto, never below RK_INT8_BUDGET_BASE; 0 =
+    // unlimited; see ggml_backend_rocket_init). Over budget -> that weight runs on the fp16
+    // path. Host vectors, freed with the context.
     std::unordered_map<std::string, rocket_int8_weight> int8_wcache;
     size_t int8_resident_bytes = 0;
-    size_t int8_cache_budget   = (size_t)4096 << 20;
+    size_t int8_cache_budget   = RK_INT8_BUDGET_BASE;
+    // The auto budget's runtime guard: past RK_INT8_BUDGET_BASE, a new int8 weight is admitted
+    // only while MemAvailable stays above this reserve (0 = no guard: a fixed budget, or auto
+    // that did not grow). int8_floor_hit latches the first refusal, so the rest stream.
+    size_t int8_floor_bytes    = 0;
+    bool   int8_floor_hit      = false;
 
     // RK3576 W8A8 path, selected by the DETECTED PART (rocket_hw_current()) rather than
     // by an env knob, because the RK3588 int8 entry writes int32 with no output requant
@@ -796,6 +806,30 @@ static inline void rk_f16_stop(ggml_backend_rocket_context * ctx, const char * f
     ctx->f16_stop_resident = ctx->resident_bytes;
 }
 
+static size_t rocket_meminfo_bytes(const char * field);   // defined below (init); read here and in build_resident
+// Whether an int8 cache already holding `held` bytes may take a new weight of `est` bytes: the
+// one admission rule of the three int8 caches (the RK3588 one-shot and resident routes, the
+// RK3576 route), each of which charges its own bytes against int8_cache_budget. Past
+// RK_INT8_BUDGET_BASE an auto budget also needs MemAvailable above int8_floor_bytes, read only
+// while a weight is being admitted and latched on the first refusal, because the budget was
+// sized from MemAvailable at init and the KV cache, the activations and any other route's
+// resident weights are allocated after it.
+static bool rk_int8_budget_admits(ggml_backend_rocket_context * ctx, size_t held, size_t est) {
+    if (ctx->int8_cache_budget != 0 && held + est > ctx->int8_cache_budget) return false;
+    if (ctx->int8_floor_bytes && held + est > RK_INT8_BUDGET_BASE) {
+        if (ctx->int8_floor_hit) return false;
+        const size_t avail = rocket_meminfo_bytes("MemAvailable");
+        if (avail && avail < ctx->int8_floor_bytes) {
+            ctx->int8_floor_hit = true;
+            ROCKET_LOGI("[rocket] int8 weight budget: MemAvailable %zuMB fell below the %zuMB "
+                        "reserve at %zuMB held; the remaining weights run on the fp16 path\n",
+                        avail >> 20, ctx->int8_floor_bytes >> 20, held >> 20);
+            return false;
+        }
+    }
+    return true;
+}
+
 // The three knobs each integer route reads from BOTH its one-shot and its resident entry.
 // Cached on the context rather than in a function static because they are per-backend, and
 // read through one accessor so the default cannot drift between the two spellings of the
@@ -839,22 +873,29 @@ static inline int rocket_pad_m(int M) { return (M + 3) & ~3; }
 // The K*N cancels out of the leading term, so M* is nearly MODEL-INDEPENDENT -- the
 // packB you pay scales with the same K*N as the compute you gain. What remains is the
 // dispatch term, which does NOT scale with K*N and so weighs more when the weights are
-// small: a small model crosses LATER, though today the drift is a few rows. Measured [HW sweep,
-// RK1 at 600 MHz, F16, warm t/s NPU/CPU, governor performance, llama.cpp a7fb71f, llama-bench -r 3,
-// two passes within 0.04; the CPU arm is the faster of 4 threads on the A76s and 8 on all cores]:
+// small: a small model crosses LATER, though today the drift is a few rows. Measured [HW sweep
+// 2026-11-21, RK1 at 927.5 MHz (the 900 MHz request), boot loader programs SPLL, F16, warm t/s
+// NPU/CPU, governor performance, llama.cpp b11539, llama-bench -r 3, two passes within 1%; the NPU
+// arm pinned to the A76s at -t 4, the CPU arm the faster of that and 8 threads on all cores]:
 //
-//              pp16   pp32   pp48   pp64   pp96   pp128     M*
-//     0.8B     0.75   1.20   1.53   1.71   1.86   1.96      ~25
-//     3B       0.78   1.40   2.03   2.51   3.26   3.68      ~22
-//     8B       0.77   1.46   2.21   2.75   3.54   3.90      ~21
+//              pp12   pp16   pp20   pp24   pp32   pp64   pp128     M*
+//     0.8B     0.75   0.89   1.05   1.15   1.35   1.87   2.34      ~19
+//     3B       0.84   1.00   1.25   1.44   1.79   2.64   3.77      ~16
+//     8B       0.77   0.98   1.07   1.28   1.63   2.91   4.24      ~17
 //
-// Default 32: above every measured crossover, so NO model regresses below the CPU, and the
-// 32..127 wins (1.2-3.9x) are taken. whisper.cpp is unchanged by it: whisper-small F16 on a 176 s
-// clip ran 0.995-1.006x the old floor of 128 over three passes, transcript byte-identical (its
-// beam-5 decode steps sit at 5 rows; its prompt passes of 64-127 rows now offload and tie). A CTC
-// or transducer encoder's 2.6-10 s utterance now offloads too: uncontended it gains, and beside
-// another process on the same cores it wants OMP_WAIT_POLICY=PASSIVE. Quantized weights and MoE
-// experts have their own (higher) floors, so this governs the F16/BF16 dense path alone.
+// Most of the move from the June crossovers (21-25 rows) is the backend build, not the clock or
+// the boot loader: the June build on the same board crosses at ~19 on the 3B.
+//
+// Default 24: above every measured crossover by at least 5 rows, so NO model regresses below the
+// CPU, and the 24..127 wins (1.15-4.2x) are taken. The boot-loader fix and the 816 -> 927.5 MHz
+// clock together moved the June build 1.04-1.08x at these rows, so a board behind a boot loader
+// that leaves SPLL unprogrammed keeps a margin at 24 [expected; measured on the 3B only].
+// whisper.cpp is unchanged by it: whisper-small F16 on a 176 s clip ran 0.995-1.006x the older
+// floor of 128 over three passes, transcript byte-identical (its beam-5 decode steps sit at 5
+// rows; its prompt passes of 64-127 rows offload and tie). A CTC or transducer encoder's
+// 2.6-10 s utterance offloads too: uncontended it gains, and beside another process on the same
+// cores it wants OMP_WAIT_POLICY=PASSIVE. Quantized weights and MoE experts have their own
+// (higher) floors, so this governs the F16/BF16 dense path alone.
 //
 // A floor of 4 (the old default) is a TRAP for hosts whose *decode* is batched:
 // whisper.cpp defaults to beam search with beam_size=5 and batches all active decoders
@@ -869,24 +910,26 @@ static int rocket_min_m(void) {
     static const int m = [] {
         // Set-empty is UNSET (rocket_knob_int): atoi("")==0 would clamp to the floor 4 and
         // silently re-arm the beam/small-M offload trap the default exists to prevent.
-        const int x = rocket_knob_int("ROCKET_MIN_M", 32);
+        const int x = rocket_knob_int("ROCKET_MIN_M", 24);
         return x < 4 ? 4 : x;
     }();
     return m;
 }
 
-// Quantized (GGUF) weights always take the per-call dequant->fp16 path, whose
-// dequant is a fixed per-microbatch cost. Below a few hundred rows it doesn't
-// amortize and the offload loses to the CPU -- measured crossover ~360 rows on
-// 9B/27B Q4_K (NPU pp384 6.6 vs CPU 6.2 t/s; pp256 4.8 < 6.2 t/s). So quantized
-// MUL_MATs use a higher floor than the F16 rocket_min_m(): default 512 = the
-// default micro-batch, so full ubatches still offload (clearly winning, >=1.33x)
-// while shorter prefills stay on the CPU. Tunable via ROCKET_MIN_M_QUANT; never
-// below rocket_min_m(). (Native int4/int8 modes re-quantize F16 weights, not
-// ggml_is_quantized ones, so this gate covers the dequant path alone.)
+// Quantized (GGUF) weights take the per-call dequant->fp16 path unless they are resident
+// (ROCKET_QUANT_RESIDENT), and the dequant is a fixed per-microbatch cost, so they cross
+// later than F16. Measured crossover 142 rows on Qwen3.5-9B Q4_K_M and 137 on Qwen3.6-27B
+// Q4_K_M, streamed, against the CPU at -t 8 with its repack on; at 192 rows the 9B runs 1.24x
+// the CPU, at 256 1.48-1.50x streamed and 4.2x resident [HW sweep 2026-11-21, RK1 at 927.5 MHz,
+// SPLL programmed, llama.cpp b11539, unpinned]. The crossover is the same behind a boot loader
+// that leaves SPLL unprogrammed (~145 rows, 2026-11-02). Default 256: the row count at which a
+// weight first goes resident (max_tile), 1.8x the measured crossover, which leaves room for a
+// smaller model whose dispatch term crosses later (only the 9B and 27B were measured). Tunable via
+// ROCKET_MIN_M_QUANT; never below rocket_min_m(). (Native int4/int8 modes re-quantize F16
+// weights, not ggml_is_quantized ones, so this gate covers the dequant path alone.)
 static int rocket_min_m_quant(void) {
     static const int m = [] {
-        const int x = rocket_knob_int("ROCKET_MIN_M_QUANT", 512);
+        const int x = rocket_knob_int("ROCKET_MIN_M_QUANT", 256);
         const int base = rocket_min_m();
         return x < base ? base : x;
     }();
@@ -1104,11 +1147,10 @@ static int rocket_flash_attn_min_kv(void) {
     static const int kv = [] { const int x = rocket_knob_int("ROCKET_FLASH_ATTN_MIN_KV", 1024); return x < 1 ? 1 : x; }();
     return kv;
 }
-// ROCKET_FLASH_ATTN_UNMASKED=1 admits FLASH_ATTN_EXT ops that carry no mask (encoder
-// self-attention). Off by default: measured at parity on CPU core-seconds and +36% on the
-// encode wall for whisper small (d=64, T=n_kv=1500), see the gate in supports_op.
+// ROCKET_FLASH_ATTN_UNMASKED (default 1) admits FLASH_ATTN_EXT ops that carry no mask (encoder
+// self-attention, and a decoder's cross-attention); 0 declines them. See the gate in supports_op.
 static bool rocket_flash_attn_unmasked(void) {
-    static const int v = rocket_knob_int("ROCKET_FLASH_ATTN_UNMASKED", 0);
+    static const int v = rocket_knob_int("ROCKET_FLASH_ATTN_UNMASKED", 1);
     return v > 0;
 }
 // ROCKET_FA_THREADS: worker count for the FLASH_ATTN_EXT handler's HOST gather and scatter.
@@ -2187,7 +2229,6 @@ static int rocket_quant_int4_grouped(const float * srcf, const void * srcv, bool
 // One-shot int8 / int4 / bf16 matmul generators
 // ===========================================================================
 static std::string rocket_weight_key(const ggml_tensor * t);   // defined below (fp16 wcache)
-static size_t rocket_meminfo_bytes(const char * field);        // defined below (init); read in build_resident
 static void   rocket_meminfo_read(const char * const * fields, size_t * out, int n);
 static bool   rocket_parse_mb_budget(const char * name, const char * e, size_t * out_bytes);   // defined below (init)
 static size_t rocket_auto_budget_reserve(void);                            // defined below (init)
@@ -2281,8 +2322,7 @@ static int ggml_backend_rocket_mul_mat_int8(
         // Return -1 so this weight runs on the fp16 path: int8-mode degrades to "int8
         // for what fits the budget, fp16 for the rest", usable and thrash-free.
         const size_t est = (size_t)N * K + (size_t)N * sizeof(float);
-        if (key.empty() || (ctx->int8_cache_budget != 0
-                            && ctx->int8_resident_bytes + est > ctx->int8_cache_budget))
+        if (key.empty() || !rk_int8_budget_admits(ctx, ctx->int8_resident_bytes, est))
             return -1;
         // A live iterator here means the key is present at a shape/rotation this call
         // cannot use; the insert below replaces that entry, so drop it first.
@@ -2946,8 +2986,7 @@ static int ggml_backend_rocket_mul_mat_rk3576(
         const size_t est = (size_t)N * K
                          + kc.size() * (size_t)N * (3 * sizeof(float) + sizeof(double)
                                                     + sizeof(int64_t));
-        if (key.empty() || (ctx->int8_cache_budget != 0
-                            && ctx->rk76_resident_bytes + est > ctx->int8_cache_budget))
+        if (key.empty() || !rk_int8_budget_admits(ctx, ctx->rk76_resident_bytes, est))
             return -1;   // don't re-quantize per call; this weight runs on the fp16 path
         rocket_rk3576_weight e;
         e.ch.resize(kc.size());
@@ -3509,8 +3548,7 @@ static int ggml_backend_rocket_mul_mat_int8_resident(
         // from the packed weight after the fact (rocket_i8_weights_bytes) and used
         // for the running total, so the cap tracks the true NPU-BO footprint.
         const size_t est = (size_t)N * K + (size_t)N * sizeof(float);
-        if (ctx->int8_cache_budget != 0
-            && ctx->i8_resident_bytes + est > ctx->int8_cache_budget)
+        if (!rk_int8_budget_admits(ctx, ctx->i8_resident_bytes, est))
             return -1;                        // over budget -> fp16 streams this weight
 
         // quantize (+rotate) the weight to host int8 ONCE; the resident pack
@@ -7675,13 +7713,16 @@ static bool ggml_backend_rocket_device_supports_op_impl(ggml_backend_dev_t dev, 
             // The mask is OPTIONAL to the handler and the driver (NULL = unmasked,
             // rocket_attn.h), and an ENCODER's self-attention passes none: whisper.cpp's
             // audio encoder and the vision encoders behind mtmd build ggml_flash_attn_ext
-            // with src[3] NULL. Unmasked ops are admitted only under
-            // ROCKET_FLASH_ATTN_UNMASKED=1, because at the one shape measured the offload
-            // is not a win: whisper small (12 heads, d=64, T=n_kv=1500) reads the same CPU
-            // core-seconds as the CPU kernel it replaces (16.2 -> 16.1 on a 20 s window)
-            // and +36% encode wall, since the [T,n_kv] scores round-trip through the host
-            // softmax and at d=64 that traffic costs what the QK/AV MACs save [HW sweep
-            // 2026-09-03, RK3588 600 MHz]. A masked (LLM decoder) op is gated as before.
+            // with src[3] NULL, and whisper.cpp's decoder cross-attention does too. They are
+            // admitted by default (ROCKET_FLASH_ATTN_UNMASKED=0 declines them) under the same
+            // n_tokens and n_kv floors as a masked op. Whisper's encoder (d=64, T=n_kv=1500)
+            // encodes in 0.92-0.93x the declined time on tiny, 0.80-0.81x on base and
+            // 0.72x on small; whisper-cli on a 176 s clip (beam 5, whose prompt passes of 16+
+            // tokens also offload the cross-attention) runs in 0.995x / 0.92x / 0.88x the
+            // wall at 0.92x / 0.83x / 0.78x the core-seconds, transcripts byte-identical
+            // [HW sweep 2026-11-22, RK3588 at 927.5 MHz, SPLL programmed, 4 threads on the
+            // A76s]. The vision encoders measured here (SigLIP, d=72) fail the head_dim
+            // alignment below and stay on the CPU either way.
             const ggml_tensor * m = op->src[3];
             if (!rocket_flash_attn_on() || !q || !k || !v) return false;
             if (!m && !rocket_flash_attn_unmasked()) return false;
@@ -8093,9 +8134,33 @@ ggml_backend_t ggml_backend_rocket_init(void) {
             }
         }
     }
-    // ROCKET_INT8_CACHE_MB: resident rotated-int8 weight budget in MB (0 = unlimited).
-    if (const char * e = getenv("ROCKET_INT8_CACHE_MB")) {
-        size_t b; if (rocket_parse_mb_budget("ROCKET_INT8_CACHE_MB", e, &b)) ctx->int8_cache_budget = b;
+    // ROCKET_INT8_CACHE_MB: the int8 weight budget in MB, which each int8 cache charges its own
+    // bytes against (rk_int8_budget_admits). N sets an N-MB budget and 0 removes it. Unset, empty
+    // or "auto" (the default) sizes it the way ROCKET_F16_RESIDENT=auto sizes its own --
+    // MemAvailable at init less rocket_auto_budget_reserve() -- but never below the fixed
+    // RK_INT8_BUDGET_BASE (4096 MB) it replaced, and the bytes past that base are admitted only
+    // while MemAvailable stays above the reserve. The fixed 4096 MB held 141 of Ministral-3-8B's
+    // 235 int8 weights (4094 of 6940 MB) and cost 9.7-10.4% at pp512 against no budget, 5.6-9.0%
+    // on Qwen3.5-9B (125 weights held) [HW sweep 2026-11-21, RK1 32 GB at 1028 MHz, SPLL
+    // programmed, ROCKET_INT8_RESIDENT=1]. A board with less free RAM than base + reserve keeps
+    // the 4096 MB budget it had. Computed only when ROCKET_INT8 is on, the routes' one opt-in.
+    {
+        const char * e = getenv("ROCKET_INT8_CACHE_MB");
+        size_t b;
+        if (e && *e && strcmp(e, "auto") != 0) {
+            if (rocket_parse_mb_budget("ROCKET_INT8_CACHE_MB", e, &b)) ctx->int8_cache_budget = b;
+        } else if (rocket_int8_mode_on()) {
+            const size_t avail   = rocket_meminfo_bytes("MemAvailable");
+            const size_t reserve = rocket_auto_budget_reserve();
+            if (avail > reserve && avail - reserve > RK_INT8_BUDGET_BASE) {
+                ctx->int8_cache_budget = avail - reserve;
+                ctx->int8_floor_bytes  = reserve;
+            }
+            ROCKET_LOGI("[rocket] ROCKET_INT8_CACHE_MB=auto -> int8 weight budget %zuMB "
+                        "(MemAvailable %zuMB - reserve %zuMB, floor %zuMB)\n",
+                        ctx->int8_cache_budget >> 20, avail >> 20, reserve >> 20,
+                        RK_INT8_BUDGET_BASE >> 20);
+        }
     }
     // ROCKET_INT4_CACHE_MB: int4 weight budget in MB (0 = unlimited). Caps BOTH the
     // one-shot host int4 cache and the resident int4 NPU-BO total (the nibble-packed
