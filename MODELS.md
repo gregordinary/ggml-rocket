@@ -8,14 +8,20 @@ A figure dated 2026-11-01 was measured with the NPU at 928 MHz (the 900 MHz requ
 Conditions line says otherwise, any other figure was measured with the NPU at ~816 MHz (the
 600 MHz request), warm. A speedup's baseline is the 8-thread CPU backend on the same GGUF.
 
+A figure dated 2026-11-21 or 2026-11-22 ran with [SPLL](README.md#terms) programmed, on a second
+RK1 at 1028 MHz (the 900 MHz request). It ran on kernel 7.3.3 with `rocket` 1.3.0, llama.cpp
+b11539, the backend of 2026-11-11 and CPU governor `performance`. Every other figure here ran
+behind a boot loader that leaves SPLL unprogrammed.
+
 ## Speech models
 
 ### Whisper
 
 Stock `whisper-cli` and `whisper-bench` load the backend's `.so` through `GGML_BACKEND_PATH` and
-run the encoder's `MUL_MAT` ops on the NPU. Transcripts are byte-identical to the CPU backend's,
-at WER 0 and encoder-output cosine 0.9998. The encoder is faster than on the CPU backend at every
-model size, and the speedup grows with the model:
+run the encoder's `MUL_MAT` ops on the NPU, and by default its attention too. With the `MUL_MAT`
+ops offloaded, transcripts are byte-identical to the CPU backend's, at WER 0 and encoder-output
+cosine 0.9998. The encoder is faster than on the CPU backend at every model size, and the speedup
+grows with the model:
 
 | Model | Encoder speedup over the CPU backend |
 |---|---|
@@ -26,9 +32,19 @@ model size, and the speedup grows with the model:
 | `large-v3` | 2.14x |
 | `large-v3-turbo` | 2.12x |
 
-**Conditions:** `whisper-bench` encode.
+**Conditions:** `whisper-bench` encode, with the encoder's attention on the CPU.
 
-The decoder runs at `M`=1 and stays on the CPU with either backend. `large-v3-turbo` keeps the
+At the defaults, which offload the attention as well, the encoder runs faster still. It runs
+1.50-1.52x as fast as on the CPU backend on `tiny`, 2.01-2.03x on `base` and 2.90x on `small`. The
+transcript of a 176 s clip
+is byte-identical to the one with the attention on the CPU, on all three
+([Encoder attention](TUNING.md#encoder-attention)).
+
+**Conditions:** the multilingual F16 models, an RK1 at 927.5 MHz (the 900 MHz request), the
+backend of 2026-11-22, whisper.cpp v1.9.5 with flash attention on [HW sweep 2026-11-22]. Each
+backend on 4 threads pinned to the A76 cores.
+
+The decoder's token steps stay on the CPU with either backend. `large-v3-turbo` keeps the
 full 32-layer encoder with a 4-layer decoder, ~6x cheaper per step, so the offloaded encoder is
 the larger share of its pipeline.
 
@@ -198,8 +214,10 @@ every norm, softmax and GELU.
 `ROCKET_INT8=1` runs the RK3588's offloaded matmuls as W8A8, with the weights and the activations
 quantized to int8. With the Hadamard rotation on (`ROCKET_INT8_HADAMARD=1`), the output is
 coherent and character-identical to fp16. `ROCKET_INT8_RESIDENT=1` holds the int8 weights
-[resident](README.md#terms). Resident int8 prefill measures 0.95-0.99x resident fp16 on two 3 B
-models and about resident fp16's rate on an 8 B model ([TUNING.md](TUNING.md#quantization-and-prefill-speed)).
+[resident](README.md#terms). Resident int8 prefill measures 0.98-1.10x resident fp16 on four
+models of 3-9 B [HW sweep 2026-11-21]. On Gemma-4-12B at `pp2048`, where resident fp16 places 94%
+of the weights, it measures 1.11-1.19x [HW sweep 2026-11-21]
+([TUNING.md](TUNING.md#quantization-and-prefill-speed)).
 
 Wikitext perplexity over 8 chunks of 512 rises with the int8 route as follows:
 
@@ -253,18 +271,21 @@ activation, at the same accuracy:
 
 | Route | Prefill, t/s | Weights' NPU footprint |
 |---|---:|---:|
-| fp16 | 13.18 | ~10.5 GB |
-| int4, resident | 6.94 | 2634 MB |
-| int4, per call | 3.56 | |
+| fp16, resident (`ROCKET_F16_RESIDENT=auto`) | 26.70-27.25 | 19361 MB, 307 of 325 weights |
+| int4, resident | 7.45-7.52 | 5264 MB, all 325 weights |
 
-**Conditions:** Gemma-4-12B F16 GGUF, `pp512`.
+**Conditions:** Gemma-4-12B F16 GGUF, `pp512`, `ROCKET_INT4_CACHE_MB=0`, the group of 128 and the
+rotation at their defaults [HW sweep 2026-11-22].
 
-Resident int4 runs at ~2x the per-call int4 route and 0.53x fp16, with the weights' NPU footprint
-at a quarter of fp16's. A deep-`K` matmul in group-wise int4 reads back ~120 K-group partials,
-where fp16 with K-accumulation reads back once, and that keeps int4 slower.
+**Not characterized:** the per-call int4 route on the backend of 2026-11-11.
 
-`ROCKET_INT4_CACHE_MB` caps the resident total at 4096 MB by default. A full 12B model is ~6 GB of
-int4 weights, so raise the cap for full coverage. The one-time rotation of each weight runs on
+Resident int4 runs at 0.28x resident fp16, with the weights' NPU footprint at about a quarter of
+fp16's. A deep-`K` matmul in group-wise int4 reads back ~120 K-group partials, where fp16 with
+K-accumulation reads back once, and that keeps int4 slower. On an earlier build at ~816 MHz, the
+per-call int4 route ran at about half that build's resident int4 rate.
+
+`ROCKET_INT4_CACHE_MB` caps the resident total at 4096 MB by default. Gemma-4-12B's int4 weights
+take 5264 MB, so raise the cap for full coverage. The one-time rotation of each weight runs on
 every CPU core and takes about 3 min for a 12B model.
 
 ### bf16

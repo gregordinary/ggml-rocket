@@ -15,12 +15,23 @@ The CPU governor is pinned to `performance` unless a figure says `ondemand`. An 
 process blocks with its threads off the run queue. An unpinned governor then parks the big cores
 and biases a comparison against the NPU.
 
+Every RK3588 figure dated before 2026-11-21 ran behind a U-Boot whose SPL left SPLL unprogrammed,
+which halves the NPU's DDR read rate. The series of 2026-11-21 and 2026-11-22 ran with SPLL
+programmed, on kernel 7.3.3 with `rocket` 1.3.0 and the backend built from the repository's
+2026-11-11 state. Its LLM figures ran on llama.cpp b11539 and its speech figures on whisper.cpp
+v1.9.5. The figures that check the defaults of 2026-11-22 ran a build of the backend with those
+defaults, and name it as the backend of 2026-11-22.
+
+Two RK1 boards ran the series. The first runs the 900 MHz request at 927.5 MHz and ran most of the
+earlier figures. The second runs it at 1028 MHz. Every process of the series completed, and the
+kernel log showed no job timeout or IOMMU warning.
+
 ## README
 
 The headline table, the interactive turn, and the language-model figures dated 2026-11-01 in
 [MODELS.md](MODELS.md) and [MOE.md](MOE.md) are one measurement series on the RK1. It ran
 llama.cpp b11539 with the backend built from the repository's 2026-10-29 state, the NPU at
-928 MHz and the CPU governor at `performance`.
+928 MHz, SPLL unprogrammed and the CPU governor at `performance`.
 
 Each configuration of a GGUF ran in its own process from a memory reset. An NPU configuration first
 ran a discarded warm-up process. `llama-bench` ran three repetitions on the NPU and one on the CPU.
@@ -82,6 +93,38 @@ its NPU prefill on gpt-oss-20b at `pp512`: 24.90-25.23 t/s. On DeepSeek-V2-Lite 
 measured 1.09-1.14x: 32.69-32.83 t/s. Both were NPU only, at governor `ondemand`
 [HW sweep 2026-10-09]. That route also halves DeepSeek-V2-Lite's one-time expert conversion.
 
+The boot-loader figures in the README's Requirements are one RK1 at 1028 MHz under three boot
+areas in sequence [HW sweep 2026-11-21]. A mainline U-Boot v2026.07 build that leaves SPLL
+unprogrammed ran first and last, and Armbian's `2026.07_armbian` build, which programs it, ran
+between. The two unprogrammed configurations agree within 2% on every row. Each configuration ran
+two passes in rotated order, each process after a page-cache drop and a discarded warm-up process:
+
+| Workload | SPLL programmed | SPLL unprogrammed | Ratio |
+|---|---:|---:|---:|
+| int8 weight read, 4×2048×4096, one task, one core | 0.796-0.802 ms | 1.578-1.586 ms | 1.98x |
+| Llama-3.2-3B F16, `pp512`, fp16 route | 105.7-108.4 t/s | 97.8-101.4 t/s | 1.07-1.11x |
+| Qwen3.5-9B F16, `pp512`, fp16 route | 40.1-40.5 t/s | 38.3-39.5 t/s | 1.01-1.05x |
+| Qwen3.5-9B F16, `pp512`, rotated resident int8 | 45.0-45.9 t/s | 43.6-44.3 t/s | 1.02-1.05x |
+| Whisper base encoder, 30 s window | 887-907 ms | 896-910 ms | 0.99-1.03x |
+| Whisper small encoder, 30 s window | 2585-2593 ms | 2600-2625 ms | 1.00-1.02x |
+| Llama-3.2-3B F16, `pp512`, CPU only | 20.7 t/s | 20.5-20.7 t/s | 1.00-1.01x |
+
+**Conditions:** kernel 7.3.3, `rocket` 1.3.0, CPU governor `performance`, DDR at 2112 MHz.
+`llama-bench -p 512 -t 8` unpinned on llama.cpp b11539, and `whisper-bench` on 4 threads on
+whisper.cpp v1.9.5.
+
+The decode comparison divides weight bytes by time. At M 4, three processes drive the NPU's three
+cores to 30.0-30.2 GB/s at fp16 and 27.5-29.3 GB/s at int8. The NPU rates were measured on the RK1
+at 1028 MHz with SPLL programmed [HW sweep 2026-11-21]. The CPU decoder's `tg64` rates of
+2026-11-01 at `taskset 0xf0 -t 4` on llama.cpp b11539 imply ~22-27 GB/s on the four A76 cores
+[host-computed].
+
+The clock figure is fp16 `512×3840×4096` on one core with SPLL programmed: 37.55-37.58 ms at
+471.9 MHz, 22.89-23.74 ms at 905.0 MHz and 18.97-21.42 ms at 1028 MHz [HW sweep 2026-11-21]. The
+device time fits 14830/f + 6.2 ms, with f in MHz, so ~70% of it scales with the clock at 1028 MHz.
+The 1.044x with SPLL unprogrammed is fp16 `512×3840×4096` on two cores, 25.07 ms at ~816 MHz
+against 24.02 ms at 928 MHz [HW sweep 2026-10-19].
+
 ## TUNING
 
 The `taskset 0xf0 -t 4` prefill figures are three rotated passes on three models, with the NPU
@@ -97,14 +140,27 @@ The CPU-only prefill comparison is one process per thread count at `pp512`, gove
 `performance`, before the series [HW 2026-11-01]. SmolVLM2-2.2B F16 ran at 30.94 t/s at 8 threads
 and 29.63 at 4 on the A76s, 1.04x. Ministral-3-8B `Q4_K_M` ran at 10.29 and 9.34, 1.10x.
 
-The `ROCKET_F16_RESIDENT` figures are three rotated passes per configuration, and each row's
-speedup is the ratio of its two means. Before 2026-11-01 the table gave 1.078-1.084x on every row,
-which is the range of those ratios over the three models. An
-earlier build measured a larger gain at shorter prefills: Llama-3.2-3B +9.5% at `pp512` against
-+5.9% at `pp2048`, with output token-identical to the streamed configuration. Phi-4-mini, whose
-single `qkv` and `gate_up` weights leave nothing to fuse, measured +21% at `pp512` and +16% at
-`pp1024` there. The likely cause of the smaller long-prefill gain is that attention stays on the
-CPU at long prefill and dilutes the offloaded matmuls' share [hypothesis].
+The `ROCKET_F16_RESIDENT` table pairs the default and resident fp16 configurations of the
+quantization table's series, below, each ratio within one pass. The teardown report put every
+weight of the 3-9 B models resident, and 307 of Gemma-4-12B-it's 325, where the IOVA window
+filled. Gemma-4-12B-it's `pp512` ratios ran 0.981-1.137x, in the process modes that series
+describes.
+
+The table replaced a measurement on llama.cpp b10558 at ~816 MHz with SPLL unprogrammed [HW sweep
+2026-08-29]. It ran `pp2048` at the default `-b` and `-ub`, with every weight resident, in three
+rotated passes per configuration. Each speedup is the ratio of two means:
+
+| Model, F16 | Streamed weights, t/s | `ROCKET_F16_RESIDENT=auto`, t/s | Speedup |
+|---|---:|---:|---:|
+| Llama-3.2-3B | 56.01 | 60.54 | 1.081x |
+| Ministral-3-3B | 48.28 | 52.04 | 1.078x |
+| Phi-4-mini | 50.19 | 54.40 | 1.084x |
+
+An earlier build measured a larger gain at shorter prefills: Llama-3.2-3B +9.5% at `pp512`
+against +5.9% at `pp2048`, with output token-identical to the streamed configuration.
+Phi-4-mini, whose single `qkv` and `gate_up` weights leave nothing to fuse, measured +21% at
+`pp512` and +16% at `pp1024` there. The likely cause of the smaller long-prefill gain is that
+attention stays on the CPU at long prefill and dilutes the offloaded matmuls' share [hypothesis].
 
 The residency cache's key includes the content fingerprint because the scheduler reuses pooled
 addresses across weights. A cache keyed on the address served one weight's packed tiles for
@@ -154,33 +210,181 @@ A later build measured Gemma-4-12B F16 at 19.96 t/s at `pp2048` over six rotated
 The `ROCKET_MM_STREAM` speedups are three rotated passes per configuration.
 
 The `ROCKET_MIN_M` crossover table divides the NPU's prefill rate by the faster of the 4- and
-8-thread CPU backends at each length.
+8-thread CPU backends at each length. It ran on the first RK1 [HW sweep 2026-11-21]. `llama-bench`
+ran `-p 8,12,16,20,24,32,48,64,128 -n 0 -r 3` in two passes with the configurations rotated, and
+every per-pass spread was under 1%. The 4-thread CPU configuration loads the backend and declines
+every op (`ROCKET_MIN_M=1000000 ROCKET_FLASH_ATTN=0`).
 
-The attention context ratios are from a build that predates the current softmax and the row
-handoff of the scores between the matmuls. The `ROCKET_FLASH_ATTN_UNMASKED` figures, on whisper
-small (12 heads, `d`=64, `T` = `n_kv` = 1500), were measured on 2026-09-03, before the fused NEON
-softmax and the direct score de-tile. The offload used as many CPU core-seconds as the CPU kernel
-(16.1 against its 16.2 on a 20 s window), and with the on-NPU softmax encoding took 96% longer.
+The table replaced a 2026-10-09 measurement on llama.cpp a7fb71f and the backend of that date, at
+~816 MHz with SPLL unprogrammed. It put the crossover at 21-25 rows:
+
+| F16 model | `pp16` | `pp32` | `pp64` | `pp128` |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B | 0.75x | 1.20x | 1.71x | 1.96x |
+| Llama-3.2-3B | 0.78x | 1.40x | 2.51x | 3.68x |
+| Ministral-3-8B | 0.77x | 1.46x | 2.75x | 3.90x |
+
+Most of the crossover's move comes from the newer backend. The 2026-10-09 build ran on
+Llama-3.2-3B as a fourth configuration in the same passes. Its NPU rate rose 1.04-1.08x over its
+own 2026-10-09 reading, a rise that includes both SPLL and the clock's move from ~816 to 927.5 MHz.
+The current build measured 1.19x that build at `pp16`, and the CPU configurations were unchanged.
+Interpolated on the earlier table's grid of 16 and 32 rows, the crossover on Llama-3.2-3B was 21.7
+rows. The 2026-10-09 build moves it to about 19.7 rows, and the current one to 16.1.
+
+The default of 24 was checked on the backend of 2026-11-22 [HW sweep 2026-11-22]. Llama-3.2-3B F16
+prefilled a 24-row prompt at 23.81-23.86 t/s at the default. Under `ROCKET_MIN_M=32`, which keeps
+it on the CPU, it ran at 16.52-16.55 t/s. The default ran 1.442x as fast in each of two rotated
+passes. Both configurations ran `taskset -c 4-7 -t 4` and loaded the backend. The table's figure
+for the same model and length is 1.444-1.447x the faster CPU configuration.
+
+The Whisper beam figures ran `whisper-cli` at its defaults (beam 5, best-of 5, flash attention on)
+on a 176 s clip, 4 threads pinned to the A76 cores [HW sweep 2026-11-22]. Three passes ran with the
+thresholds rotated. The beam steps are whisper.cpp's `batchd` time, the M=5 calls. Thresholds of
+8 and 32 measured the same, 0.988-1.011x, and the transcripts were md5-identical across the
+thresholds of 4, 8 and 32. At a threshold of 4, `ROCKET_MM_PROFILE` put whisper-small's weight
+pack at 13.0 s, against 1.0 s at a threshold of 8. With SPLL unprogrammed, the beam steps at 4
+measured 2.3x their CPU time and the transcription 1.40x as long.
+
+The attention context table ran two passes with the configurations rotated, on the first RK1
+[HW sweep 2026-11-21]. The 8K and 16K tests ran one repetition with `--no-warmup`, after the
+discarded warm-up process. A 512-token prompt with every op offloaded (`ROCKET_FLASH_ATTN_MIN_KV`
+of 512) measured 0.992-0.998x on Gemma-4-12B and 0.976-0.990x on Llama-3.2-3B. At a 1K prompt
+that threshold measured 1.082-1.083x and 1.074-1.087x, against the default's 1.069-1.086x and
+1.073-1.083x. The pinned figure pairs `taskset 0xf0 -t 4` configurations with the offload on and
+off at `pp2048`, in two passes.
+
+The table replaced Gemma-4-12B F16 figures at ~816 MHz with SPLL unprogrammed, on the backend and
+llama.cpp of that month [HW sweep 2026-06-26/28]. They were parity at 1K and below, 1.07x at 4K,
+1.45-1.50x at 8K and 1.25x at 16K. At `pp2048` the same pinned and unpinned pairs measured 1.079x
+and 1.045x [HW sweep 2026-09-03], against 1.240-1.252x and 1.199-1.205x now. Between those dates
+the offload-off configurations gained 1.12-1.15x and the offload-on configurations 1.29-1.33x. The
+two dates differ in the boot loader, the NPU clock, the backend's softmax, score de-tile and row
+handoff, and the llama.cpp build. The measurements do not separate those causes.
+
+The encoder-attention figures ran on the first RK1 with the backend of 2026-11-22 [HW sweep
+2026-11-22]. Three configurations ran per model: the default, `ROCKET_FLASH_ATTN_UNMASKED=0`, and
+the CPU backend without `libggml-rocket.so`. Every process ran `taskset -c 4-7 -t 4` after a memory
+reset, and each backend configuration had a discarded warm-up process per model. The models are
+whisper.cpp's multilingual `ggml-tiny`, `ggml-base` and `ggml-small`, F16, whose encoders attend
+over `T` = `n_kv` = 1500 with `d`=64.
+
+`whisper-bench` ran three passes with the configurations rotated. Its encode times, in ms:
+
+| Model | Default | `ROCKET_FLASH_ATTN_UNMASKED=0` | CPU backend |
+|---|---:|---:|---:|
+| `tiny` | 438.2-442.8 | 475.5-478.3 | 666.0-668.2 |
+| `base` | 749.7-761.6 | 941.7-943.7 | 1524.2-1533.2 |
+| `small` | 1919.0-1923.9 | 2674.7-2686.5 | 5562.0-5569.1 |
+
+The process core-seconds cover `whisper-bench`'s whole run, its decode benchmarks included. They
+were 32.4-32.5 against 35.6-35.8 on `tiny`, 55.8-56.3 against 64.3-64.6 on `base`, and
+132.2-133.9 against 161.2-163.2 on `small`. One untimed `ROCKET_FA_TIMING=1` process per
+configuration counted 84, 126 and 252 offloaded attention ops at the default and none at `=0`. A
+series on the backend of 2026-11-11 with `ROCKET_FLASH_ATTN_UNMASKED=1` measured `small` at
+1913.7-1932.3 ms against 2673.4-2682.8 ms without it.
+
+`whisper-cli` ran one process per configuration and model on a 176 s English clip, with `-nt` and
+the default beam search.
+Its wall-clock times were 10.03 s against 10.08 s on `tiny`, 17.06 s against 18.49 s on `base` and
+39.53 s against 44.84 s on `small`. Its core-seconds were 30.5 against 33.3, 52.7 against 63.6 and
+123.6 against 157.5. The transcripts' md5s matched between the two configurations, and on base and
+small they matched the transcripts of the threshold comparison above. Each default process
+offloaded `6 x n_audio_layer` ops for its six encodes and `5 x n_text_layer` more. Five decoder
+prompt passes that offload their cross-attention give that remainder [hypothesis].
+
+With SPLL unprogrammed, on 2026-09-03, the offload took 36% longer than the CPU kernel. Through
+`whisper-cli` on a 20 s window, its encode took 4.31 s against 3.17 s, with an md5-identical
+transcript. That build predates the fused NEON softmax, the direct score de-tile and the row
+handoff. The offload used as many CPU core-seconds as the CPU kernel (16.1 against its 16.2), and
+with the on-NPU softmax encoding took 96% longer. The two dates differ in both the boot loader and
+the backend, and the measurements do not separate them.
+
+The voice-command table ran `parakeet-cli` over four sets of ten utterances [HW sweep 2026-11-22].
+Three repetitions rotated five configurations: the CPU only, and thresholds of 4, 8, 16 and 32. Each
+per-utterance cost is a 10-file process less a 1-file process, divided by nine, in wall-clock time
+and in user plus system core-seconds. Thresholds of 4, 8 and 16 admit the same GEMMs and measured
+within 1.5% of each other. The transcripts were byte-identical across all five configurations.
+
+The table replaced figures at ~816 MHz with SPLL unprogrammed and CPU governor `ondemand`
+[HW sweep 2026-09-30]. A threshold of 4 then tied the CPU at 1.3-1.8 s and ran 1.18-1.73x its
+speed at 2-6 s, freeing 34-61% of the CPU core-seconds.
+
+The `ROCKET_MIN_M_QUANT` table ran one micro-batch of M rows on the first RK1 [HW sweep 2026-11-21].
+Two passes ran eleven configurations, rotated by one each pass. The CPU configuration ran without
+the backend. The resident configuration's teardown lines showed 0% resident at 128 and 192 rows, and
+all 197 weights (12896 MB) resident from 256 rows, at 44.7-46.0 t/s. Qwen3.6-27B ran the streamed
+and CPU configurations only, on 2026-11-22. The crossover interpolates linearly between 128 and 192
+rows.
+
+The default of 256 was checked on the backend of 2026-11-22 [HW sweep 2026-11-22]. Qwen3.5-9B
+`Q4_K_M` ran a 256-row prompt at the default `-b` and `-ub` with `--repack 0`, at 15.83-15.93 t/s.
+The CPU backend with its repack on ran 10.76-10.77 t/s, for 1.472x and 1.479x in two rotated
+passes. A `ROCKET_MM_PROFILE` process confirmed the offload. The table's streamed 256-row
+configuration measured 15.93-16.07 t/s.
+
+The table replaced a crossover of ~360 rows on 9B and 27B `Q4_K` [HW sweep 2026-06-28]. That
+measurement ran at ~816 MHz with a serial dequantization, against a CPU backend without the weight
+repack. A 2026-11-02 measurement at 928 MHz with SPLL unprogrammed put the 9B's crossover at
+~145 rows.
 
 The 5.6% share in `ROCKET_FA_THREADS` is from a `ROCKET_FA_TIMING=1` readout: the walks took 5.44 s
 of a 97.8 s pinned prefill, 3.46 s gathering and 1.98 s scattering. The thread-count sweep ran
 three configurations in three rotated passes. A fit of `G_k = A/k + B` to the table leaves a
 fixed 0.55 s, which bounds what workers past four can save.
 
-The quantization table's four configurations ran on one build, selected by environment alone.
-Each process followed a memory reset and a discarded warm-up process. Three passes ran with the
-order rotated, and each ratio pairs two configurations within one pass [HW sweep 2026-11-06].
-The whole-tile int8 figure is the same build under `ROCKET_MM_STREAM_INT8=0`: 69.4-70.5 t/s on
-Llama-3.2-3B-Instruct at `pp512`. It reproduces the 0.60x of the earlier record, Gemma-4-12B F16
-at `pp2048` at ~816 MHz. The int8 route's perplexity is the same on both plans at every chunk,
-11.0729.
+The quantization table's configurations ran on one build, selected by environment alone, on the
+second RK1 at 1028 MHz [HW sweep 2026-11-21]. Each process followed a memory reset and a discarded
+warm-up process. Three passes ran with the order rotated, and each ratio pairs two configurations
+within one pass. The 8-9 B models added the int8 route at a 4096 MB budget as a fifth
+configuration in the same passes. The fifth configuration gives the 4096 MB budget's figures on
+Qwen3.5-9B and at `pp2048`. One untimed `ROCKET_DEBUG=1` process per model read that budget's
+placement on 2026-11-22.
 
-The table's 8-9 B rows ran the same way on a later build of the same sources [HW sweep
-2026-11-07]. Ministral-3-8B-Instruct ran five configurations: the four, plus the int8 route at the
-default 4096 MB budget. Qwen3.5-9B ran four, without the whole-tile plan. All 27 processes
-completed. The whole-tile int8 plan ran Ministral-3-8B-Instruct at 31.7-31.8 t/s at `pp512`,
-0.610-0.615x resident fp16. Resident fp16 places at these sizes because a prefill-only process
-drops each F16 source page once its weight is resident.
+Qwen3.5-9B's configurations spread more between processes than the other models' (resident fp16
+at 44.71-47.24 t/s at `pp512`), so its per-pass ratios against resident fp16 straddle 1.00. Its
+rotated route against the default, 1.090-1.145x at `pp512`, agrees with a run on the same board
+the day before, 1.116x and 1.125x.
+
+Gemma-4-12B-it's `pp512` rates ran in modes between processes. The unrotated int8 route measured
+25.36 t/s in one process and 39.89 in another, while each process's repetitions agreed within
+0.3 t/s. Its `pp512` ratios against resident fp16 were 0.804-1.477x unrotated and 1.142-1.319x
+rotated, and the table omits that test.
+
+The whole-tile int8 and resident int4 figures are one series on Gemma-4-12B-it at `pp512` [HW sweep
+2026-11-22]. Resident fp16 and the streamed int8 plan ran in the same passes as references. The
+whole-tile plan ran at 19.02-20.03 t/s and the streamed plan at 38.97-40.04, whose repetitions held
+within 0.3 t/s. Resident fp16 ran at 26.70-27.25 t/s, with its repetitions spread ±7-9 t/s within
+each process, so the ratios against it are approximate. One untimed `ROCKET_DEBUG=1` process
+confirmed that the int4 route placed all 325 weights resident.
+
+The table replaced these figures, measured on the first RK1 at 928 MHz with SPLL unprogrammed:
+
+| Date | What was measured | Earlier value |
+|---|---|---|
+| 2026-11-06 | Resident int8 against resident fp16, Llama-3.2-3B-Instruct and Ministral-3-3B-Instruct | 0.948-0.967x at `pp512` and 0.964-0.978x at `pp2048` on Llama-3.2-3B-Instruct. 0.971-0.990x and 0.968-0.984x on Ministral-3-3B-Instruct |
+| 2026-11-07 | Resident int8 against resident fp16, Ministral-3-8B-Instruct and Qwen3.5-9B | 0.893-0.899x and 0.908-0.921x on Ministral-3-8B-Instruct, 0.914-0.927x and 0.921-0.949x on Qwen3.5-9B, with the K passes summed in an int64 accumulator |
+| 2026-11-07 | The int8 route with each K pass added straight into the output | 1.07-1.12x the int64 build on Ministral-3-8B-Instruct, 51.5-52.0 t/s at `pp512`, and 1.01-1.03x on Llama-3.2-3B-Instruct |
+| 2026-11-06/07 | The whole-tile int8 plan against resident fp16 | 0.61-0.66x: 69.4-70.5 t/s on Llama-3.2-3B-Instruct and 31.7-31.8 t/s on Ministral-3-8B-Instruct at `pp512`. An earlier record measured 0.60x on Gemma-4-12B F16 at `pp2048` at ~816 MHz |
+| 2026-11-07 | The 4096 MB int8 budget against `0` | It held 58-62% of the int8 weights, and cost 3-5% on Ministral-3-8B-Instruct and 1-3% on Qwen3.5-9B |
+| 2026-11-11 | The rotated route against the unrotated one on Qwen3.5-9B at `pp512` | 0.951-0.972x, and 0.855-0.867x with the conversions on one thread |
+| 2026-11-11 | Gemma-4-12B-it with every int8 weight resident | Unrotated, 1.35-1.37x the default fp16 route at `pp512` and 1.30-1.32x at `pp2048`. Rotated, 31.8-31.9 t/s at `pp512` against 25.5-25.9 for the fp16 route |
+
+The int8 route's perplexity is the same on the whole-tile and streamed plans at every chunk,
+11.0729 on Llama-3.2-3B-Instruct [HW sweep 2026-11-06]. Resident fp16 places every weight of the
+3-9 B models because a prefill-only process drops each F16 source page once its weight is
+resident.
+
+The `ROCKET_INT8_CACHE_MB` default's figures ran on Ministral-3-8B-Instruct F16 at `pp512` on the
+second RK1, with the backend of 2026-11-22 [HW sweep 2026-11-22]. Three configurations of
+`ROCKET_INT8=1 ROCKET_INT8_RESIDENT=1` ran three rotated passes: the default,
+`ROCKET_INT8_CACHE_MB=0` and `=4096`. Each ratio pairs two of them within one pass. The default ran
+at 58.87-59.64 t/s, `0` at 59.22-59.62 and 4096 at 53.39-53.70.
+
+Every default process logged a budget of 21552-21580 MB, from a `MemAvailable` of ~31 GB less a
+9535 MB reserve, and none logged the reserve stopping admission. One untimed `ROCKET_DEBUG=1`
+process per configuration counted 235 of 235 int8 weights resident at the default and at `0`, and
+141 at 4096. On the 2026-11-11 build, `0` ran at 60.04-60.19 t/s and 4096 at 0.896-0.903x it, in
+the quantization series.
 
 The `ROCKET_CONVERT_THREADS` figures are four configurations on one build, on Qwen3.5-9B F16 with
 every int8 weight resident. Rotated and unrotated each ran with the host conversions spread over
@@ -209,18 +413,22 @@ conversions ran at 52.70-52.88 t/s against 51.48-52.03. On the default route the
 331 ms over two runs and the output unscaling from 529 to 413 ms. The library's own activation
 pack rose from 746 to 906 ms, taking back part of the saving.
 
-The Gemma-4-12B rotated rate is the current build against the build before its 60-point
-rotation was restructured, in one series [HW sweep 2026-11-11]. The two builds' rotations give the
-same bits. Over three passes in alternating order the current one ran at 31.77-31.93 t/s against
-29.09-29.24, 1.090-1.093x. Its `ROCKET_MM_PROFILE` process put the rotated conversions at 3.50 s
-over two `pp512` runs, against 6.35 s for the earlier build. The fp16 route's 25.48-25.93 t/s comes
-from a series earlier that day under the same protocol.
+On 2026-11-11, one series compared the Gemma-4-12B rotated rate on two builds [HW sweep
+2026-11-11]. The later one restructured the 60-point rotation. The two builds'
+rotations give the same bits. Over three passes in alternating order the newer one ran at
+31.77-31.93 t/s against 29.09-29.24, 1.090-1.093x. Its `ROCKET_MM_PROFILE` process put the rotated
+conversions at 3.50 s over two `pp512` runs, against 6.35 s for the earlier build. The fp16 route's
+25.48-25.93 t/s comes from a series earlier that day under the same protocol.
 
 The perplexity rows in [MODELS.md](MODELS.md#int8-w8a8) are 8 chunks of 512 of wikitext-2 test.
 Each arm's error estimate is ~5%, so the sign of each difference rests on the per-chunk running
 estimates. int8 is above fp16 at every chunk on both 8-9 B models.
 
 ## MODELS
+
+The Whisper encoder speedups at the defaults, which the README also gives, divide the CPU
+backend's encode time by the default configuration's within each pass. They come from the
+encoder-attention series under [TUNING](#tuning).
 
 The Ministral-3-8B and Gemma-4-12B tables replaced 2026-07-01 and 2026-07-02 sessions at ~816 MHz.
 Their quantized rows ran at `-b 2048 -ub 2048`, against a CPU backend without the weight repack. On
@@ -241,6 +449,11 @@ speedup figure, from a build that measured the 3-4 B models at ~3.4x.
 The `ROCKET_FLASH_ATTN` perplexity figures, 13.8994 with the offload and 13.9024 without, are
 `llama-perplexity` runs on Ministral-3-3B F16. Two offloaded processes agreed to every digit
 [HW sweep 2026-09-07].
+
+The int4 table is the quantization series' Gemma-4-12B-it figures at `pp512`, described under
+[TUNING](#tuning) [HW sweep 2026-11-22]. It replaced figures on an earlier build at ~816 MHz with
+SPLL unprogrammed. The fp16 route ran at 13.18 t/s with ~10.5 GB of weights. Resident int4 ran at
+6.94 t/s with 2634 MB, 0.53x fp16, and the per-call int4 route at 3.56 t/s.
 
 ## MOE
 

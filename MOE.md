@@ -9,7 +9,10 @@ Each comparison names its baseline. The experts-on-CPU baseline is the backend w
 `ROCKET_MOE=0`, which offloads the dense matmuls and leaves the experts on the CPU. The models
 measured are gpt-oss-20b
 and DeepSeek-V2-Lite. Unless a Conditions line says otherwise, a figure here was measured on the
-RK3588 with the NPU at ~816 MHz (the 600 MHz request).
+RK3588 with the NPU at ~816 MHz (the 600 MHz request). Every figure here ran behind a boot loader
+that leaves [SPLL](README.md#terms) unprogrammed.
+
+**Not characterized:** the placement minimums and the MoE ratios with SPLL programmed.
 
 A MoE model's architecture decides whether its experts offload. One model's ratio does not
 transfer to another. The default needs no environment variable. Where the experts offload, add

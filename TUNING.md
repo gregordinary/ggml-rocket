@@ -5,7 +5,13 @@ the [README](README.md), which covers the build and a first run. [API.md](API.md
 environment variable with its default.
 
 Unless a Conditions line says otherwise, a figure here was measured on the RK3588 with the NPU at
-~816 MHz (the 600 MHz request), warm. Its baseline is the 8-thread CPU backend on the same GGUF.
+~816 MHz (the 600 MHz request), warm. Its boot loader left [SPLL](README.md#terms) unprogrammed,
+and its baseline is the 8-thread CPU backend on the same GGUF.
+
+A figure dated 2026-11-21 or 2026-11-22 was measured with SPLL programmed, CPU governor
+`performance`, kernel 7.3.3 and `rocket` 1.3.0. It ran the backend of 2026-11-11, unless its
+Conditions line names the backend of 2026-11-22, which has the current defaults. It ran on an RK1
+at 927.5 MHz (the 900 MHz request), unless its Conditions line names a second RK1 at 1028 MHz.
 
 ## Recommended configurations
 
@@ -15,17 +21,19 @@ needs an environment variable. Add the settings the table gives for the workload
 
 | Workload | Precision | Add | Effect |
 |---|---|---|---|
-| Interactive chat, short prompts | Any | `taskset 0xf0 -t 4`, and a `Q4_K_M` GGUF for decode t/s | The turn is decode-bound, so the quantization and the thread placement set its speed. A quantized prompt under 512 rows stays on the CPU, and an F16 one under 32 |
+| Interactive chat, short prompts | Any | `taskset 0xf0 -t 4`, and a `Q4_K_M` GGUF for decode t/s | The turn is decode-bound, so the quantization and the thread placement set its speed. A quantized prompt under 256 rows stays on the CPU, and an F16 one under 24 |
 | Agentic, RAG or long prompts | Quantized GGUF whose fp16 form fits RAM, wholly or partly | `ROCKET_QUANT_RESIDENT=auto`, at the default `-ub` | 1.35-1.75x the default configuration's prefill on seven dense models of 1.8-11.9 B. Needs free RAM of about the fp16 model size |
 | Agentic, RAG or long prompts | Quantized GGUF whose fp16 form does not fit | `-b 2048 -ub 2048` | 0.91-1.53x the default `-ub 512`, by model, so measure it |
-| Agentic or RAG, repeated prefill | F16, with RAM for ~2x the model | `ROCKET_F16_RESIDENT=auto` and `ROCKET_N_THREADS=6` | 1.08x the default configuration's prefill on three 3-4 B models |
-| Agentic or RAG, repeated prefill | F16, with RAM for ~1.5x the model | `ROCKET_INT8=1 ROCKET_INT8_RESIDENT=1`, and above 4 B a `ROCKET_INT8_CACHE_MB` that holds the int8 weights | 1.11-1.12x the default configuration's prefill on two 3 B models and at least 1.05-1.07x on two 8-9 B models ([Quantization and prefill speed](#quantization-and-prefill-speed)), at a wikitext perplexity 0.7-2.8% above fp16. At the default 4 GB budget the weights past it run on the fp16 route, 1-5% slower at 8-9 B |
+| Agentic or RAG, repeated prefill | F16, with RAM for ~2x the model | `ROCKET_F16_RESIDENT=auto`, and `ROCKET_N_THREADS=6` where the IOVA window fills | 1.13-1.21x the default configuration's prefill on four models of 3-9 B ([F16 weights](#f16-weights)) |
+| Agentic or RAG, repeated prefill | F16, with RAM for ~1.5x the model | `ROCKET_INT8=1 ROCKET_INT8_RESIDENT=1` | 1.15-1.21x the default configuration's prefill on four models of 3-9 B ([Quantization and prefill speed](#quantization-and-prefill-speed)), at a wikitext perplexity 0.7-2.8% above fp16. Where free RAM holds the int8 budget at its 4096 MB minimum, the weights past it run on the fp16 route, 4-8% slower at 8-9 B |
 | Medium or long prompts | MoE whose experts offload (gpt-oss, DeepSeek-V2-Lite) | `-b 2048 -ub 2048` and `ROCKET_N_THREADS=6` | 1.25-1.32x the default `-ub` at `pp2048`. [MOE.md](MOE.md) has the rest |
 | Model too large at F16 | Any | A `Q4_K_M` GGUF, or `ROCKET_INT4=1` with an F16 GGUF | Reduces the footprint at a slower prefill than fp16 |
 | Transcription service (`whisper-server` fed fixed-length chunks) | F16 Whisper | `-nt -sns`, `-ac 50*(chunk_s+4)` capped at 1500, and `temperature_inc=0` as a request field | 0.70x the server defaults' CPU core-seconds per second of audio on 20 s chunks, at better WER |
-| Voice commands, short utterances (Parakeet through whisper.cpp's `parakeet-cli`) | F16 | `ROCKET_MIN_M=16` in the STT process, and `OMP_WAIT_POLICY=PASSIVE` where another process shares its cores | Offloads the whole encoder of a command shorter than 2.6 s, where the default threshold offloads 24 of its 265 GEMMs |
+| Voice commands, short utterances (Parakeet through whisper.cpp's `parakeet-cli`) | F16 | `ROCKET_MIN_M=16` in the STT process, and `OMP_WAIT_POLICY=PASSIVE` where another process shares its cores | Offloads the whole encoder of a command shorter than ~1.9 s, of which the default threshold offloads only part [expected] |
 
-**Conditions:** the LLM rows at `pp2048`. The speech rows' conditions are in their sections.
+**Conditions:** the LLM rows at `pp2048`. The F16 residency and int8 rows on a second RK1 at
+1028 MHz, at five NPU workers [HW sweep 2026-11-21]. The speech rows' conditions are in their
+sections.
 
 ## Weight residency
 
@@ -36,7 +44,8 @@ Whisper's encoder. The two residency variables extend it to every weight.
 
 A weight becomes resident the first time the backend sees it at `M` >= 256, the RK3588's tile
 cap. Below that, a call [streams](README.md#terms) the weight and leaves any resident copy in
-place. A weight packed during warm-up therefore serves a later prefill of any length.
+place. A weight packed during warm-up therefore serves every later micro-batch of 256 rows or
+more, and no shorter one.
 
 The cache is keyed on the weight's name and a fingerprint of its contents (sixteen 64-byte
 windows), not on its address or on `M`. A weight that is reloaded or replaced under the same name
@@ -54,19 +63,25 @@ fusion: each fusable group becomes one resident weight, still with one activatio
 submit. It does not `madvise` the GGUF, so the file stays mapped for CPU decode. The full benefit
 therefore needs RAM for about twice the F16 model.
 
-| Model, F16 | Streamed weights, t/s | `ROCKET_F16_RESIDENT=auto`, t/s | Speedup |
+| Model, F16 | `pp512` speedup | `pp2048` speedup | Weights resident |
 |---|---:|---:|---:|
-| Llama-3.2-3B | 56.01 | 60.54 | 1.081x |
-| Ministral-3-3B | 48.28 | 52.04 | 1.078x |
-| Phi-4-mini | 50.19 | 54.40 | 1.084x |
+| Llama-3.2-3B-Instruct | 1.201-1.228x | 1.150-1.156x | 193 of 193 |
+| Ministral-3-3B-Instruct | 1.207-1.211x | 1.151-1.164x | 179 of 179 |
+| Ministral-3-8B-Instruct | 1.225-1.235x | 1.190-1.205x | 235 of 235 |
+| Qwen3.5-9B | 1.119-1.142x | 1.127-1.164x | 197 of 197 |
+| Gemma-4-12B-it | Varies by process | 1.133-1.170x | 307 of 325 |
 
-**Conditions:** llama.cpp b10558, `pp2048` at the default `-b` and `-ub`, every weight resident
-[HW sweep 2026-08-29].
+**Conditions:** `ROCKET_F16_RESIDENT=auto` over the default configuration, which streams every
+weight with `K` above 2048. A second RK1 at 1028 MHz (the 900 MHz request), five NPU workers,
+llama.cpp b11539, `llama-bench -n 0 -r 3 -t 8` unpinned at the default `-b` and `-ub` [HW sweep
+2026-11-21]. [Quantization and prefill speed](#quantization-and-prefill-speed) gives the rates.
 
-`ROCKET_N_THREADS=6` places the most weights on this route where the [IOVA window](README.md#terms)
-binds. On Gemma-4-12B F16 at `pp512`, six workers placed 293 weights, against 286 at the default
-five and 274 at seven [HW sweep 2026-09-02]. At `pp2048` the `MemAvailable` minimum binds before
-the window, and six workers placed 284 against five's 286 [HW sweep 2026-09-03].
+On Gemma-4-12B-it the [IOVA window](README.md#terms) fills before every weight is resident.
+`ROCKET_N_THREADS=6` places the most weights on this route where the window binds. On
+Gemma-4-12B F16 at `pp512`, six workers placed 293 weights, against 286 at five and 274 at seven
+[HW sweep 2026-09-02, llama.cpp b10558]. At `pp2048` the `MemAvailable` minimum bound before the
+window there, and six workers placed 284 against five's 286 [HW sweep 2026-09-03]. Both ran the
+backend of that date.
 
 ### Quantized weights
 
@@ -144,9 +159,27 @@ it over more rows. The setting measures 1.18-1.53x the default `-ub 512` on dens
 8 B, and 0.94-1.13x on models under 4 B parameters. It is slower on two models of the eleven
 measured, so measure it per model.
 
-A quantized prefill shorter than `ROCKET_MIN_M_QUANT`, 512 rows by default, stays on the CPU,
-where it is faster than a dequantize-bound offload. The default sits just above the measured
-crossover of ~360 rows on 9B and 27B `Q4_K`.
+A quantized micro-batch shorter than `ROCKET_MIN_M_QUANT`, 256 rows by default, stays on the CPU.
+The offload is faster than the CPU from 142-143 rows on Qwen3.5-9B `Q4_K_M` and from 137 rows on
+Qwen3.6-27B `Q4_K_M`. The default is 1.8x that crossover, and is the row count at which quantized
+residency starts. A smaller model's crossover is expected to be later, because its per-call
+dispatch cost weighs more against its weights [expected]. Over the CPU, the offload measures:
+
+| Micro-batch, rows | 128 | 192 | 256 | 384 | 512 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.5-9B, streamed, over the CPU | 0.93x | 1.24x | 1.48-1.50x | 1.82-1.86x | 2.12-2.13x |
+| Qwen3.5-9B, `ROCKET_QUANT_RESIDENT=auto`, over the CPU | 0.92x | 1.24-1.25x | 4.19-4.22x | 4.11-4.16x | 4.07-4.17x |
+| Qwen3.6-27B, streamed, over the CPU | 0.95x | Not measured | 1.59-1.61x | 2.00-2.04x | 2.41-2.43x |
+
+**Conditions:** `Q4_K_M`, one micro-batch of M rows (`-b` and `-ub` at M) with
+`ROCKET_MIN_M_QUANT=1` and `--repack 0`, against the CPU backend with its weight repack on. Both
+run 8 threads unpinned on llama.cpp b11539 [HW sweep 2026-11-21/22].
+
+Quantized residency serves no micro-batch under 256 rows, because a weight becomes resident only
+at its first call of 256 rows or more. With every weight resident, a micro-batch of 256 rows or
+more runs at 4.1-4.2x the CPU on the 9B. Between the crossover and 256 rows the default keeps a
+micro-batch on the CPU. There the streamed offload measures 1.24x the CPU at 192 rows on the 9B.
+Measure the crossover on your model before lowering `ROCKET_MIN_M_QUANT` below 256.
 
 The dequantization is threaded across the A76 cores by default (`ROCKET_DEQUANT_THREADS`). It is
 bit-exact and needs no extra RAM. On a 9B `Q4_K`, eight A76 and A55 threads gave
@@ -157,73 +190,82 @@ That run predates pinning the threads to the A76 cores. With the threaded dequan
 
 ## Quantization and prefill speed
 
-Quantization saves RAM and lets a larger model fit. At equal residency it does not raise prefill
-speed at this operating point. The prefill matmul is limited by DMA and dispatch rather than by
-the MAC array. int8's 2x and int4's 4x MAC rates therefore do not reach the prefill time.
+Quantization saves RAM and lets a larger model fit. At equal residency it changes prefill speed
+little: resident int8 prefills at 0.98-1.10x resident fp16 on four models of 3-9 B. The prefill
+matmul is limited by host work and the weight read rather than by the MAC array. int8's 2x and
+int4's 4x MAC rates therefore reach the prefill time only in part.
 
-The resident int8 route prefills at 0.95-0.99x resident fp16 on 3 B models, with half the
-resident weight bytes. On an 8 B model it prefills at about resident fp16's rate. Against the default configuration, which
-converts and scatters each weight on every call, it is 1.11-1.16x at 3 B and 1.05-1.07x at
-8-9 B:
+Resident int8 holds half the weight bytes of resident fp16. The default configuration converts
+and scatters each weight on every call. Against it, resident int8 prefills at 1.13-1.33x at
+`pp512` and 1.15-1.21x at `pp2048` on the 3-9 B models:
 
-| Model, F16 GGUF | Test | Default, t/s | `ROCKET_F16_RESIDENT=auto`, t/s | Resident int8, t/s | Resident int8 against resident fp16 |
-|---|---|---:|---:|---:|---:|
-| Llama-3.2-3B-Instruct | `pp512` | 95.6-96.1 | 113.2-113.8 | 107.5-109.5 | 0.948-0.967x |
-| Llama-3.2-3B-Instruct | `pp2048` | 84.4-84.7 | 97.0-97.6 | 94.1-94.8 | 0.964-0.978x |
-| Ministral-3-3B-Instruct | `pp512` | 85.8-86.3 | 101.1-101.8 | 98.8-100.1 | 0.971-0.990x |
-| Ministral-3-3B-Instruct | `pp2048` | 74.4-74.9 | 85.1-86.1 | 83.3-83.7 | 0.968-0.984x |
-| Ministral-3-8B-Instruct | `pp512` | 43.8-44.0 | 51.7-52.0 | 46.2-46.8 | 0.893-0.899x |
-| Ministral-3-8B-Instruct | `pp2048` | 39.5-39.6 | 45.7-46.2 | 42.0-42.1 | 0.908-0.921x |
-| Qwen3.5-9B | `pp512` | 36.0-36.4 | 41.3-41.8 | 38.2-38.3 | 0.914-0.927x |
-| Qwen3.5-9B | `pp2048` | 35.5-35.9 | 39.7-40.8 | 37.6-37.7 | 0.921-0.949x |
+| Model, F16 GGUF | Test | Default, t/s | Resident fp16, t/s | Resident int8, t/s | Resident int8, rotated, t/s | int8 against resident fp16 | Rotated against resident fp16 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-3B-Instruct | `pp512` | 104.32-105.32 | 126.54-128.13 | 135.74-136.73 | 131.06-131.16 | 1.065-1.073x | 1.023-1.037x |
+| Llama-3.2-3B-Instruct | `pp2048` | 93.13-93.65 | 107.68-107.85 | 110.51-111.19 | 106.32-107.90 | 1.026-1.033x | 0.987-1.002x |
+| Ministral-3-3B-Instruct | `pp512` | 94.54-94.67 | 114.28-114.61 | 125.35-125.54 | 122.90-123.34 | 1.094-1.097x | 1.075-1.077x |
+| Ministral-3-3B-Instruct | `pp2048` | 81.82-82.33 | 94.16-95.26 | 97.40-99.38 | 96.86-97.29 | 1.034-1.047x | 1.017-1.033x |
+| Ministral-3-8B-Instruct | `pp512` | 48.41-48.63 | 59.57-59.81 | 60.04-60.19 | 57.46-57.91 | 1.005-1.009x | 0.961-0.972x |
+| Ministral-3-8B-Instruct | `pp2048` | 43.57-43.97 | 52.34-52.55 | 51.32-51.55 | 49.25-49.62 | 0.979-0.982x | 0.938-0.948x |
+| Qwen3.5-9B | `pp512` | 39.95-41.37 | 44.71-47.24 | 46.56-47.08 | 44.40-45.74 | 0.986-1.049x | 0.955-1.023x |
+| Qwen3.5-9B | `pp2048` | 39.03-40.09 | 43.99-46.30 | 45.66-46.15 | 43.94-45.05 | 0.990-1.038x | 0.952-1.023x |
+| Gemma-4-12B-it | `pp2048` | 26.16-26.28 | 29.67-30.62 | 33.25-35.64 | 32.25-32.54 | 1.106-1.186x | 1.053-1.089x |
 
-**Conditions:** RK3588, NPU at 928 MHz (the 900 MHz request), llama.cpp b11539,
-`llama-bench -n 0 -r 3 -t 8` at the default `-b` and `-ub`, governor `performance`. Resident int8
-is `ROCKET_INT8=1 ROCKET_INT8_RESIDENT=1` without the Hadamard rotation, with every weight resident.
-The 8-9 B rows set `ROCKET_INT8_CACHE_MB=0` for that. The 3 B rows were measured 2026-11-06 and
-the 8-9 B rows 2026-11-07.
+**Conditions:** a second RK1 at 1028 MHz (the 900 MHz request), llama.cpp b11539,
+`llama-bench -n 0 -r 3 -t 8` unpinned at the default `-b` and `-ub` [HW sweep 2026-11-21].
+Resident fp16 is `ROCKET_F16_RESIDENT=auto`. Resident int8 is
+`ROCKET_INT8=1 ROCKET_INT8_RESIDENT=1 ROCKET_INT8_CACHE_MB=0`, rotated by
+`ROCKET_INT8_HADAMARD=1`, with every int8 weight resident. Resident fp16 places every weight
+except on Gemma-4-12B-it, where the IOVA window fills at 307 of its 325.
+
+> [!NOTE]
+> Gemma-4-12B-it's `pp512` rate varies between processes by up to 1.57x, while each process's
+> repetitions agree within 0.3 t/s. Its `pp2048` rate holds within 4%. Compare that model at
+> `pp2048`.
 
 Resident int8 reads back an int32 partial for each K pass, which fp16 accumulates on the NPU
 instead, because the backend has no integer [K-accumulation](README.md#terms). `librocketnpu`
 streams the int8 weights through the CBUF, which deepens each pass and removes most of them. The
-passes left grow with `K`.
+passes left grow with `K`, which is the likely cause of int8's smaller lead at 8-9 B
+[hypothesis].
 
-The table's 8-9 B int8 rows summed the passes in an int64 accumulator.
-`librocketnpu` now adds each pass straight into the output, with unchanged output. The int8 route
-then runs Ministral-3-8B-Instruct 1.07-1.12x faster than in the table, and Llama-3.2-3B-Instruct
-1.01-1.03x [HW sweep 2026-11-07]. That is 51.5-52.0 t/s at `pp512` on the 8 B model, resident fp16's rate.
-
-`ROCKET_INT8_HADAMARD=1` costs prefill speed. The rotation and the int8 quantization and
+`ROCKET_INT8_HADAMARD=1` costs prefill speed: the rotated route runs at 0.94-0.98x the unrotated
+rate at `pp512` on the table's four 3-9 B models. The rotation and the int8 quantization and
 dequantization run on the host for every matmul, spread over the A76 cores
 (`ROCKET_CONVERT_THREADS`). Matmuls in one scheduler split that read the same activation convert it
-once. On Qwen3.5-9B the rotated route then runs at 41.4-42.0 t/s at `pp512`, 0.951-0.972x its
-unrotated rate, against 0.855-0.867x with the conversions on one thread. The threads raise the
-rotated route's rate 1.15-1.17x and the unrotated route's 1.02-1.04x, with unchanged output. On that
-model the rotation also brings the perplexity cost from +2.83% to +0.97%
-([MODELS.md](MODELS.md#int8-w8a8)).
+once. On Qwen3.5-9B the threads raise the rotated route's rate 1.15-1.17x and the unrotated
+route's 1.02-1.04x, with unchanged output. On that model the rotation also brings the perplexity
+cost from +2.83% to +0.97% ([MODELS.md](MODELS.md#int8-w8a8)).
 
-**Conditions:** CPU governor `performance`, a memory reset and a discarded warm-up process before
-every configuration, three passes in rotated order. One backend build, with one thread selected by
-`ROCKET_CONVERT_THREADS=1 ROCKET_NO_ACT_REUSE=1` [HW sweep 2026-11-11].
+**Conditions:** the threads' gain on an RK1 at 928 MHz (the 900 MHz request), CPU governor
+`performance`, against `ROCKET_CONVERT_THREADS=1 ROCKET_NO_ACT_REUSE=1` in the same build
+[HW sweep 2026-11-11].
 
-At 12 B the int8 route gains more. On Gemma-4-12B-it F16, with every int8 weight resident
-(`ROCKET_INT8_CACHE_MB=0`), it runs at 1.35-1.37x the default fp16 route at `pp512` and 1.30-1.32x
-at `pp2048`. Unrotated output is far from fp16's on that model, so set `ROCKET_INT8_HADAMARD=1`
-there ([MODELS.md](MODELS.md#int8-w8a8)). Rotated, the route runs at 31.8-31.9 t/s at `pp512`,
-against 25.5-25.9 t/s for the fp16 route. The rotation is the difference: its `K` 3840 and 15360
-take the 60-point construction, which costs about 1.6 s a 512-row micro-batch.
+At 12 B the int8 route gains more. On Gemma-4-12B-it at `pp2048`, the unrotated route runs at
+1.27-1.36x the default fp16 route and the rotated one at 1.23-1.24x. Unrotated output is far from
+fp16's on that model, so set `ROCKET_INT8_HADAMARD=1` there ([MODELS.md](MODELS.md#int8-w8a8)).
+Its `K` of 3840 and 15360 take the 60-point rotation. On an RK1 at 928 MHz (the 900 MHz request),
+that rotation took about 1.6 s a 512-row micro-batch [HW sweep 2026-11-11].
 
-**Conditions:** CPU governor `performance`, a memory reset and a discarded warm-up process before
-every configuration, three passes in rotated order [HW sweep 2026-11-11]. The rotated and fp16
-rates come from two series run the same day.
+`ROCKET_INT8_CACHE_MB` sizes the int8 weight budget from free RAM by default: `MemAvailable` at
+init less the `ROCKET_QUANT_RESIDENT_RESERVE_MB` reserve, but never less than 4096 MB. Past
+4096 MB, a weight is admitted only while `MemAvailable` stays above the reserve. The backend logs
+the budget at init, in a `[rocket] ROCKET_INT8_CACHE_MB=auto -> int8 weight budget` line.
 
-**Not characterized:** the rotated route at `pp2048` with the current rotation.
+On the table's board, with a 9535 MB reserve, the budget came to 21552-21580 MB. It held all 235
+of Ministral-3-8B-Instruct's int8 weights (6940 MB) and ran at 0.994-1.000x the `pp512` rate of an
+unlimited budget (`0`). A 4096 MB budget holds 141 of those weights (4094 MB). The default ran at
+1.103-1.111x the rate of that budget [HW sweep 2026-11-22, the backend of 2026-11-22].
 
-The default `ROCKET_INT8_CACHE_MB` of 4096 holds 58-62% of an 8-9 B model's int8 weights, and the
-rest take the fp16 route. That costs 3-5% of the prefill rate on Ministral-3-8B-Instruct and 1-3%
-on Qwen3.5-9B against a budget that holds them all. With
-its whole-tile plan (`ROCKET_MM_STREAM_INT8=0`) the same route measures 0.61-0.66x resident fp16.
-Resident int4 has no streamed plan and measured 0.53x fp16 at ~816 MHz.
+A board whose free RAM is under 4096 MB plus the reserve keeps a 4096 MB budget, and the weights
+past it take the fp16 route. In the table's series, a 4096 MB budget held 125 of Qwen3.5-9B's int8
+weights and cost 5.6-9.0% of the `pp512` rate against `0`. At `pp2048` it cost 7-8% on
+Ministral-3-8B-Instruct and 4-8% on Qwen3.5-9B.
+
+On the same board at `pp512`, the int8 route's whole-tile plan (`ROCKET_MM_STREAM_INT8=0`) runs
+Gemma-4-12B-it at 0.48-0.51x its streamed plan and 0.71-0.74x resident fp16. Resident int4 has no
+streamed plan, and runs at 0.28x resident fp16 there with all 325 weights resident [HW sweep
+2026-11-22].
 
 Use the int8 route to hold a model's weights resident in half the RAM resident fp16 takes. Use
 int4 and a quantized GGUF to fit a model in less RAM. [MODELS.md](MODELS.md#precisions) gives
@@ -259,59 +301,101 @@ bit-exact, and perplexity is unchanged:
 
 `ROCKET_MIN_M` sets the fewest rows an unquantized weight's matmul needs to offload. Below the
 crossover, the per-call dispatch and weight pack cost more than the NPU's per-row speed saves.
-The crossover is 21-25 rows on all three models measured. The default of 32 is above it, so no
-model measured is slower than on the CPU:
+The crossover is 16-19 rows on the three F16 models measured. The default of 24 is at least 5 rows
+above it, so no model measured is slower than on the CPU. At 24 rows the offload measures
+1.15-1.45x the CPU:
 
-| F16 model | `pp16` | `pp32` | `pp64` | `pp128` |
-|---|---:|---:|---:|---:|
-| 0.8B | 0.75x | 1.20x | 1.71x | 1.96x |
-| 3B | 0.78x | 1.40x | 2.51x | 3.68x |
-| 8B | 0.77x | 1.46x | 2.75x | 3.90x |
+| F16 model | `pp16` | `pp20` | `pp24` | `pp32` | `pp64` | `pp128` | Crossover, rows |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B | 0.885-0.889x | 1.042-1.051x | 1.149-1.155x | 1.351-1.356x | 1.863-1.870x | 2.331-2.343x | 18.7-18.9 |
+| Llama-3.2-3B | 0.995-0.999x | 1.243-1.246x | 1.444-1.447x | 1.786-1.790x | 2.625-2.655x | 3.765-3.767x | 16.0-16.1 |
+| Ministral-3-8B | 0.977-0.986x | 1.069-1.075x | 1.282-1.286x | 1.627-1.629x | 2.912-2.917x | 4.233-4.243x | 16.7-16.9 |
 
-**Conditions:** NPU prefill t/s over the faster of 4 and 8 CPU threads, CPU governor
-`performance` [HW sweep 2026-10, llama.cpp a7fb71f].
+**Conditions:** NPU prefill t/s at `ROCKET_MIN_M=4` on 4 threads pinned to the A76 cores. The
+baseline is the faster of the CPU backend on those 4 threads and on 8 unpinned threads.
+llama.cpp b11539 [HW sweep 2026-11-21]. The crossover interpolates linearly between the two
+lengths around 1.00x.
+
+The crossover depends on the backend build. In the same measurement, llama.cpp a7fb71f with the
+backend of 2026-10-09 crosses at 18.9-19.1 rows on Llama-3.2-3B. Behind a boot loader that leaves
+SPLL unprogrammed, the crossover is expected to stay below 24 [expected]. On Llama-3.2-3B, SPLL
+and the faster clock together raised the 2026-10-09 build's rate 1.04-1.08x at these lengths.
 
 The crossover barely depends on the model, because the weight pack the offload adds and the
 compute it saves both scale with `K`·`N`. The dispatch cost does not scale, and it causes the
-small drift between models. On whisper-small F16 the default runs at 0.995-1.006x the speed of
-`ROCKET_MIN_M=128`, with a byte-identical transcript.
+small drift between models. On whisper-small F16 a threshold of 32 runs at 0.995-1.006x the speed
+of `ROCKET_MIN_M=128`, with a byte-identical transcript [HW sweep 2026-10-09]. On Whisper base and
+small, the default of 24 gives the same transcript as thresholds of 4, 8 and 32
+[HW sweep 2026-11-22].
 
 > [!NOTE]
 > `ROCKET_MIN_M` also keeps batched decode on the CPU. whisper.cpp's default beam search presents
-> `M`=5 per step. At `ROCKET_MIN_M=4` those steps offload and run 2.3x as slow as on the CPU,
-> which makes the whole transcription 1.40x as slow.
+> `M`=5 per step. At `ROCKET_MIN_M=4` those steps offload and take 1.68-1.86x as long as on the
+> CPU. The whole transcription then takes 1.25-1.34x as long on Whisper base and small, with
+> whisper.cpp v1.9.5 [HW sweep 2026-11-22].
 
 For a CTC or transducer encoder on short utterances, set 16 in that process, as
-[Voice commands](#voice-commands) describes. Leave an LLM process at the default. Do not raise it
-to 256, the residency cap. Below 256 rows a llama.cpp model streams its weights and still
-offloads faster than the CPU, 3.90x at `pp128` on the 8B.
+[Voice commands](#voice-commands) describes. Leave an LLM process at the default rather than 16,
+where the three F16 models measure 0.89-1.00x the CPU. Do not raise it to 256, the residency cap.
+Below 256 rows a llama.cpp model streams its weights and still offloads faster than the CPU,
+4.23-4.24x at `pp128` on Ministral-3-8B.
 
 ## Attention
 
 The backend computes `softmax(scale·QKᵀ + mask)·V` on the NPU, with the heads spread across its
 workers and their submits chained. On Ministral-3-3B F16 its perplexity is within 0.03% of the CPU
 backend's attention, 13.8994 against 13.9024. It claims an op at `ROCKET_FLASH_ATTN_MIN_KV` keys
-(1024) and `ROCKET_FLASH_ATTN_MIN_T` query tokens (16) or more:
+(1024) and `ROCKET_FLASH_ATTN_MIN_T` query tokens (16) or more. From a 1K-token prompt it is
+faster than the CPU backend's flash attention, and the gain grows with the context:
 
-| Context | Speedup over the CPU backend's flash attention |
-|---|---:|
-| 1K or less | Parity |
-| 4K | 1.07x |
-| 8K | 1.50x |
-| 16K | 1.25x |
+| Prompt, tokens | Gemma-4-12B F16, speedup | Llama-3.2-3B F16, speedup |
+|---|---:|---:|
+| 512 | 0.997-1.001x | 0.993-1.009x |
+| 1K | 1.069-1.086x | 1.073-1.083x |
+| 2K | 1.199-1.205x | 1.239-1.240x |
+| 4K | 1.337-1.339x | 1.494-1.499x |
+| 8K | 1.543-1.548x | 1.855-1.865x |
+| 16K | 1.936-1.937x | Not measured |
 
-**Conditions:** Gemma-4-12B F16, governor `performance` [HW sweep 2026-06-26/28].
+**Conditions:** prefill t/s with the offload over `ROCKET_FLASH_ATTN=0`, which runs the CPU
+backend's flash attention with the matmuls still on the NPU. `llama-bench -fa 1` at the default
+`-ub` of 512, 8 threads unpinned, llama.cpp b11539 [HW sweep 2026-11-21].
 
-**Not characterized:** these ratios with the current softmax and the row handoff of the scores.
+At a 512-token prompt no op reaches the default threshold, so the attention stays on the CPU.
+Offloading those ops measures 0.98-1.00x the CPU. A threshold of 512 keys measures within 1.3% of
+the default at a 1K prompt. With the process pinned at `taskset 0xf0 -t 4`, the offload measures
+1.240-1.252x on Gemma-4-12B at `pp2048`.
 
 The row handoff (`ROCKET_FA_ROWMAJOR`, the default) passes the scores and the softmax output as
 plain rows instead of the tile layout. It measures 1.058-1.068x the tiled handoff at `pp2048` and
 1.080-1.116x at `pp4096` on Llama-3.2-3B F16 with `-fa 1` [HW sweep 2026-10-11].
 
 The backend declines an op with attention sinks (`src[4]`), which gpt-oss, `mimo2` and
-`deepseek4` use, so the CPU computes it. An unmasked op, an encoder's self-attention, stays on the
-CPU unless `ROCKET_FLASH_ATTN_UNMASKED` is set. On whisper small that offload took 36% longer than
-the CPU kernel, because the `[T, n_kv]` scores make a round trip through the host softmax.
+`deepseek4` use, so the CPU computes it.
+
+### Encoder attention
+
+The backend also offloads an attention op that has no mask: an encoder's self-attention, and the
+cross-attention of a decoder such as Whisper's. It claims one at the same `ROCKET_FLASH_ATTN_MIN_KV`
+and `ROCKET_FLASH_ATTN_MIN_T` thresholds as a masked op, and `ROCKET_FLASH_ATTN_UNMASKED=0`
+declines it. The offload shortens a Whisper encode, and the gain grows with the model:
+
+| Whisper model | Encode time | `whisper-cli` wall-clock time | `whisper-cli` CPU core-seconds |
+|---|---:|---:|---:|
+| `tiny` | 0.916-0.930x | 0.995x | 0.92x |
+| `base` | 0.796-0.807x | 0.92x | 0.83x |
+| `small` | 0.715-0.718x | 0.88x | 0.78x |
+
+**Conditions:** each figure with the ops offloaded over `ROCKET_FLASH_ATTN_UNMASKED=0`. The
+multilingual F16 models, whisper.cpp v1.9.5 with flash attention on (its default), 4 threads
+pinned to the A76 cores, the backend of 2026-11-22 [HW sweep 2026-11-22]. The encode time is
+`whisper-bench`'s 1500-frame encode. The `whisper-cli` columns transcribe a 176 s English clip at
+the default beam search, beam 5 and best of 5.
+
+The transcripts are byte-identical with the ops offloaded and declined. In the `whisper-cli` run,
+the decoder's prompt passes of 16 tokens or more also offload their cross-attention, whose keys
+are the 1500 encoder frames [hypothesis]. An encoder whose head dimension is not a multiple of 32,
+such as SigLIP's 72 in SmolVLM2, keeps its attention on the CPU.
 
 ### Host threads for attention
 
@@ -378,7 +462,10 @@ Together they cut the CPU cost to 0.70x the defaults' core-seconds per second of
 chunks, at better WER. On 30 s chunks with `-nt`, the server takes 0.65x. Without `-nt`, a 30 s
 chunk is encoded twice.
 
-**Conditions:** `ggml-small` F16 [HW sweep].
+**Conditions:** `ggml-small` F16, with the encoder's attention on the CPU [HW sweep].
+
+**Not characterized:** these settings with the encoder's attention offloaded, which is the
+default ([Encoder attention](#encoder-attention)).
 
 > [!CAUTION]
 > An `-ac` equal to the chunk length makes the decoder loop at the end of the audio. Size `-ac`
@@ -390,12 +477,25 @@ chunk is encoded twice.
 
 ### Voice commands
 
-A 1.3-6 s command is 16-75 encoder rows. The default `ROCKET_MIN_M` of 32 offloads every encoder
-GEMM of a command from 2.6 s up, and 24 of the 265 at 1.3-2.5 s. At 16, the encoder ties
-the CPU at 1.3-1.8 s and runs 1.18-1.73x the CPU's speed at 2-6 s. It frees 34-61% of the CPU
-core-seconds, with the transcript unchanged.
+A 1.3-6 s command is 16-75 encoder rows. A threshold of 32 offloads every encoder GEMM of a
+command from 2.6 s up, and 24 of the 265 at 1.3-2.5 s. At 16, every encoder GEMM offloads, and the
+encoder is faster than the CPU at every length measured. It frees 37-64% of the CPU core-seconds,
+with the transcript byte-identical:
 
-**Conditions:** Parakeet F16 through whisper.cpp's `parakeet-cli` [HW sweep].
+| Audio | CPU only, per utterance | Threshold 32 | Threshold 16 | 16 over the CPU | 16 over 32 |
+|---|---:|---:|---:|---:|---:|
+| 1.3-1.8 s | 421 ms, 1.66 core-s | 409 ms, 1.57 core-s | 362 ms, 1.04 core-s | 1.146-1.196x | 1.116-1.161x |
+| 2.1-2.5 s | 554 ms, 2.19 core-s | 523 ms, 1.99 core-s | 390 ms, 1.15 core-s | 1.422-1.428x | 1.340-1.342x |
+| 2.6-3.9 s | 786 ms, 3.10 core-s | 462 ms, 1.33 core-s | 466 ms, 1.35 core-s | 1.586-1.708x | 0.935-1.005x |
+| 4.4-5.9 s | 1202 ms, 4.77 core-s | 598 ms, 1.73 core-s | 592 ms, 1.71 core-s | 2.017-2.047x | 0.998-1.022x |
+
+**Conditions:** Parakeet TDT 0.6B v3 F16 through whisper.cpp v1.9.5's `parakeet-cli`, 4 threads
+pinned to the A76 cores, ten LibriSpeech test-clean utterances a length. Each time is a median
+per-utterance cost without the model load [HW sweep 2026-11-22]. The CPU-only configuration loads
+the backend and declines every op.
+
+At the default threshold of 24, a command of ~1.9 s or more is expected to offload every encoder
+GEMM, as at 16 [expected]. A shorter command is expected to measure as at 32 [expected].
 
 Beside a CPU-bound process, the offloaded STT process slows more than a CPU-only one does.
 `OMP_WAIT_POLICY=PASSIVE` recovers most of that slowdown.
@@ -404,6 +504,10 @@ Beside a CPU-bound process, the offloaded STT process slows more than a CPU-only
 
 The NPU clock drops at idle, so a cold run measures ~15% low. Discard a warm-up run before
 timing, run at least three times, and compare warm runs.
+
+The NPU's DDR read rate depends on the boot loader, so compare a rate against one here only under
+the same boot-loader condition. [Boot loader](README.md#boot-loader) says which U-Boot builds
+program SPLL.
 
 Run once with `ROCKET_LOG_STDERR=1` to confirm that the intended route and budget engaged.
 `llama-bench` silences the host's logger, and with it every backend line, unless it runs with

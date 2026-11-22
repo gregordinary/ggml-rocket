@@ -20,8 +20,10 @@ It runs the Whisper encoder end to end on the NPU, and the prefill of Gemma-4, Q
 Llama-3.2, Phi-4, Ministral and more.
 
 Decode stays on the CPU. A decode step is single-row work, bound by the DDR bandwidth the NPU
-shares with the CPU. Below `ROCKET_MIN_M` (default 32 rows), the dispatch and the weight pack
-cost more than the NPU saves.
+shares with the CPU. Behind a boot loader that programs [SPLL](#terms), the NPU's three
+cores read weights at 1.0-1.4x the CPU decoder's rate [host-computed]. An offloaded step
+adds a dispatch, a weight pack and a de-tile to that read, and an NPU decode is not characterized
+end to end. `ROCKET_MIN_M` (default 24 rows) keeps decode and short prompts on the CPU.
 
 The backend links `librocketnpu`, which the `rocket-userspace` project builds and which also runs
 on its own. The build expects the checkouts side by side:
@@ -104,14 +106,16 @@ The backend offloads the ops that dominate prefill, and the CPU backend computes
 - **`MUL_MAT`**: the prefill GEMMs. The backend [claims](#terms) a matmul with an F16, F32 or
   quantized weight if `M >= ROCKET_MIN_M` and the shape aligns (`K%32`, `N%16`, `K>=64`,
   `N>=64`).
-- **`FLASH_ATTN_EXT`**: prefill attention, on the NPU by default at `n_kv >= 1024`.
+- **`FLASH_ATTN_EXT`**: prefill attention and an encoder's self-attention, on the NPU by default
+  at `n_kv >= 1024`.
 - **`MUL_MAT_ID`**: MoE routed experts, on the NPU by default as [native-quant experts](#terms).
   The backend claims a quantized [expert stack](#terms) that fits the memory budget and whose
   per-expert GEMM repays its dispatch. Any other stack runs whole on the CPU. The first
   prefill of each `llama_context` converts the experts once, which [MOE.md](MOE.md) times.
 - **Opt-in routes**: native int8 (`ROCKET_INT8=1`), int4 (`ROCKET_INT4=1`) and bf16
-  (`ROCKET_BF16=1`). They fit a model in less RAM or compute an exact fp32 result, but none
-  prefills faster than fp16.
+  (`ROCKET_BF16=1`). They fit a model in less RAM or compute an exact fp32 result. Resident int8
+  prefills at 0.98-1.10x resident fp16 on four models of 3-9 B [HW sweep 2026-11-21], and int4
+  and bf16 prefill no faster than fp16 ([TUNING.md](TUNING.md#quantization-and-prefill-speed)).
 - **Precision declarations**: the backend declines a matmul whose model declares a precision the
   backend cannot meet, such as Mistral-4's F32 routed down-projection activation.
   [API.md](API.md#precision-declarations) has the rules.
@@ -139,12 +143,16 @@ quantization, not the backend.
 | gpt-oss-20b (MoE) | 20.9B | MXFP4 | 37.8 | 2.29x | 9.1 | 11.3 |
 | Qwen3.6-27B (hybrid) | 27.3B | Q4_K_M | 11.5 | 3.8x | 1.3 | 15.9 |
 
-**Conditions:** RK3588, NPU 928 MHz (the 900 MHz request), CPU governor `performance`, warm runs,
-llama.cpp b11539 [HW sweep 2026-11-01]. Each speedup pairs the NPU and the 8-thread CPU backend on
-the same GGUF. The F16 rows run at llama.cpp's default `-b` and `-ub`. The four quantized rows run
-at `-b 2048 -ub 2048`, with llama.cpp's weight repack on in the CPU backend. Decode is the CPU
+**Conditions:** RK3588, NPU 928 MHz (the 900 MHz request), a boot loader that leaves SPLL
+unprogrammed, CPU governor `performance`, warm runs, llama.cpp b11539 [HW sweep 2026-11-01]. Each
+speedup pairs the NPU and the 8-thread CPU backend on the same GGUF. The F16 rows run at
+llama.cpp's default `-b` and `-ub`. The four quantized rows run at `-b 2048 -ub 2048`, with
+llama.cpp's weight repack on in the CPU backend. Decode is the CPU
 backend at `-t 4` on the four A76 cores (`taskset 0xf0`), `tg64`, which decodes faster than 8
 threads, as [TUNING.md](TUNING.md#cpu-threads) gives.
+
+**Not characterized:** the table's NPU rates with SPLL programmed. [Boot loader](#boot-loader)
+gives what that changes at `pp512`.
 
 NPU prefill's perplexity agrees with the CPU backend's on every model in the table but
 gpt-oss-20b. Wikitext perplexity is not a valid measure for that reasoning model. Its offloaded
@@ -161,8 +169,14 @@ as on the CPU backend, from `tiny.en` to `large-v3`. Through transcribe.cpp, a w
 pipeline gains 1.0x-1.9x. It gains most where the encoder is large or the decoder cross-attends
 the audio, and least on a small decoder-only model.
 
-**Conditions:** RK3588, warm runs, against the CPU backend on the same model. Whisper at NPU
-~816 MHz (the 600 MHz request), transcribe.cpp at `Q8_0`.
+**Conditions:** RK3588, a boot loader that leaves SPLL unprogrammed, warm runs, against the CPU
+backend on the same model. Whisper at NPU ~816 MHz (the 600 MHz request), with the encoder's
+attention on the CPU. transcribe.cpp at `Q8_0`.
+
+The encoder's attention also offloads by default. With it offloaded, the multilingual Whisper
+encoder runs 1.50-1.52x as fast as on the CPU backend on `tiny` and 2.90x on `small` [HW sweep
+2026-11-22]. Both figures ran on an RK1 at 927.5 MHz with SPLL programmed, each backend
+on 4 threads on the A76 cores.
 
 ### An interactive turn
 
@@ -222,15 +236,40 @@ NPU clock follows the rail voltage, so a requested rate is not the rate the NPU 
 
 Apply the `patches/rocket` clock and voltage patches, and load the module with
 `rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs the NPU at 928 MHz.
+The rate differs between parts: a second RK1 runs the same request at 1028 MHz.
 
 The language-model figures in this README were measured at the 900 MHz request. The speech
-figures were measured at the 600 MHz request, which runs at ~816 MHz on the same rail. The 900 MHz
-request is 1.044x its speed on matmul device time.
+figures were measured at the 600 MHz request, which runs at ~816 MHz on the same rail, except the
+encoder figures at the defaults. The boot
+loader decides how much a faster clock gives. With SPLL programmed, ~70% of one core's fp16
+matmul device time scales with the NPU clock at 1028 MHz [HW sweep 2026-11-21]. With SPLL
+unprogrammed, the 900 MHz request is 1.044x the 600 MHz request on matmul device time [HW sweep
+2026-10-19].
 
 > [!CAUTION]
 > With the NPU cores pinned on (`power/control=on`), an `rmmod` at the 900 MHz request
 > hard-locks the board, and only a power cycle recovers it. Unload the module only while all
 > three cores are runtime-suspended.
+
+### Boot loader
+
+On the RK3588 the NPU reads DDR through the center interconnect, whose clock comes from
+[SPLL](#terms). Only the boot loader can program SPLL. Behind a boot loader that leaves it
+unprogrammed, the NPU reads DDR at half the rate, and Linux reports nothing.
+
+> [!NOTE]
+> `clk_summary` reports SPLL at 702 MHz whether or not the boot loader programmed it, so it
+> cannot show the halved read rate.
+
+Mainline U-Boot v2026.07 and v2026.10, built for the RK1's eMMC boot, leave SPLL unprogrammed
+[HW sweep 2026-11-21]. The other mainline releases from v2026.01 to v2027.01-rc1 are expected to
+as well [expected]. Upstream commit `514663543ecf`, first released in v2027.01-rc2, programs it,
+and so does Armbian's `2026.07_armbian` U-Boot for the RK1.
+
+The read rate moves only the part of a run that waits on the NPU. With SPLL programmed, an LLM
+prefill at `pp512` runs 1.01-1.11x as fast, and a Whisper encode 0.99-1.03x. A decode-sized
+weight read runs 1.98x as fast [HW sweep 2026-11-21]. The figures under
+[Performance](#performance) were measured with SPLL unprogrammed.
 
 ## Build and run
 
@@ -434,6 +473,7 @@ The terms these documents use that ggml's and llama.cpp's documentation does not
 | Pre-flight | The check in `supports_op` that reserves the RAM and IOVA window an expert stack needs, before the backend claims its `MUL_MAT_ID` op. | Coined | Admission control |
 | Resident weight | A weight converted to the NPU's tile layout and written to NPU buffers once, then reused by every later call. Its opposite is a streamed weight. | Coined | Prepacked weight |
 | Route | The way the backend computes one op, named by its precision and by whether its weights are resident: for example the fp16 route, the native-quant route or the RK3576 route. `ggml_backend_rocket_route_ops` counts ops per route. | Coined | Code path |
+| SPLL | Not expanded. A PLL of the RK3588 that clocks the center interconnect, through which the NPU reads DDR. Only the boot loader can program it. | RK3588 TRM | |
 | Streamed weight | A weight converted and written to NPU buffers on every call that uses it. Its opposite is a resident weight. | Coined | |
 | The RK3576 route | The int8 route for `MUL_MAT` on an RK3576, with int8 weights and activations (W8A8) and the result requantized per output column on the NPU. | Coined | W8A8 quantized matmul |
 | Work per dispatch | The multiply-accumulates one expert GEMM does, `M_e · K · N`, where `M_e` is the rows routed to the expert. The backend offloads an expert stack only above a minimum. | Coined | |
